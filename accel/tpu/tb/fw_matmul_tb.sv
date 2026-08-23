@@ -198,6 +198,135 @@ module fw_matmul_tb;
         end
     end
 
+    // ---- optional per-command timeline (+CMDLOG=<path>) ----------------------
+    //
+    // `idlec` says how many clocks of the run had no unit busy. On a 534-command
+    // kernel that number alone cannot say *where*, and "where" is the whole
+    // question — 4% spread evenly is a different machine from 4% concentrated in
+    // one phase. This records, per command, the clock the CPU pushed it and the
+    // clocks its unit began and finished it, which is enough to attribute every
+    // clock of the run to a producer or a consumer.
+    //
+    // Off unless the plusarg is given, and everything below is in ONE always
+    // block on purpose: `cyc` is incremented by its own always block, so probes
+    // split across blocks could disagree by a clock about what "now" is.
+    //
+    // Pairing is exact rather than heuristic. A GEOM command retires in one
+    // clock and never starts its unit, so the nth `*_start` pulse belongs to the
+    // nth *executing* command pushed to that unit — each unit's queue is
+    // in-order and each command runs to completion. tb/cmd_timeline.py consumes
+    // the CSV.
+    // The opcode that makes a command actually run its unit: MXU_MM, VPU_OP,
+    // DMA_MOVE. A function rather than an unpacked localparam array, which
+    // Icarus does not accept.
+    function automatic logic [7:0] tl_exec_op(input int unit);
+        tl_exec_op = (unit == 0) ? 8'h02 : 8'h01;
+    endfunction
+
+    integer tl_f = 0;
+    string  tl_path;
+
+    int tl_push  [0:MAX_CMDS-1];
+    int tl_start [0:MAX_CMDS-1];
+    int tl_end   [0:MAX_CMDS-1];
+    // Clocks its unit was actually busy on this command, and the no-unit-busy
+    // clocks that preceded its push. Accumulated rather than derived from
+    // start/end because the three units do not agree on where `busy` sits
+    // relative to their start/done pulses -- and these two columns have to sum
+    // to the perf counters exactly or the attribution is guesswork.
+    int tl_busy  [0:MAX_CMDS-1];
+    int tl_gap   [0:MAX_CMDS-1];
+    int tl_unit  [0:MAX_CMDS-1];
+    int tl_op    [0:MAX_CMDS-1];
+    int tl_w0    [0:MAX_CMDS-1];
+    int tl_w1    [0:MAX_CMDS-1];
+    int tl_w2    [0:MAX_CMDS-1];
+    int tl_q     [0:2][0:MAX_CMDS-1];   // per unit: indices of executing commands
+    int tl_wr    [0:2];
+    int tl_rd    [0:2];
+    int tl_cur   [0:2];
+    // Its own push counter rather than the trace monitor's `n_cmd_got`: both
+    // blocks run on the same edge and their order is not defined, so reading the
+    // other block's counter shifted every record by one.
+    int tl_n = 0;
+    int tl_idle_acc = 0;   // no-unit-busy clocks since the last push
+
+    initial begin
+        for (int i = 0; i < MAX_CMDS; i++) begin
+            tl_push[i] = -1; tl_start[i] = -1; tl_end[i] = -1;
+            tl_busy[i] = 0;  tl_gap[i] = 0;
+        end
+        for (int u = 0; u < 3; u++) begin
+            tl_wr[u] = 0; tl_rd[u] = 0; tl_cur[u] = -1;
+        end
+        if ($value$plusargs("CMDLOG=%s", tl_path)) begin
+            tl_f = $fopen(tl_path, "w");
+            if (tl_f == 0) $display("FW_MATMUL: cannot open %s for the timeline", tl_path);
+        end
+    end
+
+    always @(posedge clk) if (rst_n && tl_f != 0) begin
+        int u;
+        if (dut.p_cmd_we && !dut.p_cmd_full && tl_n < MAX_CMDS) begin
+            u = dut.p_cmd_unit;
+            tl_push[tl_n] = cyc;
+            tl_unit[tl_n] = u;
+            tl_op  [tl_n] = dut.p_cmd_data[7:0];
+            tl_w0  [tl_n] = dut.p_cmd_data[31:0];
+            tl_w1  [tl_n] = dut.p_cmd_data[63:32];
+            tl_w2  [tl_n] = dut.p_cmd_data[95:64];
+            if (u < 3 && dut.p_cmd_data[7:0] == tl_exec_op(u)) begin
+                tl_q[u][tl_wr[u]] = tl_n;
+                tl_wr[u]          = tl_wr[u] + 1;
+            end
+            tl_gap[tl_n] = tl_idle_acc;
+            tl_idle_acc  = 0;
+            tl_n         = tl_n + 1;
+        end
+        if (dut.mxu_start) begin
+            tl_cur[0] = tl_q[0][tl_rd[0]]; tl_rd[0] = tl_rd[0] + 1;
+            tl_start[tl_cur[0]] = cyc;
+        end
+        if (dut.vpu_start) begin
+            tl_cur[1] = tl_q[1][tl_rd[1]]; tl_rd[1] = tl_rd[1] + 1;
+            tl_start[tl_cur[1]] = cyc;
+        end
+        if (dut.dma_start) begin
+            tl_cur[2] = tl_q[2][tl_rd[2]]; tl_rd[2] = tl_rd[2] + 1;
+            tl_start[tl_cur[2]] = cyc;
+        end
+        if (dut.mxu_done && tl_cur[0] >= 0) tl_end[tl_cur[0]] = cyc;
+        if (dut.vpu_done && tl_cur[1] >= 0) tl_end[tl_cur[1]] = cyc;
+        if (dut.dma_done && tl_cur[2] >= 0) tl_end[tl_cur[2]] = cyc;
+
+        // Busy attribution. `tl_cur[u]` still names the last command that unit
+        // ran, so a clock is charged to it only while the unit is up -- between
+        // commands every unit is idle and nothing is charged.
+        if (busy) begin
+            if (dut.mxu_busy && tl_cur[0] >= 0) tl_busy[tl_cur[0]] = tl_busy[tl_cur[0]] + 1;
+            if (dut.vpu_busy && tl_cur[1] >= 0) tl_busy[tl_cur[1]] = tl_busy[tl_cur[1]] + 1;
+            if (dut.dma_busy && tl_cur[2] >= 0) tl_busy[tl_cur[2]] = tl_busy[tl_cur[2]] + 1;
+            if (!dut.mxu_busy && !dut.vpu_busy && !dut.dma_busy)
+                tl_idle_acc = tl_idle_acc + 1;
+        end
+    end
+
+    task automatic write_timeline();
+        $fdisplay(tl_f, "# idx,unit,op,w0,w1,w2,push,start,end,busy,gap");
+        // Two run lengths, and the arithmetic below wants the second: `run_clk`
+        // is wall clocks from host_run to done, while the perf counters measure
+        // the `busy` window and land one clock shorter. Mixing them makes the
+        // reconstructed overlap come out at -1.
+        $fdisplay(tl_f, "# run_clocks=%0d perf_run=%0d tail_idle=%0d",
+                  run_clk, dut.u_perf.counts[0*32 +: 32], tl_idle_acc);
+        for (int i = 0; i < tl_n; i++)
+            $fdisplay(tl_f, "%0d,%0d,%0d,%08h,%08h,%08h,%0d,%0d,%0d,%0d,%0d",
+                      i, tl_unit[i], tl_op[i], tl_w0[i], tl_w1[i], tl_w2[i],
+                      tl_push[i], tl_start[i], tl_end[i], tl_busy[i], tl_gap[i]);
+        $fclose(tl_f);
+        $display("timeline: %0d commands -> %0s", tl_n, tl_path);
+    endtask
+
     // ---- checks --------------------------------------------------------------
     int got;
 
@@ -308,6 +437,7 @@ module fw_matmul_tb;
 
         check_dram();
         check_cmds();
+        if (tl_f != 0) write_timeline();
 
         $display("==== done: %0d checks, %0d errors ====", checks, errors);
         if (errors == 0) $display("FW_MATMUL: ALL TESTS PASSED");

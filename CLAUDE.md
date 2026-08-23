@@ -11,14 +11,25 @@ validated numerically against it.
 
 The current front line is the TPU, and it is **caught up with the model**.
 [`accel/tpu/fw/adder.c`](accel/tpu/fw/adder.c) runs the whole int4 adder model —
-four transformer layers plus the output head — as one firmware kernel, 518
-commands and 1544 bytes of RISC-V, verified against the ISS and the RTL and
+four transformer layers plus the output head — as one firmware kernel, 534
+commands and 1992 bytes of RISC-V, verified against the ISS and the RTL and
 scored on the addition task:
 
 | | |
 | --- | --- |
-| `cd accel/tpu/tb && make fw FWPROG=adder` | 526 879 checks, **0 errors**, 439 917 clocks, 518/518 commands matched |
+| `cd accel/tpu/tb && make fw FWPROG=adder` | 526 959 checks, **0 errors**, 453 778 clocks, 534/534 commands matched |
 | `python accel/tpulang/adder_export.py -n 256` | **100.00% exact-sequence, 100.00% token** on `model/saved/int4_d64_f256_l4.pt`, identical to the PyTorch QAT model |
+
+It is composed out of [`accel/tpu/fw/tpulib.h`](accel/tpu/fw/tpulib.h), a layer
+of **size-independent primitives** over `tpu.h`'s single macro-ops: a matmul
+that blocks in rows, columns and the contraction and stages whatever is in DRAM,
+the chunked elementwise pairs, a transpose and 2-D block moves. Nothing in the
+kernel depends on the model fitting in 64 KB of scratchpad any more; it fits, so
+every activation stays resident and only the weights stream, which is a
+*residency* choice the kernel makes rather than a constraint the code carries.
+`fw/tiled.c` (`make fw FWPROG=tiled`) is the regression for the paths `adder.c`
+does not take — DRAM to DRAM, undersized arena, all three block loops running —
+and is checked against an independent Python matmul, not only against the ISS.
 
 Everything is int4 now, weights *and* activations, on both sides: the RTL and
 `iss.py` take **int4 weights in a row-major 4-bit packed layout** and every
@@ -96,11 +107,12 @@ one command producer, PicoRV32 firmware in `accel/tpu/fw/`:
 
 ```bash
 make -C accel/tpu/fw                        # C firmware -> matmul.hex (RISC-V gcc)
-make -C accel/tpu/fw PROG=adder             # ...or mha / ffn / matmul_loop
+make -C accel/tpu/fw PROG=adder             # ...or tiled / mha / ffn / matmul_loop
 make -C accel/tpu/fw trace PROG=adder       # the kernel's command trace, host cc only
 python accel/tpulang/fw_vectors.py -t <trace> -o accel/tpu/tb/vectors_fw -k adder
 python accel/tpu/host/run_fw_matmul.py --dry-run   # operands + reference, no board
 cd accel/tpu/tb && make fw FWPROG=adder     # the kernel through the whole core (~3 min)
+cd accel/tpu/tb && make fw FWPROG=tiled     # tpulib.h's block loops, ~20 s
 cd accel/tpu/tb && make list                # RTL testbenches (Icarus)
 
 python accel/tpulang/adder_export.py -n 256          # accuracy on the addition task
@@ -273,7 +285,10 @@ keeping only the last 3 (gitignored; the committed `colab_*.pt` are not produced
   is the first firmware to issue a **VPU** command at all, and **`mha.c`** (one
   head of ReLU attention) adds the **transposing DMA** and the `quant4` pack.
   Both pass through `make fw FWPROG=ffn|mha` and are checked against an
-  independent Python reference as well as the ISS.
+  independent Python reference as well as the ISS. **`tiled.c`** is the fifth and
+  is written against `tpulib.h` rather than `tpu.h`: three DRAM-to-DRAM problems
+  with an undersized arena, so the row, column and contraction loops all have to
+  run (`make fw FWPROG=tiled`, 80 404 clocks, 237 commands).
   Both build with Homebrew `riscv64-elf-gcc` 16.2.0 and both **pass in
   simulation** — `cd accel/tpu/tb && make fw [FWPROG=matmul_loop]` runs the image
   out of `FW_INIT` through the whole core, 129 checks, 0 errors. **Not yet run on
@@ -340,13 +355,39 @@ keeping only the last 3 (gitignored; the committed `colab_*.pt` are not produced
   expected command stream, plus the **one** definition of each kernel's synthetic
   operands), and `adder_export.py` (real checkpoint → requant table → trace →
   accuracy). The directory name is now a fossil.
+- **`fw/tpulib.h` is the primitive layer, and it is written to be specialized.**
+  `tpu_matmul` blocks a GEMM in rows (`t_len <= 32`), columns and the contraction,
+  stages whichever operands are in DRAM through a caller-supplied `tpu_arena`,
+  and requants on store when the contraction was unsplit or through the VPU when
+  it was not; `tpu_add_narrow` / `tpu_relu_narrow` / `tpu_pack4` chunk the VPU
+  pairs at `vlen` and stream DRAM operands; `tpu_transpose8` and `tpu_move2d`
+  cover the rest. Every primitive is **self-fencing** — it returns only once its
+  commands have retired — so composing two is always safe.
+  - **`tpu_matmul`, `tpu_gemm_blocks` and `tpu_gemm_need` are `always_inline`,
+    and that is load-bearing, not cosmetic.** Everything a primitive computes
+    before its first push is exposed clock for clock (the caller has just
+    fenced) and the PicoRV32 is ~5-9 clocks per instruction with no cache, so
+    ~200 instructions of block arithmetic per matmul costs more than the array
+    spends on the dispatch. With the shape constant at the call site gcc folds
+    the chooser, the loops and every staging branch away; without the fold the
+    same kernel runs **597 936 clocks instead of 453 778** and the image is
+    *larger*. Measured three ways in `docs/picorv32_migration.md` §9.10. If you
+    add a firmware abstraction, check the disassembly, not the command count.
+  - `fw/tiled.c` is the regression for the block loops themselves: DRAM to DRAM,
+    an arena of a few hundred bytes, and `fw_vectors.py::reference_tiled`
+    checking the ISS against a plain Python matmul — because a mis-tiled matmul
+    is something the ISS would reproduce as faithfully as the RTL.
 - **`fw/adder.c` is not an example — it is the whole shipped model** (four layers
-  + the output head) in **518 commands and 1544 bytes**, one program, one run.
-  `LAYERS` is the only thing that moves when the model's depth changes. Its
-  byte-level contract — DRAM/scratchpad maps, the 16 requant `{m0,n}` words per
-  layer, the row-major int4 packing, why K is transposed and V is not — is that
-  file's header and `accel/tpu/fw/README.md`. Read those before touching the
-  kernel or the host staging.
+  + the output head) in **534 commands and 1992 bytes**, one program, one run,
+  composed out of `tpulib.h`. `LAYERS` is the only thing that moves when the
+  model's depth changes. Its byte-level contract — DRAM/scratchpad maps, the 16
+  requant `{m0,n}` words per layer, the row-major int4 packing, why K is
+  transposed and V is not — is that file's header and
+  `accel/tpu/fw/README.md`. Read those before touching the kernel or the host
+  staging. `Wq`/`Wk`/`Wv` are **three dense `[D][D]` DRAM blocks**, not one
+  fused `[D][3D]` one: fusing the fill was free when the kernel staged its own
+  weights, and under `tpu_matmul` a column slice of a fused block is strided and
+  would cost D transfers.
   - **The requant table is a compile-time input**, because the `{m0,n}` word is a
     literal in the macro-op and the CPU has no path to DRAM or the scratchpad.
     `fw/adder_rq.h` is the checked-in default and is tuned for `fw_vectors.py`'s
@@ -521,16 +562,26 @@ concluding anything from a board run.
 
 ## Long simulations
 
-A full-model run is `make fw FWPROG=adder` in `accel/tpu/tb`: **439 917 clocks**, about
-**3 minutes** of Icarus, 526 879 checks. It regenerates the golden vectors from the
+A full-model run is `make fw FWPROG=adder` in `accel/tpu/tb`: **453 778 clocks**, about
+**3 minutes** of Icarus, 526 959 checks. It regenerates the golden vectors from the
 kernel's own native trace first, so a stale image cannot silently be compared against
 the wrong expectations. `fw_matmul_tb.sv` does not dump a VCD at all, and the tb
 Makefile already passes the kernel a 60 ms watchdog (the 2 ms default is sized for the
 small kernels and would trip on this one while it worked perfectly).
 
-The split is `mxu = 206 361`, `dma = 131 168`, `vpu = 84 352`, `idlec = 18 035` (4.1%,
+The split is `mxu = 206 361`, `dma = 131 200`, `vpu = 84 352`, `idlec = 31 864` (7.0%,
 which is what the CPU costs as a command producer). `qfull` and `ovlap` are both 0:
-nothing overlaps yet, because the kernel fences after every cross-unit dependency.
+nothing overlaps yet, because every primitive fences after every cross-unit dependency.
+
+**`make fwtime FWPROG=<kernel>` is the same run plus a per-command timeline** —
+`fw_matmul_tb.sv` dumps one with `+CMDLOG=`, `tb/cmd_timeline.py` turns it into
+per-unit, per-phase and per-command-class tables, and the two columns it uses
+reconstruct the perf counters exactly (the tool checks that every run). Two things
+it found that the totals hide: **moving weights (98 400 DMA clocks, 23.2%) costs
+more than either FFN matmul**, and **82% of the CPU's time is the `tpu_wait`
+barriers, not building commands** — a command pushed onto a busy unit costs 13.3
+exposed clocks, one after a barrier costs 183.6, and 64 of the 143 barriers are the
+fence in the per-head attention loop. `docs/picorv32_migration.md` §9.9-§9.10.
 
 For an edit-run loop, use the **ISS** rather than the RTL — one four-layer forward is
 **1.9 s**, so `python accel/tpulang/adder_export.py -n 4` is a ~10 s check that the

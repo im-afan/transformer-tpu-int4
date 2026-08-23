@@ -3,8 +3,9 @@
 **Status: phases 0-5 are done, including the model. The scalar unit,
 `assembler.py`, `gen_vectors.py`, `torch_ref.py`, `pytpu.py` and every
 `examples/*.tpu` have been deleted — the CPU is the only producer, and
-[`../fw/adder.c`](../fw/adder.c) is the whole four-layer int4 model in 518
-commands and 1544 bytes of RISC-V. `adder_export.py` came back as the firmware
+[`../fw/adder.c`](../fw/adder.c) is the whole four-layer int4 model in 534
+commands and 1992 bytes of RISC-V, composed out of
+[`../fw/tpulib.h`](../fw/tpulib.h)'s size-independent primitives (§9.10). `adder_export.py` came back as the firmware
 kernel's host: it derives the requant table from a checkpoint, compiles the
 kernel natively against it, and scores the trace on `iss.py`. Phase 6 (a second
 architecture as a new `.c` file) is the remaining one.**
@@ -16,7 +17,8 @@ architecture as a new `.c` file) is the remaining one.**
 | 2 | **done** - scratchpad grants, VPU stall, DMA skid buffer + `sram.sv` backpressure, queue depth 8 |
 | 3 | **done** - no interpreter (§8.1): `fw/tpu.h` gains `-DTPU_TRACE`, `fw/mock/` emits the trace from a native build, `iss.py` gains `exec_command`/`run_trace`, `fw_vectors.py` turns a trace into golden images + an expected command trace, and `fw_matmul_tb.sv` monitors `p_cmd_*` and diffs both |
 | 4 | **done (RTL)** - `cpu_subsys.sv`: PicoRV32 + AXI4-Lite + the MMIO command aperture, alongside the scalar unit. The C toolchain now exists too (`../fw/`, §8): `matmul.c` (hardware tile walk) and `matmul_loop.c` (the same product, tile grid walked in C) are the kernels and `host/run_fw_matmul.py` runs either. Both **build** (Homebrew `riscv64-elf-gcc` 16.2.0, 248 and 352 bytes of the 16 KB) and both **pass in simulation** through `tb/fw_matmul_tb.sv` (`make fw`) — see §9.6. Not yet run on the board. |
-| 4 (rest) | **done** - `tpu.h` has builders for all three units (VPU + transposing DMA), and the model is written against them: `ffn.c`, `mha.c`, then `adder.c` — four transformer layers and the output head, 518 commands, 439 917 clocks, byte-exact against the ISS through `make fw FWPROG=adder`. Row-major weights swapped which attention operand needs the transpose; see that file's header |
+| 4 (rest) | **done** - `tpu.h` has builders for all three units (VPU + transposing DMA), and the model is written against them: `ffn.c`, `mha.c`, then `adder.c` — four transformer layers and the output head, 534 commands, 453 778 clocks, byte-exact against the ISS through `make fw FWPROG=adder`. Row-major weights swapped which attention operand needs the transpose; see that file's header |
+| 4 (library) | **done** - `fw/tpulib.h`: matmul, elementwise, transpose and block moves at any size, over operands in either memory. `adder.c` is composed out of it and no longer depends on the model fitting in 64 KB of scratchpad; `tiled.c` exercises the paths it does not take. §9.10 |
 | 5 | **done** - `scalar_unit.sv` and the whole tpulang toolchain deleted; `tpu_top.sv` has one producer, one S-port requester and no imem/cfg path; `iss.py` kept for its op bodies with the instruction decoder stripped |
 | 6 | not started - a second architecture as a new `.c` file and no RTL change |
 
@@ -33,7 +35,8 @@ What passes today, on the tree as it stands:
 | `make TEST=cpu_smoke` (new) | 68 checks, 0 errors - PicoRV32 boots, pushes two DMA commands, 64-byte round trip byte-exact |
 | `make fw` - the C firmware through `tpu_top`, image via `FW_INIT`, golden vectors + expected command trace from the kernel's own native trace (§8.1) | **539 / 574 checks, 0 errors** on `matmul` / `matmul_loop`; halts after 2 210 / 2 587 clocks. Checks the DRAM image *and* the command stream, 5 / 12 commands matched |
 | `make fw FWPROG=ffn` / `mha` | 0 errors - the feed-forward block and one attention head, the first VPU and transposing-DMA commands from firmware |
-| `make fw FWPROG=adder` - **the whole model** | **526 879 checks, 0 errors**, halts after 439 917 clocks; 518 of 518 commands matched |
+| `make fw FWPROG=adder` - **the whole model** | **526 959 checks, 0 errors**, halts after 453 778 clocks; 534 of 534 commands matched |
+| `make fw FWPROG=tiled` - `tpulib.h` past the scratchpad | **525 474 checks, 0 errors**, 80 404 clocks, 237 of 237 commands matched, and the ISS's answer checked against an independent Python matmul |
 | ~~`make model [LAYERS=n]`~~ | **gone with phase 5** - `tpu_top_tb.sv` drove the scalar unit. `make fw FWPROG=adder` replaces it and checks strictly more (the command stream as well as the image) |
 | `make fwsweep` - both kernels over 11 shapes, vectors regenerated per shape | 22 of 22, 0 failures (largest: 260 commands) |
 | `make all` | 15 of 15 |
@@ -748,40 +751,40 @@ Three consequences:
 
 ### 9.8 The whole model on the C producer, measured
 
-`make fw FWPROG=adder` — four transformer layers plus the output head, 518
+`make fw FWPROG=adder` — four transformer layers plus the output head, 534
 commands, `tb/fw_matmul_tb.sv` checking every DRAM byte *and* every command word
 against `iss.py`:
 
 | | clocks | share |
 | --- | ---: | ---: |
-| whole run | 439 917 | 100% |
-| MXU | 206 361 | 46.9% |
-| DMA | 131 168 | 29.8% |
-| VPU | 84 352 | 19.2% |
-| **`idlec` = CPU issuing commands** | **18 035** | **4.1%** |
+| whole run | 453 778 | 100% |
+| MXU | 206 361 | 45.5% |
+| DMA | 131 200 | 28.9% |
+| VPU | 84 352 | 18.6% |
+| **`idlec` = CPU issuing commands** | **31 864** | **7.0%** |
+
+(These are the `tpulib.h` numbers. The hand-written kernel this replaced was 518
+commands and 439 917 clocks with `idlec` 18 035 / 4.1%; the units did
+byte-identical work then too, so the whole 13 861-clock difference is the
+producer. §9.10.)
 
 **Do not read this against §0's 690 705.** That baseline is a *different model* —
 the ternary `d=128, f=128` kernel on the scalar unit — and this is the int4
 `d=64, f=256` one on the CPU. The only number that transfers is the last row.
 
-**Issue overhead is 4.1%**, against §9's estimate of ≈2.7% for the CPU producer.
-The gap is not a surprise and is not the command format: §9.7 measured ~85
-clocks to build and push one command, and 518 × 85 = 44 030 clocks of *CPU*
-time, of which only 18 035 is exposed — the rest hides under array work. It sits
-above the estimate because this kernel's average dispatch is much smaller than
-the sweep's: 96 of the 128 commands per layer are VPU passes over 512 elements
-(32 clocks of work each), so the CPU is genuinely the critical path across the
-elementwise stretches and genuinely idle across the matmuls.
+**Issue overhead is 7.0%**, against §9's estimate of ≈2.7% for the CPU producer.
+§9.9 decomposes it and the answer is not what the estimate was about: almost
+none of it is building commands.
 
 Two things follow for anyone trying to shrink it, and neither is the queue:
 
-- **`qfull` and `ovlap` are both 0.** Nothing is overlapped, because the kernel
-  fences after every cross-unit dependency — `tpu_wait` before each of the four
-  weight refills, around the K transpose, and between the array and the vector
+- **`qfull` and `ovlap` are both 0.** Nothing is overlapped, because every
+  primitive fences after every cross-unit dependency — `tpu_wait` before each
+  weight refill, around the K transpose, and between the array and the vector
   unit at each attention step. Every one of those is a real dependency, so
   removing them needs double-buffering (a second weight window, a second int32
   temp), not a looser barrier.
-- **The VPU is 19.2% of the run**, against 7.6% on the retired ternary kernel,
+- **The VPU is 18.6% of the run**, against 7.6% on the retired ternary kernel,
   and its cost tracks element count almost exactly: 196 608 elements over 84 352
   clocks is 0.43 clocks each, i.e. ~7 clocks per 16-lane chunk with per-command
   overhead a rounding error. The FFN's `relu → requant` pair is **a third** of
@@ -790,6 +793,166 @@ Two things follow for anyone trying to shrink it, and neither is the queue:
   narrows on the writeback path (vpu.md). A fused `relu.rq` would delete half
   those commands and all of the int32 traffic, worth ~6% of the whole run: the
   largest item on this table that is a *design* choice rather than arithmetic.
+
+### 9.9 Where the CPU's clocks actually go
+
+`idlec` says the CPU costs 7.0% of the adder run. It cannot say *where*, and 7%
+spread evenly is a different machine from 4% concentrated in one place. So
+`fw_matmul_tb.sv` gained an optional per-command timeline (`+CMDLOG=<path>`,
+driven by `make fwtime`) and `tb/cmd_timeline.py` turns it into the tables
+below. Two columns carry it — clocks the unit was busy on each command, and the
+no-unit-busy clocks before each push — and they are **accumulated in the
+testbench rather than derived**, because they have to reconstruct the perf
+counters exactly or the attribution is guesswork. They do: `mxu`/`vpu`/`dma`/
+`idlec` come back bit-identical on every kernel, and the tool prints the check.
+
+**The finding: 82% of the CPU's time is the barriers, not building commands.**
+
+| `make fwtime FWPROG=adder` | clocks | share of the CPU's 31 864 |
+| --- | ---: | ---: |
+| 143 commands that follow a `tpu_wait`, 183.6 each | **26 256** | **82.4%** |
+| ...of which the barrier's marginal cost over a back-to-back push | *24 352* | *76.4%* |
+| 390 commands pushed back-to-back, 13.3 each | 5 192 | 16.3% |
+| boot (reset to the first command) | 260 | 0.8% |
+| tail (last command to `done`) | 156 | 0.5% |
+
+(The first row's sub-line is not additive with it — 143 × 13.3 of the 26 256 is
+the ordinary push cost those commands would have paid anyway.)
+
+A command pushed on top of a busy unit is nearly free — 13.3 exposed clocks
+against the ~85 §9.7 measured, because the rest hides under the unit that is
+still running. `vpu requant` and `vpu dyt` cost **1.1** each: they are
+pushed while the VPU is still on the widening op they are paired with, so the
+queue absorbs them entirely. That is the queue doing exactly what §9.3 said it
+would, and it means **the command format is not the problem and a wider one
+would buy nothing.**
+
+What costs is stopping. A barrier is 170.3 clocks on average, and it is two
+things: *polling granularity* — `tpu_wait` spins on the retired counter over
+AXI4-Lite with instruction fetch on the same bus, so when a unit goes idle the
+CPU is mid-poll and finishes that iteration before it can see it — and whatever
+the producer computes between the barrier and its next push, which is exposed
+clock for clock (§9.10). Nearly half the barriers sit in one place:
+
+| phase | barriers | CPU clocks | share of CPU |
+| --- | ---: | ---: | ---: |
+| attention S / mask / relu / A (4 per head, 4 heads, 4 layers) | 64 | 12 960 | **41%** |
+| weight fills (6 per layer) | 24 | 6 878 | 22% |
+| everything else | 55 | 11 610 | 36% |
+
+The attention inner loop fences four times per head because the array and the
+vector unit hand `S → SM → P → A` back and forth through one set of buffers.
+Giving that loop a second `S`/`P` pair — head `h+1`'s scores computed into the
+other one while head `h`'s `P@V` is still on the array — is what would remove
+most of those 64 barriers, and it is a scratchpad-budget change (2 KB) rather
+than an ISA one. One of the four is cheaper to remove than the rest: `tpulib.h`
+drains the VPU at the end of *every* elementwise primitive, so the `+mask` and
+the `relu` that follows it fence twice where the hand-written kernel fenced
+once. That is the price of the library's self-fencing contract — a primitive
+returns only once its commands have retired, which is what makes composing two
+of them safe — and it is 16 barriers, ~0.6% of the run.
+
+The same measurement across the smaller kernels, for scale:
+
+| kernel | run | MXU | VPU | DMA | CPU | barriers | per barrier |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `matmul` | 2 209 | 13.1% | — | 70.1% | **16.8%** | 2 | 60.5 |
+| `matmul_loop` | 2 586 | 15.2% | — | 59.9% | **25.0%** | 2 | 48.9 |
+| `ffn` | 1 380 | 11.7% | 7.1% | 24.3% | **56.8%** | 4 | 70.3 |
+| `mha` | 2 228 | 9.6% | 4.5% | 24.1% | **61.8%** | 8 | 72.3 |
+| `tiled` | 80 404 | 4.8% | 1.2% | 16.1% | **77.9%** | 91 | 158.2 |
+| `adder` | 453 778 | 45.5% | 18.6% | 28.9% | **7.0%** | 143 | 170.3 |
+
+The four small kernels are 40–60% CPU, which says nothing about the machine:
+each is a handful of commands over a few hundred clocks of unit work, and boot
+alone (101–227 clocks) is a tenth of the run. `tiled` is 78% CPU for a related
+reason and a more interesting one — its arena is deliberately a few hundred
+bytes, so it does the *most* blocking the library can do over the *least* array
+work. Its barriers are ordinary (158.2 each); what is not is its **back-to-back**
+push cost, 210.2 clocks against `adder`'s 13.4, because 196 of its 237 commands
+are single-row DMAs from a strided block move and the engine finishes a 16-byte
+row long before the CPU has built the next one. That is the producer-bound
+regime, reached on purpose. **Only the last row is a workload.**
+
+And the units, per phase, from the same run:
+
+| phase | MXU | VPU | DMA | CPU | share of run |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| weight fills | — | — | 98 400 | 6 878 | **23.2%** |
+| FFN `W1` | 63 492 | — | — | 1 084 | 14.2% |
+| FFN `W2` | 60 420 | — | — | 1 080 | 13.6% |
+| projections (`Wq`, `Wk`, `Wv`) | 47 628 | — | — | 3 056 | 11.2% |
+| FFN `relu → requant` | — | 24 704 | — | 732 | 5.6% |
+| K transpose (spill + fill) | — | — | 25 104 | 424 | 5.6% |
+| attention mask (`+mask`, `RQ_ID`) | — | 16 448 | — | 2 384 | 4.2% |
+| `Wo` | 15 876 | — | — | 1 024 | 3.7% |
+| attention `relu` | — | 12 352 | — | 2 768 | 3.3% |
+| attention `S` | 9 488 | — | — | 4 096 | 3.0% |
+| attention `A` | 8 464 | — | — | 3 712 | 2.7% |
+| residual, DyT norm1, DyT norm2 | — | 24 672 | — | 1 984 | 6.0% |
+| operands in, packs, head, logits out | 993 | 6 176 | 7 696 | 2 486 | 3.9% |
+
+(The rows sum to 453 622; the missing 156 is the tail, which follows the last
+command and so belongs to none of them.)
+
+**Weight movement is the single largest item in the run — bigger than either FFN
+matmul.** 98 400 DMA clocks is 24 KB per layer through a 1 clock/byte engine,
+re-fetched every forward because one 8 KB arena cannot hold a layer. It is also
+the item most obviously fixable: the weights are read-only and a fill depends on
+nothing but the arena block it lands in, so double-buffering that block would
+let it run under the matmuls instead of between them. 22% is the ceiling, not the
+prize — the DMA is last in the scratchpad's arbitration (`A > W > C > V > s >
+DMA`), so an overlapped fill takes its cycles out of the matmul beside it. It is
+still the largest overlap opportunity in the run, and the one §9.3's ~1.45x was
+mostly about.
+
+### 9.10 What a primitive library costs a producer this slow
+
+`fw/tpulib.h` moved the block loops, the weight staging and the barriers out of
+`adder.c` and into primitives, so that nothing in the kernel depends on the
+model fitting in 64 KB of scratchpad. Measured on the same simulation, same
+checkpoint-free operands, same array:
+
+| | commands | image | clocks | `idlec` |
+| --- | ---: | ---: | ---: | ---: |
+| hand-written against `tpu.h` | 518 | 1 544 B | 439 917 | 18 035 (4.1%) |
+| through `tpulib.h`, helper with runtime `m`/`k`/`n` | 534 | 2 784 B | **597 936** | 176 022 (29.4%) |
+| through `tpulib.h`, shapes constant at the call site | 534 | 1 992 B | **453 778** | 31 864 (7.0%) |
+
+The MXU, VPU and DMA columns are byte-identical across all three: the array does
+exactly the same work, and the whole spread is the producer.
+
+**The middle row is the lesson.** A general matmul has to choose block sizes,
+resolve residency, compute a block's three base addresses and decide whether the
+store can narrow — about 200 instructions. On a PicoRV32 with no cache that is
+~1 400 clocks, and *all of it lands between a barrier and the next push*, where
+it is exposed clock for clock. Per-barrier cost went 140.3 → **1 143.8**. The
+library did not issue meaningfully more commands; it issued the same commands
+1 000 clocks later each.
+
+The third row is the same library with the decisions made at compile time. A
+transformer's dimensions are `#define`s, so a call site that spells its shape out
+gives the compiler everything: `tpu_gemm_blocks` folds to a constant, the block
+loops fold to one iteration, every `space` test resolves, and the descriptor
+never reaches memory — what is left is the two stores of a `GEOM` and the two of
+a matmul. gcc will not do it unprompted at `-Os` (`tpu_matmul` is a kilobyte of
+object code *before* folding, and the inliner decides before it knows the
+folding is available), so the three entry points that see the shape are
+`always_inline`. That makes the image **smaller**, 1 992 B against 6 420 B
+without the fold, because the general paths become dead code at every site.
+
+What remains against the hand-written kernel is +3.2% of the run: 16 more
+commands — `Wq`/`Wk`/`Wv` are three dense DRAM blocks now rather than one fused
+`[D][3D]` one, because a column slice of a fused block is strided and
+`tpu_matmul` would fetch it a row at a time — and 36 more barriers, half of them
+the drain at the end of every elementwise primitive (§9.9). That is the price of
+the self-fencing contract, and it is what makes composing two primitives safe
+without the caller reasoning about queues.
+
+**The general rule this establishes:** on this machine the producer's cost is
+paid in *instructions between a barrier and a push*, not in commands issued. Any
+firmware abstraction is free if it folds and expensive if it does not — so the
+thing to check when adding one is the disassembly, not the command count.
 
 ---
 

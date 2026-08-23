@@ -149,7 +149,7 @@ def operands_adder(args) -> dict:
 
         0x00000 X0     [T][D]   int8    0x00800 mask  [T][T]  int8
         0x01400 W_fc   [D][16]  int4    0x01800 logits[T][16] int32 (out)
-        0x02000 + L*0x6000: WQKV [D][3D], +0x1800 Wo [D][D],
+        0x02000 + L*0x6000: Wq [D][D], +0x0800 Wk, +0x1000 Wv, +0x1800 Wo,
                             +0x2000 W1 [D][F], +0x4000 W2 [F][D]
 
     Every tensor gets its own salt so a mis-addressed weight shows up as a wrong
@@ -158,10 +158,11 @@ def operands_adder(args) -> dict:
     that strided its second output tile wrongly, because both would be zero.
 
     The weights come from :func:`w_hash` rather than the `(a*r + b*c) % 16`
-    pattern the smaller kernels use, for a reason worth keeping: `Wq`, `Wk` and
-    `Wv` are *column slices* of one fused [D][3D] block, 64 columns apart, and
-    `c*b mod 16` has a period dividing 16 — so any linear pattern makes the
-    three projections bit-identical and a Wk/Wv addressing bug invisible.
+    pattern the smaller kernels use: `c*b mod 16` has a period dividing 16, so a
+    linear pattern makes blocks that differ only by a multiple-of-16 column
+    offset bit-identical — and the four [D][D] projections here are exactly that
+    kind of neighbour, which would make an addressing bug between them
+    invisible.
     """
     T, D, DFF, VPAD, LAYERS = 32, 64, 256, 16, 4
     img: dict = {}
@@ -176,14 +177,41 @@ def operands_adder(args) -> dict:
 
     for l in range(LAYERS):
         base = 0x02000 + l * 0x06000
-        put_rowmajor_i4(img, base + 0x0000, D, 3 * D,
-                        lambda r, c, s=4 * l + 1: w_hash(r, c, s))
-        put_rowmajor_i4(img, base + 0x1800, D, D,
-                        lambda r, c, s=4 * l + 2: w_hash(r, c, s))
+        for i, off in enumerate((0x0000, 0x0800, 0x1000, 0x1800)):   # Wq Wk Wv Wo
+            put_rowmajor_i4(img, base + off, D, D,
+                            lambda r, c, s=6 * l + i + 1: w_hash(r, c, s))
         put_rowmajor_i4(img, base + 0x2000, D, DFF,
-                        lambda r, c, s=4 * l + 3: w_hash(r, c, s))
+                        lambda r, c, s=6 * l + 5: w_hash(r, c, s))
         put_rowmajor_i4(img, base + 0x4000, DFF, D,
-                        lambda r, c, s=4 * l + 4: w_hash(r, c, s))
+                        lambda r, c, s=6 * l + 6: w_hash(r, c, s))
+    return img
+
+
+# ---- tiled.c ----------------------------------------------------------------
+# Its DRAM map, written once and read by both the operand builder and the
+# reference below.
+TL_A1, TL_W1, TL_C1, TL_C2 = 0x00000, 0x00600, 0x00800, 0x00E00
+TL_A3, TL_W3, TL_C3 = 0x01400, 0x01600, 0x01700
+TL_M1, TL_K1, TL_N1 = 40, 32, 32
+TL_M3, TL_K3, TL_N3 = 8, 64, 8
+
+
+def _tl_a3(r: int, c: int) -> int:
+    return ((r * 7 + c * 3) % 9) - 4
+
+
+def _tl_w3(r: int, c: int) -> int:
+    return ((r * 3 + c * 7) % 16) - 8
+
+
+def operands_tiled(args) -> dict:
+    """tiled.c: two matmuls and one elementwise pass, all DRAM to DRAM."""
+    del args
+    img: dict = {}
+    put_rowmajor_i8(img, TL_A1, TL_M1, TL_K1, TL_K1, a_val)
+    put_rowmajor_i4(img, TL_W1, TL_K1, TL_N1, w_val)
+    put_rowmajor_i8(img, TL_A3, TL_M3, TL_K3, TL_K3, _tl_a3)
+    put_rowmajor_i4(img, TL_W3, TL_K3, TL_N3, _tl_w3)
     return img
 
 
@@ -193,6 +221,63 @@ OPERANDS = {
     "ffn": operands_ffn,
     "mha": operands_mha,
     "adder": operands_adder,
+    "tiled": operands_tiled,
+}
+
+
+# =============================================================================
+# Independent references.
+#
+# The golden DRAM image is whatever the ISS computed, which checks the RTL
+# against the ISS and nothing else. That is the right check for a kernel whose
+# job is to drive the datapath: the two implementations of `matmul` are
+# independent, so agreeing means something.
+#
+# It is NOT enough for a kernel whose job is to drive a *loop*. If tpulib.h
+# tiles a matmul wrongly — a stale stride, a block base off by a tile — the ISS
+# executes the wrong commands exactly as faithfully as the hardware does, and
+# both agree on the wrong answer. So a kernel may register a reference here, and
+# it is checked against the ISS's DRAM before any vector file is written.
+# =============================================================================
+def _ref_matmul(a, w, m: int, k: int, n: int, rq_m0: int, rq_n: int) -> list:
+    """C = requant(A @ W), plain Python. `a`/`w` are index functions."""
+    out = []
+    for i in range(m):
+        row = []
+        for j in range(n):
+            acc = sum(a(i, t) * w(t, j) for t in range(k))
+            v = (acc * rq_m0 + (1 << (rq_n - 1) if rq_n else 0)) >> rq_n
+            row.append(max(-8, min(7, v)))
+        out.append(row)
+    return out
+
+
+def reference_tiled(tpu: TPU) -> None:
+    """tiled.c's three results, computed without the ISS or the kernel."""
+    c1 = _ref_matmul(a_val, w_val, TL_M1, TL_K1, TL_N1, 1, 4)
+    c3 = _ref_matmul(_tl_a3, _tl_w3, TL_M3, TL_K3, TL_N3, 1, 4)
+    want = {}
+    for i in range(TL_M1):
+        for j in range(TL_N1):
+            want[TL_C1 + i * TL_N1 + j] = c1[i][j] & 0xFF
+            want[TL_C2 + i * TL_N1 + j] = max(c1[i][j], 0) & 0xFF
+    for i in range(TL_M3):
+        for j in range(TL_N3):
+            want[TL_C3 + i * TL_N3 + j] = c3[i][j] & 0xFF
+
+    bad = [(a, tpu.dram[a], v) for a, v in sorted(want.items()) if tpu.dram[a] != v]
+    if bad:
+        for a, got, exp in bad[:8]:
+            print(f"  REF FAIL dram[0x{a:05x}] = 0x{got:02x}, expected 0x{exp:02x}",
+                  file=sys.stderr)
+        raise SystemExit(f"tiled: {len(bad)} of {len(want)} result bytes disagree "
+                         f"with the independent reference — the kernel's tiling "
+                         f"is wrong, not just the hardware's copy of it")
+    print(f"reference: {len(want)} result bytes match an independent matmul")
+
+
+REFERENCES = {
+    "tiled": reference_tiled,
 }
 
 
@@ -261,6 +346,9 @@ def main() -> int:
     with open(args.trace) as f:
         records = parse_trace(f.read())
     cmds = tpu.run_trace(records)
+
+    if args.kernel in REFERENCES:
+        REFERENCES[args.kernel](tpu)
 
     # Everything the run spilled back to DRAM, straight out of the model's own
     # write tracking — no second reference implementation to keep in step.

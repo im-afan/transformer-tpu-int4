@@ -86,7 +86,7 @@ RTL_fw_matmul    := $(UART_RTL)
 # RISC-V cross gcc (use `make fw`). `make all` would only fail on either.
 TESTS := $(filter-out uart_memory_cosim fw_matmul,$(patsubst %_tb.sv,%,$(wildcard *_tb.sv)))
 
-.PHONY: sim wave list all clean uart echo mem bram cosim fw fwsweep
+.PHONY: sim wave list all clean uart echo mem bram cosim fw fwtime fwsweep
 
 sim: $(TB) $(RTL)
 	$(IVERILOG) -o $(TOP).vvp $(RTL) $(TB)
@@ -109,7 +109,8 @@ sim: $(TB) $(RTL)
 #   make fw FWPROG=matmul_loop  the software tile loop, same expectations
 #   make fw FWPROG=ffn          the feed-forward block (first VPU commands)
 #   make fw FWPROG=mha          one head of ReLU attention
-#   make fw FWPROG=adder        the whole int4 adder model, ~440 k clocks / ~3 min
+#   make fw FWPROG=tiled        fw/tpulib.h's block loops, DRAM to DRAM
+#   make fw FWPROG=adder        the whole int4 adder model, ~454 k clocks / ~3 min
 #   make fw M=8 KTILES=16 NTILES=16   a different shape (rebuild ../fw with the
 #                                     SAME three numbers or the TB will mismatch)
 FWPROG ?= matmul
@@ -153,11 +154,30 @@ fwvec: | $(FWVEC)
 	       -k $(FWPROG) \
 	       -M $(or $(FW_M),8) --ktiles $(or $(FW_KT),4) --ntiles $(or $(FW_NT),2)
 
+FWBUILD = $(IVERILOG) -DFW_HEX='"../fw/$(FWPROG).hex"' -DFW_VEC_DIR='"$(FWVEC)"' \
+	          $(FWSHAPE) $(FW_WATCHDOG) -o fw_matmul_tb.vvp $(UART_RTL) fw_matmul_tb.sv
+
 fw: $(UART_RTL) fw_matmul_tb.sv
 	@$(MAKE) --no-print-directory fwvec
-	$(IVERILOG) -DFW_HEX='"../fw/$(FWPROG).hex"' -DFW_VEC_DIR='"$(FWVEC)"' \
-	            $(FWSHAPE) $(FW_WATCHDOG) -o fw_matmul_tb.vvp $(UART_RTL) fw_matmul_tb.sv
+	$(FWBUILD)
 	$(VVP) fw_matmul_tb.vvp
+
+# Where the run's clocks go: the same simulation, plus the testbench's optional
+# per-command timeline and the analysis that turns it into tables. This is the
+# CPU-overhead / unit-activity benchmark -- `idlec` says how much the CPU costs,
+# this says which phase it costs it in.
+#
+#   make fwtime FWPROG=adder
+#   make fwtime FWPROG=adder TLARGS=--per-command
+TIMELINE = $(FWVEC)/$(FWPROG).timeline.csv
+TLARGS  ?=
+
+fwtime: $(UART_RTL) fw_matmul_tb.sv cmd_timeline.py
+	@$(MAKE) --no-print-directory fwvec
+	$(FWBUILD)
+	$(VVP) fw_matmul_tb.vvp +CMDLOG=$(TIMELINE)
+	python cmd_timeline.py $(TIMELINE) -k $(FWPROG) \
+	       -t $(FWVEC)/$(FWPROG).trace.txt $(TLARGS)
 
 $(FWVEC):
 	mkdir -p $@

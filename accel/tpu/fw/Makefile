@@ -53,7 +53,10 @@ CFLAGS += $(if $(M),-DM=$(M)) $(if $(KTILES),-DKTILES=$(KTILES)) \
 LDFLAGS := $(ARCH) -nostdlib -Wl,-T,link.ld -Wl,--gc-sections
 
 PROG ?= matmul
-OBJS := start.o $(PROG).o
+# memops.o is the freestanding runtime gcc calls without being asked (struct
+# assignment lowers to memcpy). --gc-sections drops it from kernels that make
+# no such call, so it costs nothing to carry.
+OBJS := start.o memops.o $(PROG).o
 
 PORT ?=
 PORTARG := $(if $(PORT),-p $(PORT))
@@ -99,7 +102,8 @@ TRACEFLAGS := -DTPU_TRACE -I. -Wall -Wextra -O1 \
               $(if $(M),-DM=$(M)) $(if $(KTILES),-DKTILES=$(KTILES)) \
               $(if $(NTILES),-DNTILES=$(NTILES))
 
-%.trace: %.c mock/tpu_trace.c tpu.h
+# The host build gets memcpy from libc, so memops.c is not in this line.
+%.trace: %.c mock/tpu_trace.c tpu.h tpulib.h
 	$(HOSTCC) $(TRACEFLAGS) -o $@ $< mock/tpu_trace.c
 
 trace: $(PROG).trace

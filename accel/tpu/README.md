@@ -22,9 +22,9 @@ by simulating it against vectors produced by that reference (the same role the C
 
 **Current state.** The design simulates and, at the last bitstream that was built, ran on
 the board. The **whole model runs on it**: `fw/adder.c` is four transformer layers plus the
-output head in 518 macro-ops, and `cd tb && make fw FWPROG=adder` puts the real PicoRV32
+output head in 534 macro-ops, and `cd tb && make fw FWPROG=adder` puts the real PicoRV32
 image through the real core and checks every DRAM byte *and* every command word against the
-ISS — 526 879 checks, 0 errors, 439 917 clocks. Scored on the addition task through the ISS
+ISS — 526 959 checks, 0 errors, 453 778 clocks. Scored on the addition task through the ISS
 (`python ../tpulang/adder_export.py -n 256`) it lands at **100.00% exact-sequence**, the same
 as the PyTorch checkpoint it came from.
 
@@ -34,10 +34,15 @@ stopped reproducing (the MXU is less than half the size it was measured at) and 
 this section's doing. See [`docs/synth.md`](docs/synth.md) §5 for the current numbers next to
 the historical ones, and [`host/README.md`](host/README.md) for the link.
 
-The software side is now two directories: [`fw/`](fw) is the kernels (C, one file each), and
-[`../tpulang`](../tpulang) is what survived the toolchain deletion — the bit-exact ISS, the
-golden-vector generator that drives it from a kernel's own command trace, and the checkpoint
-exporter.
+The software side is now two directories: [`fw/`](fw) is the kernels (C, one file each) plus
+[`fw/tpulib.h`](fw/tpulib.h), a layer of **size-independent primitives** — a matmul that
+blocks in rows, columns and the contraction and stages whatever is in DRAM, the chunked
+elementwise pairs, a transpose and 2-D block moves — over `tpu.h`'s single macro-ops.
+`adder.c` is composed out of it, so nothing in the model kernel depends on the model fitting
+in 64 KB of scratchpad; `fw/tiled.c` (`make fw FWPROG=tiled`) is the regression for the
+paths it does not take. [`../tpulang`](../tpulang) is what survived the toolchain deletion —
+the bit-exact ISS, the golden-vector generator that drives it from a kernel's own command
+trace, and the checkpoint exporter.
 
 ## Directory layout
 
@@ -48,7 +53,7 @@ exporter.
 | `sim/`         | Placeholder for simulator artifacts (waveforms, logs — gitignored). Testbenches currently build and run in place under `tb/`. |
 | `constraints/` | Pin assignment and timing constraints, one `.xdc` per target board. |
 | `synth/`       | Vivado non-project build (`synth/vivado/build.tcl`), with per-board definitions and top-level wrappers under `synth/vivado/boards/<board>/`. Build output goes to `synth/build/` (gitignored). |
-| `fw/`          | C firmware for the PicoRV32 command producer (`rtl/cpu_subsys.sv`): the MMIO driver header, one `.c` per kernel, `start.S`, linker script and Makefile. Needs a RISC-V cross gcc — see [`fw/README.md`](fw/README.md). |
+| `fw/`          | C firmware for the PicoRV32 command producer (`rtl/cpu_subsys.sv`): the MMIO driver header (`tpu.h`), the size-independent primitives over it (`tpulib.h`), one `.c` per kernel, `start.S`, linker script and Makefile. Needs a RISC-V cross gcc — see [`fw/README.md`](fw/README.md). |
 | `host/`        | Python host driver: the UART protocol (`tpu_uart.py`), the end-to-end runner (`run_fw_matmul.py`), and link self-tests. |
 | `docs/`        | Microarchitecture notes: ISA / command format, register + memory map, dataflow, numerics. Start at [`docs/README.md`](docs/README.md). |
 

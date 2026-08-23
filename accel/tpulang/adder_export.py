@@ -25,7 +25,7 @@ Three things happen, in order:
 3. **Run.** Weights, the causal mask and the output head are staged into DRAM
    once — they are read-only, exactly as they would stay resident in the board's
    SRAM across forwards — and then each problem stages only its embedded `X0`
-   and re-runs the same 518 commands.
+   and re-runs the same 534 commands.
 
 The host owns the two ends, structurally: the token embedding (the ISA has no
 gather) and the argmax over 13 logits (nothing returns an index).
@@ -78,7 +78,8 @@ ROWS = COLS = 8
 # ---- DRAM map (fw/adder.c) ---------------------------------------------------
 DR_X, DR_MASK, DR_WFC, DR_LOG = 0x00000, 0x00800, 0x01400, 0x01800
 DR_LAYER, DR_LSTEP = 0x02000, 0x06000
-LW_QKV, LW_O, LW_1, LW_2 = 0x0000, 0x1800, 0x2000, 0x4000
+LW_Q, LW_K, LW_V, LW_O, LW_1, LW_2 = (0x0000, 0x0800, 0x1000, 0x1800,
+                                      0x2000, 0x4000)
 
 # ---- the 16 requant sites, in fw/adder.c's enum order ------------------------
 RQ_NAMES = ["Q", "K", "V", "KP", "VP", "S", "ID", "P", "A", "O", "XO", "X1",
@@ -193,7 +194,12 @@ def derive(model) -> tuple:
         w1, a_1 = int4_weight(lay.ff[0].w)
         w2, a_2 = int4_weight(lay.ff[2].w)
 
-        weights[(L, "qkv")] = torch.cat([wq, wk, wv], dim=1)   # [D][3D]
+        # Four dense [D][D] blocks rather than one fused [D][3D]: `tpu_matmul`
+        # stages a weight block itself, and a column slice of a fused block is
+        # strided (adder.c's DRAM map note).
+        weights[(L, "q")] = wq
+        weights[(L, "k")] = wk
+        weights[(L, "v")] = wv
         weights[(L, "o")] = wo
         weights[(L, "w1")] = w1
         weights[(L, "w2")] = w2
@@ -295,10 +301,10 @@ def stage_static(tpu: TPU, weights: dict) -> None:
 
     for L in range(LAYERS):
         base = DR_LAYER + L * DR_LSTEP
-        qkv, wo = weights[(L, "qkv")], weights[(L, "o")]
+        for key, off in (("q", LW_Q), ("k", LW_K), ("v", LW_V), ("o", LW_O)):
+            blk = weights[(L, key)]
+            put_rowmajor_i4(img, base + off, D, D, lambda r, c, b=blk: int(b[r][c]))
         w1, w2 = weights[(L, "w1")], weights[(L, "w2")]
-        put_rowmajor_i4(img, base + LW_QKV, D, 3 * D, lambda r, c: int(qkv[r][c]))
-        put_rowmajor_i4(img, base + LW_O, D, D, lambda r, c: int(wo[r][c]))
         put_rowmajor_i4(img, base + LW_1, D, DFF, lambda r, c: int(w1[r][c]))
         put_rowmajor_i4(img, base + LW_2, DFF, D, lambda r, c: int(w2[r][c]))
 
