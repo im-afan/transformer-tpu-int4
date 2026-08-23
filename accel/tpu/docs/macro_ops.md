@@ -25,7 +25,7 @@ Built and passing (`tb/` 13/13, `make cosim` 11/11, `torch_ref.py` all kernels):
 
 | Piece | Where | Test |
 | --- | --- | --- |
-| Per-run performance counters | `rtl/perf_counters.sv` (replaces `cycle_timer.sv`) | `tpu_top_uart_tb` structural + per-program checks |
+| Per-run performance counters | `rtl/perf_counters.sv` (replaces `cycle_timer.sv`) | `fw_uart_tb` structural + per-kernel checks, decoded from the `'T'` reply (`make fwuart`) |
 | `setcfgr` (register → config) | `scalar_unit.sv` `0x1C` | `examples/setcfgr.tpu` |
 | MXU config strides | `mxu.sv` `a_row`/`c_row`/`w_row` | `examples/strided_matmul.tpu` |
 | `matmul_t` hardware tile loop | `mxu.sv` `0x1D` | `examples/tiled_matmul_hw.tpu` |
@@ -153,7 +153,11 @@ off "the stride registers are nonzero", with zero meaning the single-tile defaul
 works for one program and breaks for two — running `strided_matmul.tpu` (which sets
 `arow=16`, `crow=64`, `wcol=4`) and then `relu_layer.tpu` made the second program's plain
 `matmul` read its operands at the first program's strides, corrupting every output byte.
-The two-program `tpu_top_uart_tb` sequence catches this; a single-program test never would.
+The two-program `tpu_top_uart_tb` sequence caught this. That testbench went with the
+scalar unit; `make fwuart FWPROG=<kernel> RERUN=1` (`tb/fw_uart_tb.sv`) is the
+two-runs-one-link case now, and it found a restart bug of its own the moment it existed
+— [`picorv32_migration.md`](picorv32_migration.md) §9.11. A single-program test never
+would have seen either.
 
 So `matmul_t` (opcode `0x1D`) reads the strides and `matmul` (`0x00`) ignores them
 outright. The mode is a property of the instruction, not of leftover machine state. Within

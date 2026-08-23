@@ -137,7 +137,8 @@ like the ones in `test_uart_link.py` show up in the trace too.
 ## Running a program
 
 `run_program.py` is the whole flow in one command — the hardware counterpart of
-`tb/tpu_top_uart_tb.sv`:
+`tb/fw_uart_tb.sv` (`make fwuart`), which drives the same `'I'`/`'W'`/`'G'`/`'T'`/`'R'`
+sequence against the RTL with no board:
 
 ```bash
 python accel/tpu/host/run_program.py -p COM5                 # tiled_matmul.tpu
@@ -286,7 +287,7 @@ front and stops with a message instead of reporting 20 bogus failures.
 
 Not covered: anything requiring a program to be running (the `core_busy`
 arbitration path, `I` + `G` end to end) — that is `run_program.py`'s job, and
-`tb/tpu_top_uart_tb.sv`'s in simulation.
+`tb/fw_uart_tb.sv`'s in simulation (`cd accel/tpu/tb && make fwuart FWPROG=<kernel>`).
 
 ## Testing the UART alone
 

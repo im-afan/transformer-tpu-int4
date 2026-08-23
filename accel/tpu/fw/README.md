@@ -56,8 +56,12 @@ here. Nothing is linked (`-nostdlib`, no libgcc), so a kernel that needs `/` or
 
 ## Simulate it
 
+Two testbenches run any kernel here through the whole core, against the same ISS
+golden vectors. They differ only in how the image and the operands get in.
+
 `../tb/fw_matmul_tb.sv` loads the image through `cpu_subsys.sv`'s `FW_INIT`
-(`$readmemh`, no UART), seeds DRAM, releases the CPU and checks the int32 C:
+(`$readmemh`, no UART), seeds DRAM by backdoor, releases the CPU and checks the
+int32 C. This is the fast one and the one to iterate on:
 
 ```bash
 cd accel/tpu/tb
@@ -77,8 +81,42 @@ to delete. Breakdown in
 timeline: where the run's clocks went, per unit and per phase, and what the CPU
 cost to issue each class of command. It works on any kernel here.
 
-Both take the shape from the build, so `make fwsweep` walks a range of them and
-tabulates what each costs the CPU:
+`../tb/fw_uart_tb.sv` touches nothing but the two serial pins: `'I'` loads the
+firmware, `'W'` writes the operands — weights included — `'G'` starts the core,
+`'T'` reads the counters and `'R'` reads the results back. That is exactly the
+sequence `host/run_fw_matmul.py` runs on the board, so a pass says the board path
+is wired end to end and not only that the datapath computes:
+
+```bash
+make fwuart FWPROG=ffn          # ~12 s
+make fwuart FWPROG=adder        # the whole model, 102 KB of weights over the wire
+make fwuart FWPROG=ffn RERUN=1  # load and run a second time, no reset in between
+```
+
+`adder` passes: 1 980 firmware bytes in one `'I'`, 101 888 operand bytes in 26
+`'W'` frames, 4 096 result bytes back in 2 `'R'` frames, 531 102 checks, 0 errors,
+534/534 commands — and a counter block **bit-identical** to `make fw`'s
+(`run=453 777 mxu=206 361 vpu=84 352 dma=131 200 idlec=31 864`). The serial path
+adds nothing to the run; it only changes how the bytes arrive.
+
+The link is the whole cost of that target: at `FWUART_CPB=16` clocks per bit a
+byte is 160 core clocks, so `adder` is 17.8 M simulated clocks — **~21 minutes of
+Icarus** against `make fw`'s ~3 — of which 16.3 M is serial traffic and 454 k is
+the compute. `FWUART_CPB=8` halves it; below 8 the receiver's mid-bit sample
+stops being mid-bit (it sits at `CPB/2` clocks past a two-flop synchroniser).
+Iterate with `make fw`; run this one to prove the board path.
+
+`RERUN=1` is the regression for restarting the core without a reset — see
+[`../docs/picorv32_migration.md`](../docs/picorv32_migration.md) §9.11 for the
+bug it found.
+
+`matmul.c` and `matmul_loop.c` take their shape from the build, and either
+testbench follows: `make fw M=... KTILES=... NTILES=...` (or `make fwuart ...`)
+rebuilds the firmware, its native trace and the golden operands at that shape —
+until recently it rebuilt only the first two and staged the *default* shape's
+operands, which did not fail: the ISS read the same zeros the hardware did, so
+the run passed having tested almost nothing. `make fwsweep` walks a range of
+shapes and tabulates what each costs the CPU:
 
 ```bash
 make -C accel/tpu/fw M=8 KTILES=16 NTILES=16   # one shape (make clean first)

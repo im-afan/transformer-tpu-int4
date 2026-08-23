@@ -113,6 +113,7 @@ python accel/tpulang/fw_vectors.py -t <trace> -o accel/tpu/tb/vectors_fw -k adde
 python accel/tpu/host/run_fw_matmul.py --dry-run   # operands + reference, no board
 cd accel/tpu/tb && make fw FWPROG=adder     # the kernel through the whole core (~3 min)
 cd accel/tpu/tb && make fw FWPROG=tiled     # tpulib.h's block loops, ~20 s
+cd accel/tpu/tb && make fwuart FWPROG=ffn   # the same, but loaded over the simulated UART
 cd accel/tpu/tb && make list                # RTL testbenches (Icarus)
 
 python accel/tpulang/adder_export.py -n 256          # accuracy on the addition task
@@ -120,9 +121,26 @@ python accel/tpulang/adder_export.py --dump-rq -n 0  # the 16 requant words per 
 ```
 
 `make` targets in `tb/`: `sim` (default TB), `cosim` (host driver vs RTL over a
-simulated UART), `fw` / `fwsweep` (C firmware; `fw` needs a RISC-V gcc, and
-regenerates golden vectors from the kernel's own native trace first),
+simulated UART), `fw` / `fwuart` / `fwsweep` (C firmware; all need a RISC-V gcc,
+and regenerate golden vectors from the kernel's own native trace first),
 `echo`/`mem`/`bram` (bring-up images), `wave`, `list`, `all`.
+
+**`fw` and `fwuart` run the same kernel against the same ISS vectors and differ
+only in how the bytes get in.** `fw` backdoors the image through `FW_INIT` and
+pokes DRAM directly; `fwuart` (`tb/fw_uart_tb.sv`) drives the two serial pins and
+nothing else — `'I'` the firmware, `'W'` the operands *including the weights*,
+`'G'`, `'T'`, `'R'` — which is the sequence `host/run_fw_matmul.py` runs on the
+board. Use `fw` to iterate and `fwuart` to prove the host path. **`make fwuart
+FWPROG=adder` passes with a counter block bit-identical to `make fw`'s** (531 102
+checks, 534/534 commands, `run=453 777`), which is the point: the serial path
+changes only how the bytes arrive. It costs 17.8 M simulated clocks — **~21 min
+of Icarus against `make fw`'s ~3** — because at the default `FWUART_CPB=16` a
+byte is 160 core clocks and 102 KB of operands is 16.3 M of them (`FWUART_CPB=8`
+halves it; below 8 the receiver's mid-bit sample stops being mid-bit). `make fwuart FWPROG=<kernel> RERUN=1` loads and runs a second
+time with no reset in between — that is a regression, not a formality: it is what
+caught `tpu_top.sv` clearing `cpu_run` against the *previous* run's stale
+`cpu_done`, so the second `'G'` released the core for one cycle and re-reset it
+(`docs/picorv32_migration.md` §9.11).
 
 ## Architecture
 

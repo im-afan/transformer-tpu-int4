@@ -31,13 +31,14 @@ What passes today, on the tree as it stands:
 | `make TEST=dma` (incl. new contention tests) | 16 737 checks, 0 errors |
 | `make TEST=cmd_queue` (new) | 123 checks, 0 errors |
 | ~~`make examples`~~ | **gone with phase 5** - the ten `.tpu` kernels and the assembler that built them were deleted. `make fw FWPROG=...` over the four C kernels is what covers the dispatch plane now |
-| `make uart` (two programs, one link, no reset between) | 469 checks, 0 errors |
+| ~~`make uart`~~ | **gone with phase 5** - it drove two assembled `.tpu` programs through `tpu_top_uart_tb.sv`. `make fwuart FWPROG=<kernel> RERUN=1` is the successor and covers the same "two runs, one link, no reset between" case |
 | `make TEST=cpu_smoke` (new) | 68 checks, 0 errors - PicoRV32 boots, pushes two DMA commands, 64-byte round trip byte-exact |
 | `make fw` - the C firmware through `tpu_top`, image via `FW_INIT`, golden vectors + expected command trace from the kernel's own native trace (§8.1) | **539 / 574 checks, 0 errors** on `matmul` / `matmul_loop`; halts after 2 210 / 2 587 clocks. Checks the DRAM image *and* the command stream, 5 / 12 commands matched |
 | `make fw FWPROG=ffn` / `mha` | 0 errors - the feed-forward block and one attention head, the first VPU and transposing-DMA commands from firmware |
 | `make fw FWPROG=adder` - **the whole model** | **526 959 checks, 0 errors**, halts after 453 778 clocks; 534 of 534 commands matched |
 | `make fw FWPROG=tiled` - `tpulib.h` past the scratchpad | **525 474 checks, 0 errors**, 80 404 clocks, 237 of 237 commands matched, and the ISS's answer checked against an independent Python matmul |
 | ~~`make model [LAYERS=n]`~~ | **gone with phase 5** - `tpu_top_tb.sv` drove the scalar unit. `make fw FWPROG=adder` replaces it and checks strictly more (the command stream as well as the image) |
+| `make fwuart FWPROG=<kernel>` - the same kernels with **nothing backdoored**: image, operands and results all over the simulated UART (§9.11) | 0 errors on every kernel; **`adder`: 531 102 checks, 534/534 commands, and a counter block identical to `make fw`'s** (`run=453 777 mxu=206 361 vpu=84 352 dma=131 200 idlec=31 864`) |
 | `make fwsweep` - both kernels over 11 shapes, vectors regenerated per shape | 22 of 22, 0 failures (largest: 260 commands) |
 | `make all` | 15 of 15 |
 
@@ -953,6 +954,105 @@ without the caller reasoning about queues.
 paid in *instructions between a barrier and a push*, not in commands issued. Any
 firmware abstraction is free if it folds and expensive if it does not — so the
 thing to check when adding one is the disassembly, not the command count.
+
+
+### 9.11 The same kernels with nothing backdoored, and the restart bug it found
+
+`make fw` proves the datapath. It does not prove the *board* path: the image
+arrives through `cpu_subsys.sv`'s `FW_INIT` parameter, the operands are poked
+straight into the SRAM chip model, and the results are read out of it the same
+way. Everything the host actually has to do — `'I'`, `'W'`, `'G'`, `'T'`, `'R'`
+over one serial line — is untested by it.
+
+`tb/fw_uart_tb.sv` (`make fwuart FWPROG=<kernel>`) is that test, and it is the
+successor to the retired `tpu_top_uart_tb.sv` that did the same job for the
+scalar unit's `.tpu` programs. `host_run`, `imem_*` and `cfg_*` are tied off; the
+only stimulus is `uart_rx`. It runs any kernel in `fw/` against the same three
+ISS-generated vector files `fw_matmul_tb.sv` uses, so nothing about the golden
+data is duplicated — only how it gets in and out:
+
+| | `make fw` | `make fwuart` |
+| --- | --- | --- |
+| firmware image | `FW_INIT` `$readmemh` | `'I'` frames |
+| operands | poked into the chip model | `'W'` frames |
+| start | `host_run` pin | `'G'` |
+| results | read out of the chip model | `'R'` frames, compared as they arrive |
+| counters | hierarchical reference | `'T'` reply, decoded |
+| stray writes | every DRAM byte | every DRAM byte (backdoor — see below) |
+
+The one check that cannot go over the wire is the full-DRAM sweep: 512 KB at
+10·`UART_CPB` clocks a byte is more simulation than every kernel here put
+together. It stays a backdoor read of the same memory `'W'` just wrote, so it
+extends the `'R'` check to the addresses `'R'` cannot afford rather than
+replacing it.
+
+**Measured, on the whole model.** `make fwuart FWPROG=adder` — 1 980 firmware
+bytes in one `'I'`, 101 888 operand bytes in 26 `'W'` frames, 4 096 result bytes
+back in 2 `'R'` frames:
+
+```
+  'I' loaded 495 firmware words (1980 bytes)
+  'W' 101888 bytes in 26 frames
+  firmware signalled done, 454410 clocks after 'G'
+  counters: run=453777 mxu=206361 mload=33440 vpu=84352 (vmm=0) dma=131200
+            idlec=31864 qfull=0 ovlap=0
+  'R' 4096 bytes in 2 frames
+  backdoor sweep: 0 of 524288 DRAM bytes wrong
+  command trace: 534 commands issued, 534 expected
+==== done: 531102 checks, 0 errors ====
+```
+
+Every counter is **bit-identical to `make fw`'s** on the same kernel, and so is
+the 534-command trace. That is the result worth having: the run is the same run,
+so the serial path adds nothing and hides nothing — it only changes how the bytes
+arrive.
+
+**Cost.** The link is the whole of it. At the default `FWUART_CPB=16` a byte is
+160 core clocks, so the small kernels are ~10–20 s and `adder` is **17.8 M
+simulated clocks, ~21 minutes of Icarus** — 16.3 M of those clocks are serial
+traffic and 454 k are the compute `make fw` does in ~3 minutes. `FWUART_CPB=8`
+halves it; below 8 the receiver's mid-bit sample (`CPB/2`, two flops after the
+pin) stops being mid-bit. Use `make fw` to iterate; this is the one that says the
+board path works.
+
+**What it found immediately: the core could not be started twice without a
+reset.** `RERUN=1` loads and runs the same kernel a second time over the same
+link, which is what two back-to-back `run_fw_matmul.py` invocations do on the
+board. It failed on the second `'G'`:
+
+```
+---- pass 2 (no reset in between) ----
+  'I' loaded 162 firmware words (648 bytes)
+  'W' 160 bytes in 4 frames
+  FAIL core never started after 'G' (done=0)
+  FAIL command count: RTL issued 0, expected 19
+```
+
+`cpu_done` is level-held after a run, and `cpu_subsys.sv` only re-arms it on the
+clock *after* it sees `cpu_run` rise. `tpu_top.sv`'s run latch cleared `cpu_run`
+on `cpu_run && cpu_done` — which is true on that very clock, against the previous
+run's stale `done_r`. Probed:
+
+```
+[probe] cyc=303186 run_start=1 cpu_run=0 done_r=1 busy=0   <- 'G'
+[probe] cyc=303186 run_start=0 cpu_run=1 done_r=1 busy=0   <- released...
+[probe] cyc=303188 run_start=0 cpu_run=0 done_r=0 busy=0   <- ...and re-reset
+```
+
+The core is released for exactly one cycle and put straight back into reset. The
+host sees ACK for its `'I'`, its `'W'` and its `'G'`, and then an idle board
+holding the *first* run's counters and results — the same failure signature the
+scalar unit's dropped second `'I'` load had, which is why the two-program
+sequence was worth keeping when the producer changed.
+
+Fixed in `tpu_top.sv` by gating the clear on the run having actually been taken
+up (`cpu_busy` high, i.e. `done_r` re-armed), one clock later. `make fwuart
+FWPROG=mha RERUN=1` now runs both passes clean, and the second run's counters
+restart (`run=2227` against pass 1's `2228` — pass 1 begins one clock earlier
+because `done_r` is already clear out of reset).
+
+This is invisible to `make fw`, `make fwsweep` and `cpu_smoke_tb`: every one of
+them runs exactly one program per reset.
 
 ---
 

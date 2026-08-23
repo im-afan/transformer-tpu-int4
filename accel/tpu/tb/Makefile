@@ -24,6 +24,12 @@
 # bitstream's core, backed by on-chip block RAM (rtl/bram.sv):
 #   make bram
 #
+# A firmware kernel through the whole core: built from ../fw/<name>.c, checked
+# against the ISS. `fw` backdoors the image and the operands in; `fwuart` loads
+# both over the simulated serial link exactly as the board host does:
+#   make fw     FWPROG=adder
+#   make fwuart FWPROG=adder
+#
 # The cmod_a7_mem image again, but driven by host/test_uart_link.py itself
 # instead of by hand-written stimulus — the real host driver, the real RTL, no
 # board (tb/uart_memory_cosim_tb.sv + host/sim_link.py):
@@ -79,14 +85,16 @@ RTL_cpu_smoke    := $(UART_RTL)
 RTL_tpu_top      := $(UART_RTL)
 RTL_tpu_top_uart := $(UART_RTL)
 RTL_fw_matmul    := $(UART_RTL)
+RTL_fw_uart      := $(UART_RTL)
 
-# Every test discoverable from the *_tb.sv files present. Two are excluded:
+# Every test discoverable from the *_tb.sv files present. Three are excluded:
 # uart_memory_cosim has no rtl/<name>.sv and cannot run without host/sim_link.py
-# driving it (use `make cosim`), and fw_matmul needs a firmware image built by a
-# RISC-V cross gcc (use `make fw`). `make all` would only fail on either.
-TESTS := $(filter-out uart_memory_cosim fw_matmul,$(patsubst %_tb.sv,%,$(wildcard *_tb.sv)))
+# driving it (use `make cosim`), and fw_matmul / fw_uart need a firmware image
+# built by a RISC-V cross gcc (use `make fw` / `make fwuart`). `make all` would
+# only fail on any of them.
+TESTS := $(filter-out uart_memory_cosim fw_matmul fw_uart,$(patsubst %_tb.sv,%,$(wildcard *_tb.sv)))
 
-.PHONY: sim wave list all clean uart echo mem bram cosim fw fwtime fwsweep
+.PHONY: sim wave list all clean uart echo mem bram cosim fw fwuart fwtime fwsweep
 
 sim: $(TB) $(RTL)
 	$(IVERILOG) -o $(TOP).vvp $(RTL) $(TB)
@@ -111,8 +119,9 @@ sim: $(TB) $(RTL)
 #   make fw FWPROG=mha          one head of ReLU attention
 #   make fw FWPROG=tiled        fw/tpulib.h's block loops, DRAM to DRAM
 #   make fw FWPROG=adder        the whole int4 adder model, ~454 k clocks / ~3 min
-#   make fw M=8 KTILES=16 NTILES=16   a different shape (rebuild ../fw with the
-#                                     SAME three numbers or the TB will mismatch)
+#   make fw M=8 KTILES=16 NTILES=16   a different shape -- the firmware, the
+#                                     native trace and the golden operands are
+#                                     all rebuilt at it (see FWSHAPEARGS)
 FWPROG ?= matmul
 M      ?=
 KTILES ?=
@@ -141,8 +150,16 @@ FWVEC := vectors_fw
 # only thing that catches it is the "nothing past C" guard.) So `fw` rebuilds
 # both firmware artifacts from clean at the requested shape every time. The
 # images are a few hundred bytes; correctness is worth the second.
-FWSHAPEARGS = $(if $(FW_M),M=$(FW_M)) $(if $(FW_KT),KTILES=$(FW_KT)) \
-              $(if $(FW_NT),NTILES=$(FW_NT))
+# The names here are M/KTILES/NTILES, not FW_M/FW_KT/FW_NT. Those are the -D
+# spellings the *testbench* takes, and they are not make variables — spelling
+# them here made both this and the fw_vectors.py line below silently fall back
+# to the default shape while the TB was built for the requested one. It did not
+# fail loudly: the firmware ran the right shape, read operands staged for the
+# small one, and the ISS read the same zeros, so both agreed and the run passed
+# having tested almost nothing. run_fw_sweep.sh always passed the shape properly
+# and is unaffected.
+FWSHAPEARGS = $(if $(M),M=$(M)) $(if $(KTILES),KTILES=$(KTILES)) \
+              $(if $(NTILES),NTILES=$(NTILES))
 
 .PHONY: fwvec
 fwvec: | $(FWVEC)
@@ -152,7 +169,7 @@ fwvec: | $(FWVEC)
 	../fw/$(FWPROG).trace > $(FWVEC)/$(FWPROG).trace.txt
 	python $(TPULANG)/fw_vectors.py -t $(FWVEC)/$(FWPROG).trace.txt -o $(FWVEC) \
 	       -k $(FWPROG) \
-	       -M $(or $(FW_M),8) --ktiles $(or $(FW_KT),4) --ntiles $(or $(FW_NT),2)
+	       -M $(or $(M),8) --ktiles $(or $(KTILES),4) --ntiles $(or $(NTILES),2)
 
 FWBUILD = $(IVERILOG) -DFW_HEX='"../fw/$(FWPROG).hex"' -DFW_VEC_DIR='"$(FWVEC)"' \
 	          $(FWSHAPE) $(FW_WATCHDOG) -o fw_matmul_tb.vvp $(UART_RTL) fw_matmul_tb.sv
@@ -161,6 +178,37 @@ fw: $(UART_RTL) fw_matmul_tb.sv
 	@$(MAKE) --no-print-directory fwvec
 	$(FWBUILD)
 	$(VVP) fw_matmul_tb.vvp
+
+# The same kernel, but nothing is backdoored: fw_uart_tb.sv loads the image with
+# 'I', writes the operands (weights included) with 'W', starts the core with 'G'
+# and reads the results back with 'R', over the two serial pins only. Same ISS
+# golden vectors as `fw`, so any kernel in ../fw/ runs here unchanged:
+#
+#   make fwuart FWPROG=ffn            ~12 s
+#   make fwuart FWPROG=adder          the whole model, weights over the wire
+#   make fwuart FWPROG=ffn RERUN=1    load + run a second time, no reset between
+#   make fwuart FWPROG=matmul VCD=1   dump fw_uart_tb.vcd (big; off by default)
+#   make fwuart FWPROG=ffn FWUART_CPB=8   half the clocks per bit, half the run
+#
+# FWUART_CPB is what the DUT's serial blocks are built with. It is a simulation
+# speed knob and the whole cost of this target: at 16 clocks/bit a byte costs 160
+# core clocks, so the adder's 102 KB of operands are ~16 M clocks of link traffic
+# against 454 k clocks of compute. Do not go below 8 -- the receiver's mid-bit
+# sample sits at CPB/2 clocks past a two-flop synchroniser and stops being
+# mid-bit. See fw_uart_tb.sv's header.
+FWUART_CPB  ?= 16
+RERUN       ?=
+VCD         ?=
+FWUARTFLAGS ?=
+
+FWUARTBUILD = $(IVERILOG) -DFW_HEX='"../fw/$(FWPROG).hex"' -DFW_NAME='"$(FWPROG)"' \
+	          -DFW_VEC_DIR='"$(FWVEC)"' -DUART_CPB=$(FWUART_CPB) \
+	          $(FWUARTFLAGS) -o fw_uart_tb.vvp $(UART_RTL) fw_uart_tb.sv
+
+fwuart: $(UART_RTL) fw_uart_tb.sv
+	@$(MAKE) --no-print-directory fwvec
+	$(FWUARTBUILD)
+	$(VVP) fw_uart_tb.vvp $(if $(RERUN),+RERUN) $(if $(VCD),+VCD)
 
 # Where the run's clocks go: the same simulation, plus the testbench's optional
 # per-command timeline and the analysis that turns it into tables. This is the
@@ -212,6 +260,11 @@ wave: sim
 list:
 	@echo "available tests:"
 	@for t in $(TESTS); do echo "  make TEST=$$t"; done
+	@echo "firmware kernels (not in \`make all\` -- they need a RISC-V cross gcc):"
+	@for k in $(patsubst ../fw/%.c,%,$(wildcard ../fw/*.c)); do \
+		case $$k in memops) continue;; esac; \
+		printf "  make fw FWPROG=%-12s |  make fwuart FWPROG=%s\n" $$k $$k; \
+	done
 
 all:
 	@for t in $(TESTS); do \

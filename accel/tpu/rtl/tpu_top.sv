@@ -307,11 +307,30 @@ module tpu_top #(
     // held there until the firmware signals done (or traps). "busy defines the
     // window" is what the host protocol, the SRAM arbitration and the perf
     // counters all key off.
+    //
+    // `cpu_started` is what makes a *second* 'G' work with no reset in between.
+    // `cpu_done` is level-held from the previous run, and cpu_subsys only clears
+    // it on the clock after it sees `cpu_run` rise — so a bare
+    // `cpu_run && cpu_done` clear fires on that same clock, on the stale value.
+    // The core is released for exactly one cycle, put straight back into reset,
+    // and the second program never runs: the host sees ACK for its 'I', 'W' and
+    // 'G' and then a board that is idle with the *first* run's counters and
+    // results still in place, until the reset button is pressed. So the clear
+    // waits for the run to actually be taken up (`cpu_busy` high, i.e. done_r
+    // re-armed), which is one clock later. tb/fw_uart_tb.sv `RERUN=1` is the
+    // regression.
+    logic cpu_started;
     always_ff @(posedge clk or negedge rst_n) begin
-        if (!rst_n)                       cpu_run <= 1'b0;
-        else if (uart_run_start)          cpu_run <= 1'b1;
-        else if (host_run)                cpu_run <= 1'b1;
-        else if (cpu_run && cpu_done)     cpu_run <= 1'b0;
+        if (!rst_n) begin
+            cpu_run     <= 1'b0;
+            cpu_started <= 1'b0;
+        end else if (uart_run_start || host_run) begin
+            cpu_run     <= 1'b1;
+            cpu_started <= 1'b0;
+        end else begin
+            if (cpu_busy)                           cpu_started <= 1'b1;
+            if (cpu_run && cpu_started && cpu_done) cpu_run <= 1'b0;
+        end
     end
 
     assign busy = cpu_busy;
