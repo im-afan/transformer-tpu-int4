@@ -50,29 +50,26 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 # --- opcode map (must match scalar_unit.sv OP_* and assembler.py SPECS) --------
-# 0x02, 0x05, 0x0A-0x0F, 0x1B and 0x20 are retired holes: vecmul, gelu,
-# vecemul, square, exp, redmax, redsum, sadd, sdiv and softmax went with the VPU
-# datapath that implemented them (rtl/vpu.sv header). They are not reused, so an
-# old binary decodes to an unknown opcode rather than to a different
-# instruction. `vecdot` (0x01) stayed: it is vecmatmul's inner primitive, so its
-# datapath is not optional.
+# 0x02, 0x05, 0x0A-0x0F, 0x1B, 0x1E and 0x20 are retired holes: vecmul, gelu,
+# vecemul, square, exp, redmax, redsum, sadd, sdiv, vecmatmul and softmax went
+# with the VPU datapath that implemented them (rtl/vpu.sv header). They are not
+# reused, so an old binary decodes to an unknown opcode rather than to a
+# different instruction. `vecdot` (0x01) stayed: it is the reduction path, and
+# the only int8 x int8 reduction the ISA has.
 # The VPU op selectors the op bodies branch on. These used to be tpulang opcodes
 # decoded from a 32-bit instruction word; with that front end gone they are just
 # an internal enum, and `TPU._VOP_TO_OP` maps the hardware's VOP_* onto them.
 OP_VECDOT, OP_VECADD = 0x01, 0x03
 OP_RELU, OP_REQUANT = 0x04, 0x09
-OP_VECMM = 0x1E
 OP_DYT = 0x21
 OP_QUANT4 = 0x22
 
 CFG_TLEN, CFG_VLEN, CFG_LEN, CFG_SCALAR = 0, 1, 2, 3
 # MXU hardware-tiling geometry (docs/macro_ops.md §3)
 CFG_KTILES, CFG_NTILES, CFG_AROW, CFG_CROW, CFG_WROW = 4, 5, 6, 7, 8
-# VPU macro-op geometry
-# CFG_VSCALAR (9) is retired with OP_SOFTMAX, the only op that read it; the
-# index is kept so 10..17 do not shift under every existing program.
-CFG_VROWS, CFG_VCOLS, CFG_VROW0, CFG_VROW1 = 10, 11, 12, 13
-CFG_VCROW = 14   # vecmatmul dst row stride (the MXU owns CFG_CROW)
+# 9 (CFG_VSCALAR) is retired with OP_SOFTMAX and 10..14 (the vecmatmul macro
+# op's rows/cols and three row strides) with OP_VECMM — its only reader. The
+# indices are kept vacant so 15..17 do not shift.
 # DMA transpose geometry (docs/dma.md §5); read only by rdmem.t / wrmem.t.
 CFG_TCOLS, CFG_TSROW, CFG_TDROW = 15, 16, 17
 
@@ -374,35 +371,6 @@ class TPU:
                     else:
                         self.wr_i32(out_n + t * c_row + j * 4, acc)
 
-    # ---- VPU macro op: vecmatmul (vpu.sv VOP_VECMATMUL) ----------------------
-    def _vecmatmul(self, dst: int, src0: int, src1: int) -> None:
-        """S[t][s] = sum_d src0[t][d] * src1[s][d], int8 operands, int32 result.
-
-        The hardware runs this as one VOP_DOT per (t, s) pair, so the numerics
-        are exactly the dot product's: int8 reads, int32 accumulate, one int32
-        store. Modelled the same way rather than as a matrix product, because
-        that equivalence *is* the contract.
-
-        `src1` is read row-major and contracted over its own rows, so the
-        transpose in Q@K^T is implicit in the loop order — K is never
-        materialized transposed.
-        """
-        rows = (self.cfg[CFG_VROWS] & 0xFFFF) or 1
-        cols = (self.cfg[CFG_VCOLS] & 0xFFFF) or 1
-        vlen = self.cfg[CFG_VLEN] & 0x3FF
-        row0 = self.cfg[CFG_VROW0] & 0xFFFF
-        row1 = self.cfg[CFG_VROW1] & 0xFFFF
-        crow = self.cfg[CFG_VCROW] & 0xFFFF
-        if vlen == 0:
-            return
-        for t in range(rows):
-            for s in range(cols):
-                a = src0 + t * row0
-                b = src1 + s * row1
-                acc = sum(self.rd_i8(a + d) * self.rd_i8(b + d)
-                          for d in range(vlen))
-                self.wr_i32(dst + t * crow + s * 4, s32(acc))
-
     # ---- VPU (vpu.sv) --------------------------------------------------------
     def _vpu(self, opc: int, dst: int, src0: int, src1: int,
              rq_word: int = None) -> None:
@@ -475,8 +443,8 @@ class TPU:
     # duplicated, forked or re-derived, so a command trace and a .tpu program
     # that mean the same thing produce byte-identical images by construction.
     #
-    # Sticky geometry (MXU_GEOM / VPU_GEOM) lands in the `cfg` file because that
-    # is where the op bodies already read it from. It is not the old global
+    # Sticky geometry (MXU_GEOM; VPU_GEOM is retired) lands in the `cfg` file
+    # because that is where the op bodies already read it from. It is not the old global
     # config file coming back: nothing else writes these, and a command stream
     # carries its geometry in its own order, which is the property cmd_mxu.sv's
     # header is about.
@@ -486,14 +454,14 @@ class TPU:
 
     # Command opcodes, from cmd_{mxu,vpu,dma}.sv.
     MXU_GEOM, MXU_MM = 0x01, 0x02
-    VPU_CMD_OP, VPU_CMD_GEOM = 0x01, 0x02
+    VPU_CMD_OP = 0x01          # 0x02 (GEOM) retired with the vecmatmul macro op
     DMA_MOVE = 0x01
 
     # vpu.sv VOP_* -> the tpulang opcode `_vpu` dispatches on. Two encodings for
     # one op set is a wart of keeping both producers alive through phase 4; the
     # map is here rather than in the caller so there is exactly one of it.
     _VOP_TO_OP = {0: OP_VECDOT, 1: OP_VECADD, 3: OP_RELU, 10: OP_REQUANT,
-                  13: OP_VECMM, 16: OP_DYT, 17: OP_QUANT4}
+                  16: OP_DYT, 17: OP_QUANT4}
 
     def exec_command(self, unit: int, w0: int, w1: int, w2: int, w3: int) -> None:
         """Execute one 128-bit macro-op. Mirrors the RTL decoders field for field.
@@ -520,13 +488,7 @@ class TPU:
                              rq_word=w2 & ((1 << (self.m0_w + self.n_w)) - 1))
 
         elif unit == self.U_VPU:
-            if op == self.VPU_CMD_GEOM:
-                self.cfg[CFG_VROWS] = (w0 >> 16) & 0xFFFF
-                self.cfg[CFG_VCOLS] = w1 & 0xFFFF
-                self.cfg[CFG_VROW0] = (w1 >> 16) & 0xFFFF
-                self.cfg[CFG_VROW1] = w2 & 0xFFFF
-                self.cfg[CFG_VCROW] = (w2 >> 16) & 0xFFFF
-            elif op == self.VPU_CMD_OP:
+            if op == self.VPU_CMD_OP:
                 vop = (w0 >> 8) & 0x1F
                 if vop not in self._VOP_TO_OP:
                     return
@@ -535,10 +497,7 @@ class TPU:
                 src1 = (w1 >> 16) & 0xFFFF
                 self.cfg[CFG_VLEN] = w2 & 0x3FF
                 rq = (w2 >> 16) & ((1 << (self.m0_w + self.n_w)) - 1)
-                if opc == OP_VECMM:
-                    self._vecmatmul(dst, src0, src1)
-                else:
-                    self._vpu(opc, dst, src0, src1, rq_word=rq)
+                self._vpu(opc, dst, src0, src1, rq_word=rq)
 
         elif unit == self.U_DMA:
             if op == self.DMA_MOVE:

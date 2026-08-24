@@ -78,6 +78,7 @@ ROWS = COLS = 8
 # ---- DRAM map (fw/adder.c) ---------------------------------------------------
 DR_X, DR_MASK, DR_WFC, DR_LOG = 0x00000, 0x00800, 0x01400, 0x01800
 DR_LAYER, DR_LSTEP = 0x02000, 0x06000
+LOGITS_BYTES = T * VPAD * 4     # what the head writes at DR_LOG
 LW_Q, LW_K, LW_V, LW_O, LW_1, LW_2 = (0x0000, 0x0800, 0x1000, 0x1800,
                                       0x2000, 0x4000)
 
@@ -283,11 +284,13 @@ def build_trace(rq_header: str, workdir: str) -> list:
 # =============================================================================
 # DRAM staging.
 # =============================================================================
-def stage_static(tpu: TPU, weights: dict) -> None:
-    """Everything that does not change per problem: weights, mask, output head.
+def static_image(weights: dict) -> dict:
+    """Everything that does not change per problem, as `{addr: byte}`.
 
-    Read-only for the whole run, which is the point — on the board this is one
-    ~9 s upload and then every forward stages only the 2 KB `X0`.
+    Weights, the causal mask and the output head — read-only for the whole run,
+    which is the point: on the board this is one ~9 s upload and then every
+    forward sends only the 2 KB `X0`. `accel/tpu/host/run_adder.py` stages the
+    board from this same dict, so the two paths cannot drift apart.
     """
     img: dict = {}
     for t in range(T):
@@ -308,32 +311,80 @@ def stage_static(tpu: TPU, weights: dict) -> None:
         put_rowmajor_i4(img, base + LW_1, D, DFF, lambda r, c: int(w1[r][c]))
         put_rowmajor_i4(img, base + LW_2, DFF, D, lambda r, c: int(w2[r][c]))
 
-    for addr, byte in img.items():
+    return img
+
+
+def input_image(x0: torch.Tensor) -> dict:
+    """`X0[T][D]` int8, row-major, as `{addr: byte}`. `x0` is int4 codes."""
+    return {DR_X + t * D + d: int(x0[t][d]) & 0xFF
+            for t in range(T) for d in range(D)}
+
+
+def stage_static(tpu: TPU, weights: dict) -> None:
+    """`static_image` into an ISS instance's DRAM."""
+    for addr, byte in static_image(weights).items():
         tpu.dram[addr] = byte
 
 
 def stage_input(tpu: TPU, x0: torch.Tensor) -> None:
-    """`X0[T][D]` int8, row-major. `x0` is already int4 codes."""
-    for t in range(T):
-        row = x0[t]
-        for d in range(D):
-            tpu.dram[DR_X + t * D + d] = int(row[d]) & 0xFF
+    for addr, byte in input_image(x0).items():
+        tpu.dram[addr] = byte
 
 
-def read_logits(tpu: TPU) -> torch.Tensor:
-    """`[T][VOCAB]` int32, out of the `[T][VPAD]` block the head writes.
+def decode_logits(raw: bytes) -> torch.Tensor:
+    """The `[T][VPAD]` int32 block the head writes -> `[T][VOCAB]`.
 
     The row stride is VPAD and the column count is VOCAB; those are different
     numbers (§the head's padding) and conflating them is the obvious way to get
-    a plausible wrong answer.
+    a plausible wrong answer. Takes raw bytes so the board's `R` reply and the
+    ISS's DRAM decode through the same function.
     """
     out = torch.zeros(T, VOCAB, dtype=torch.int64)
     for t in range(T):
         for j in range(VOCAB):
-            a = DR_LOG + (t * VPAD + j) * 4
-            v = sum(tpu.dram[a + b] << (8 * b) for b in range(4))
+            o = (t * VPAD + j) * 4
+            v = int.from_bytes(raw[o:o + 4], "little")
             out[t][j] = v - (1 << 32) if v >= (1 << 31) else v
     return out
+
+
+def read_logits(tpu: TPU) -> torch.Tensor:
+    """`[T][VOCAB]` int32 out of an ISS instance's DRAM."""
+    return decode_logits(bytes(tpu.dram[DR_LOG:DR_LOG + LOGITS_BYTES]))
+
+
+# =============================================================================
+# The host's share of the model: loading it, and the front end the ISA has no
+# op for. Both are shared with `accel/tpu/host/run_adder.py`.
+# =============================================================================
+def load_model(path: str):
+    """An `adder_int4_vanilla` checkpoint, checked against the kernel's shape."""
+    model = transformer.adder_int4_vanilla()
+    state = torch.load(path if os.path.isabs(path) else os.path.join(REPO, path),
+                       map_location="cpu")
+    model.load_state_dict(state)
+    model.eval()
+
+    shape = (model.d, model.f, len(model.layers), model.q_heads, model.head_dim)
+    if shape != (D, DFF, LAYERS, NH, DH):
+        raise SystemExit(
+            f"fw/adder.c is compiled for d={D} f={DFF} layers={LAYERS} "
+            f"heads={NH} head_dim={DH}; this checkpoint is d={model.d} "
+            f"f={model.f} layers={len(model.layers)} heads={model.q_heads} "
+            f"head_dim={model.head_dim}")
+    return model
+
+
+def embed_int4(model, tok):
+    """Tokens -> `X0` int4 codes: embed, then quantize onto `q_embed`'s scale.
+
+    The whole of the host's front end — the command ISA has no gather — and
+    there is no positional encoding to add.
+    """
+    with torch.no_grad():
+        embedded = model.embedding(tok)
+    return (embedded / act_scale(model.q_embed)).round().clamp(
+        Q4_MIN, Q4_MAX).to(torch.int64)
 
 
 # =============================================================================
@@ -350,21 +401,7 @@ def main() -> int:
                     help="print the 16 words per layer as {m0,n}")
     args = ap.parse_args()
 
-    model = transformer.adder_int4_vanilla()
-    state = torch.load(os.path.join(REPO, args.model_path)
-                       if not os.path.isabs(args.model_path) else args.model_path,
-                       map_location="cpu")
-    model.load_state_dict(state)
-    model.eval()
-
-    if (model.d, model.f, len(model.layers), model.q_heads, model.head_dim) != \
-            (D, DFF, LAYERS, NH, DH):
-        raise SystemExit(
-            f"fw/adder.c is compiled for d={D} f={DFF} layers={LAYERS} "
-            f"heads={NH} head_dim={DH}; this checkpoint is d={model.d} "
-            f"f={model.f} layers={len(model.layers)} heads={model.q_heads} "
-            f"head_dim={model.head_dim}")
-
+    model = load_model(args.model_path)
     rq_table, weights = derive(model)
 
     if args.dump_rq or args.emit_rq:
@@ -398,12 +435,7 @@ def main() -> int:
         ref_logits = model(tok, attn_mask)
     ref_pred = ref_logits.argmax(-1)
 
-    # The host's whole share of the front end: embed, then quantize onto the
-    # site the model itself learned. There is no positional encoding.
-    s_x0 = act_scale(model.q_embed)
-    with torch.no_grad():
-        embedded = model.embedding(tok)
-    x0 = (embedded / s_x0).round().clamp(Q4_MIN, Q4_MAX).to(torch.int64)
+    x0 = embed_int4(model, tok)
 
     ans = numbers_data.EQUALS_POS
     dev_ok_seq = dev_ok_tok = ref_ok_seq = ref_ok_tok = 0

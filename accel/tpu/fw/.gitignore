@@ -5,3 +5,8 @@
 *.elf
 *.hex
 *.map
+
+# The requant table adder_export.py / ../host/run_adder.py derive from a real
+# checkpoint and build adder.c against. Generated per run; the tracked table is
+# adder_rq.h, whose words are tuned for the synthetic test operands instead.
+adder_rq_ckpt.h

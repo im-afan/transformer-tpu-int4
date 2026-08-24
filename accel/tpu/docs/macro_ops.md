@@ -13,8 +13,13 @@
 >   LUT with it. DyT replaced LayerNorm in the model, and DyT needs no macro op at all: it
 >   is `requant` with a symmetric clip (opcode `0x21`, `dyt`), fused into the narrow the
 >   residual add already required.
+> - **`vecmatmul` (phase 4) was built, validated, measured — and has now been removed
+>   too.** §7's measurement is why: it was 88.3% of all VPU time, so packing K and V to
+>   int4 moved both attention matmuls onto the array, and once `Model.fc` went int4 as
+>   well the op had no caller. §5.3 and the five `v*` config registers in §3 are history.
+>   `VOP_DOT`, the datapath it wrapped, is untouched.
 >
-> Everything else here — `setcfgr`, the MXU config strides, `matmul_t`, `vecmatmul`, the
+> Everything else here — `setcfgr`, the MXU config strides, `matmul_t`, the
 > config-register model, the phase/measurement tables — is current and load-bearing.
 > See [vpu.md §Removed ops](vpu.md#removed-ops) for the removal table and measured area.
 
@@ -29,7 +34,7 @@ Built and passing (`tb/` 13/13, `make cosim` 11/11, `torch_ref.py` all kernels):
 | `setcfgr` (register → config) | `scalar_unit.sv` `0x1C` | `examples/setcfgr.tpu` |
 | MXU config strides | `mxu.sv` `a_row`/`c_row`/`w_row` | `examples/strided_matmul.tpu` |
 | `matmul_t` hardware tile loop | `mxu.sv` `0x1D` | `examples/tiled_matmul_hw.tpu` |
-| `vecmatmul` | `vpu.sv` `VOP_VECMATMUL`, opcode `0x1E` | `examples/vecmatmul.tpu` |
+| ~~`vecmatmul`~~ | *removed* — was `vpu.sv` `VOP_VECMATMUL`, opcode `0x1E` | *(was `examples/vecmatmul.tpu`; deleted)* |
 | ~~`softmax`~~ | *removed* — was `vpu.sv` `VOP_SOFTMAX`/`VOP_SM_EXP`, opcode `0x20` | *(was `vpu_tb` + `examples/softmax_rows.tpu`; both deleted)* |
 
 Measured instruction counts, same problem in each case:
@@ -37,7 +42,7 @@ Measured instruction counts, same problem in each case:
 | Kernel | Software | Macro-op |
 | --- | --- | --- |
 | 8×32 @ 32×16 tiled matmul | 70 words | **25** words — and that does it *twice* (int32 and requantized) |
-| Attention score block | 44 words (`vpu_matmul.tpu`) | **17** words (`vecmatmul.tpu`) |
+| ~~Attention score block~~ | *44 words (`vpu_matmul.tpu`)* | *17 words (`vecmatmul.tpu`)* — measured before the op was removed; attention is now `matmul_t` on the array |
 | ~~Softmax over a row block~~ | *8 words per row + a scalar bridge* | *18 words for 5 rows* — measured before the op was removed; kept as the record of what a fused macro op bought |
 
 Not built: the full-layer rewrite (§8 phase 7) and weight double-buffering (§4.5).
@@ -76,7 +81,8 @@ existing primitive opcodes all stay valid.
 - **MXU** — an outer tile loop over the contraction (`k`) and output (`n`) axes, with
   configurable row strides. New opcode; the existing single-tile `matmul` is retained.
 - **VPU** — three macro ops (`softmax`, `layernorm`, `vecmatmul`) implemented as a wrapper
-  FSM that issues the existing `VOP_*` passes internally.
+  FSM that issues the existing `VOP_*` passes internally. *(None survive — see the
+  banner. The VPU has no macro op today.)*
 - **Config file** — five new registers for the matmul geometry, two for the VPU.
 
 **Explicitly out of scope.** Removing branches (`beq`/`jmp` still drive the layer loop),
@@ -112,19 +118,15 @@ Both have room; check this before adding anything else.
 | 7 | `crow` | 16 | result row stride in bytes (`= N*4`, or `N` when requantizing) |
 | 8 | `wrow` | 16 | weight **row** stride in bytes (`= N*4/8`) |
 | 9 | ~~`vscalar`~~ | — | **retired** with `softmax`, the only op that read it. Index left vacant so 10–17 keep their meaning |
-| 10 | `vrows` | 16 | `vecmatmul` **query** rows |
-| 11 | `vcols` | 16 | `vecmatmul` **key** rows — the second, independent count |
-| 12 | `vrow0` | 16 | `vecmatmul` `src0` row stride in bytes |
-| 13 | `vrow1` | 16 | `vecmatmul` `src1` row stride in bytes |
+| 10–14 | ~~`vrows`, `vcols`, `vrow0`, `vrow1`, `vcrow`~~ | — | **retired** with `vecmatmul`, their only reader: query rows, key rows, the two source row strides and the int32 dst row stride. Indices left vacant so 15–17 keep their meaning |
 
-Plus `vcrow` at 14 (`vecmatmul`'s dst row stride, distinct from the MXU's `crow`). 15..17
-later went to the DMA transpose geometry (`dma.md` §5); 18..31 are free. `vscalar` is
-deliberately *not* `cfg3 scalar` — that one is the MXU's requant word, and the two are live
-simultaneously inside a layer.
+15..17 went to the DMA transpose geometry (`dma.md` §5); 18..31 are free. `vscalar` was
+deliberately *not* `cfg3 scalar` — that one is the MXU's requant word, and the two were
+live simultaneously inside a layer.
 
-`vrows` and `vcols` are separate because `vecmatmul` is **not square** in general: decode
-attends one query row against `t+1` key rows (§9.2). `vpu_matmul.tpu`'s square `T × T`
-block is the prefill special case, not the shape to design to.
+`vrows` and `vcols` were separate because `vecmatmul` was **not square** in general:
+decode attends one query row against `t+1` key rows (§9.2). The same asymmetry is now the
+MXU's, and `matmul_t` already takes an `M` per dispatch.
 
 ### New scalar opcode: `setcfgr`
 
@@ -247,12 +249,17 @@ roofline result.
 
 ## 5. VPU macro ops
 
-All are a **wrapper FSM** that issues the existing `VOP_*` passes internally and holds the
-scalar intermediates in registers. The lane datapath and `V_rw` are unchanged. (The LUTs
-and the reciprocal divider this once also relied on no longer exist — only `vecmatmul`
-survives, and it needs neither.) Reduction results stay in internal registers instead of
-round-tripping through the scratchpad, which is what kills the `loads`/`subs`/`stores`
-bridge idiom (`isa.md` §4.5) from programs.
+> **None of these exist any more.** All three were wrapper FSMs issuing the existing
+> `VOP_*` passes internally; `softmax` was built and removed, `layernorm` was never
+> built, and `vecmatmul` was built, measured (§7) and then removed once int4 K/V put
+> attention on the array. The VPU now has no macro op and no geometry at all — one
+> command, one vector pass. What follows is the design record.
+
+All were a **wrapper FSM** that issued the existing `VOP_*` passes internally and held the
+scalar intermediates in registers. The lane datapath and `V_rw` were unchanged. Reduction
+results stayed in internal registers instead of round-tripping through the scratchpad,
+which is what killed the `loads`/`subs`/`stores` bridge idiom (`isa.md` §4.5) from
+programs.
 
 ### 5.1 `softmax dst, src, tmp` — REMOVED
 
@@ -304,18 +311,17 @@ pushes the operand count past what the encoding holds. Emit them as a following
 `vecemul` + `vecadd` pair — two extra instructions per norm, four per layer. Not worth
 distorting the instruction format for.
 
-### 5.3 `vecmatmul dst, src0, src1`
+### 5.3 `vecmatmul dst, src0, src1` — REMOVED
 
-> **Superseded for attention.** `vecmatmul` was built because the MXU is
-> **ternary-weight × int8-activation** (`mxu.sv` header) and attention's `Q@K^T` and
-> `P@V` are activation × activation, so they could not touch the array at all. The
-> shipped kernel no longer issues it for either: K and V are now ternary
-> *activations*, so both are `matmul_t` dispatches
-> (`accel/tpulang/adder_kernel.md` §2.5). Nor does anything else — the output head
-> was its last caller, and `Model.fc` became a `TernaryLinear` too (§2.6), so the
-> whole model runs on the array. The op remains for the model shape that needs an
-> int8 × int8 matmul. Everything below still describes it correctly; only "attention
-> runs here" has stopped being true.
+> **Built, validated, measured, and then removed.** `vecmatmul` existed because the MXU
+> multiplies a *weight* by an *activation* and attention's `Q@K^T` and `P@V` are
+> activation × activation, so they could not touch the array at all. `QUANT4` ended that:
+> an activation packed to int4 **is** a legal weight operand, so both became `matmul_t`
+> dispatches (`accel/tpulang/adder_kernel.md` §2.5), and the output head followed when
+> `Model.fc` became an `Int4Linear` (§2.6). With no caller left, the op, its two-level
+> pair counter, the five `v*` config registers and the `VPU_GEOM` command that carried
+> them are gone; `VOP_DOT`, the datapath it wrapped, is not. Retained below as the design
+> record; **this is not the current ISA.**
 
 The MXU is **ternary-weight × int8-activation** (`mxu.sv` header). Attention's `Q@K^T` and
 `P@V` were activation × activation, so they could not touch the MXU at all — which is why
@@ -389,7 +395,7 @@ Add alongside `cycle_timer`, surfaced on the UART `'T'` command:
 | `vpu_busy_cycles` | `vpu.busy` | how much of the layer is attention rather than GEMM |
 | `dma_busy_cycles` | `dma.busy` | memory-bound vs. compute-bound — the roofline's x-axis |
 | `su_wait_cycles` | `scalar_unit.state == S_WAIT` | control overhead, i.e. what issue-and-wait actually costs |
-| `vpu_mm_cycles` | `vpu.vpu_mm_busy` | of the VPU's share, how much is `vecmatmul` |
+| ~~`vpu_mm_cycles`~~ | *was `vpu.vpu_mm_busy`* | of the VPU's share, how much is `vecmatmul` — **retired with the op**; counter 6 (`vmm`) is tied low and kept only so the `'T'` reply does not renumber |
 
 Six 32-bit counters and their UART readback: ~200 FFs, ~150 LUTs. This is the cheapest
 work in this document and the only item that directly produces the analysis the project
@@ -426,6 +432,13 @@ Any attempt to bring the VPU's 41% down has to attack `vecmatmul`'s inner loop (
 states per pair, over a 32-element contraction that occupies only two of the sixteen lanes'
 worth of chunks); tuning the pointwise path can recover at most 4.8%.
 
+**That is what happened, and it is why the op no longer exists.** The inner loop was not
+tuned — it was made unnecessary: packing K and V to int4 (`QUANT4`) put both attention
+matmuls on the array, which deleted the 36.4% rather than shrinking it. `vecmatmul` was
+then dead code and was removed. This counter is the reason the change was made to the
+right thing, and it is also the reason the counter itself is no longer needed: the VPU
+now runs only pointwise ops, so `vpu` is no longer ambiguous.
+
 ## 8. Migration plan
 
 Each phase leaves the tree green.
@@ -436,7 +449,7 @@ Each phase leaves the tree green.
 | 1 | `vpu_op` widened to 5 bits; new cfg registers + `setcfgr` (§3) wired through `scalar_unit`/`tpu_top`; assembler + ISS know the names | **done** — no behavior change; whole suite still green |
 | 2 | MXU strides from cfg (§4.1), still single-tile | **done** — `tiled_matmul.tpu` passes unmodified; `strided_matmul.tpu` proves the strides are consulted |
 | 3 | MXU tile loop + `matmul_t` opcode (§4.2) | **done** — `tiled_matmul_hw.tpu`, checked against an independent Python matmul over the full K |
-| 4 | `vecmatmul` | **done** — `vecmatmul.tpu`, deliberately non-square (12×20) |
+| 4 | `vecmatmul` | built and validated (`vecmatmul.tpu`, deliberately non-square 12×20), then **removed** — int4 K/V put attention on the array and it lost its last caller |
 | 5 | `softmax` | built and validated, then **removed** — the model does not use softmax |
 | 6 | `rsqrt` LUT + `layernorm` | **dropped** — DyT replaced LayerNorm; `dyt` (`0x21`) needs no macro op |
 | 7 | Full layer rewritten; re-measure against the phase-0 baseline | not started |
@@ -518,6 +531,12 @@ makes each phase verifiable rather than a rewrite you hope is equivalent.
    dominating `vpu_busy_cycles`, the real answer is an int8×int8 mode in the MXU, which is
    a much larger change (the PE is a select+conditional-negate adder, not a multiplier)
    and is out of scope here. Measure before deciding.
+
+   > **Resolved, and this risk was real:** the counters showed 36.4% of the run in
+   > `vecmatmul` (§7). The answer was not an int8×int8 MXU but the mirror image of one —
+   > narrow the *activation* to the weight width instead of widening the weight path.
+   > `QUANT4` packs K and V to int4, both matmuls became `matmul_t`, and `vecmatmul` was
+   > deleted.
 
 6. **`softmax` operand count.** Three addresses plus `cfg vscalar` is the ceiling of what
    the encoding holds. If a macro op ever needs a fourth address, that is the signal the

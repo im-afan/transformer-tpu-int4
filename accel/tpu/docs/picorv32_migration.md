@@ -46,8 +46,8 @@ What passes today, on the tree as it stands:
 `make examples` is the one that matters most: between them the ten kernels cover
 every path a dispatch can take through the new plane - single-tile `matmul`,
 software tiling, the hardware tile loop and its config strides, `vecmatmul` and
-its geometry command, runtime `setcfgr`, the transposing DMA, and DRAM above
-64 KB. All byte-identical to what `iss.py` produced, unmodified.
+its geometry command (both since removed), runtime `setcfgr`, the transposing
+DMA, and DRAM above 64 KB. All byte-identical to what `iss.py` produced, unmodified.
 
 Two make targets were added for this, and they are the loop worth using:
 `make examples` (all ten kernels, a few minutes) and `make model [LAYERS=n]`
@@ -228,7 +228,7 @@ As built (`cmd_mxu.sv`, `cmd_vpu.sv`, `cmd_dma.sv`):
 | `MXU_GEOM` | `0x01` | `arow` | `wcol:crow` | `tlen(6) : ntiles(8) : ktiles(8)` | — |
 | `MXU_MM` | `0x02` | `out` | `wgt:act` | `{n,m0}` | — |
 | `VPU_OP` | `0x01` | `dst` (`flags[4:0]` = the `VOP_*` code) | `src1:src0` | `{n,m0} : vlen(10)` | — |
-| `VPU_GEOM` | `0x02` | `vrows` | `vrow0:vcols` | `vcrow:vrow1` | — |
+| ~~`VPU_GEOM`~~ | `0x02` | *retired with `vecmatmul` — `vrows`, `vrow0:vcols`, `vcrow:vrow1`* | | | |
 | `DMA_MOVE` | `0x01` | `spad` (`flags[0]`=write, `flags[1]`=`.t`) | `dram(19)` | `tcols:len` | `tdrow:tsrow` |
 
 An unknown `op` is discarded with a simulation message rather than executed, so a stale
@@ -251,12 +251,14 @@ counts and lands at exactly 128 with zero margin, which is not worth doing. Spli
 | --- | --- | --- |
 | `MXU.GEOM` | `tlen`(6), `ktiles`(8), `ntiles`(8), `arow`(16), `crow`(16), `wcol`(16) | 70 of 112 |
 | `MXU.MM` | `out`(16), `act`(16), `wgt`(16), `{m0,n}`(16), flags `.acc`/`.rq` | 64 of 112 |
-| `VPU.OP` | `dst`(16), `src0`(16), `src1`-or-`{m0,n}`(16), `vlen`(10), macro-op strides | 58–130 |
+| `VPU.OP` | `dst`(16), `src0`(16), `src1`-or-`{m0,n}`(16), `vlen`(10) | 58 of 112 |
 | `DMA.MOVE` | `spad`(16), `dram`(19), `len`(16), `tcols`(16), `tsrow`(16), `tdrow`(16) | 99 of 112 |
 
-`VPU.OP` needs a second entry only for `vecmatmul` (`vrows`/`vcols`/`vrow0`/`vrow1`/`vcrow` =
-80 more bits). Nothing in the shipped kernel issues `vecmatmul`, so the long form is a
-`VPU.GEOM` companion on the same pattern as the MXU's, not a special case in the fast path.
+`VPU.OP` needed a second entry only for `vecmatmul` (`vrows`/`vcols`/`vrow0`/`vrow1`/`vcrow`
+= 80 more bits), carried by a `VPU.GEOM` companion on the same pattern as the MXU's rather
+than as a special case in the fast path. **That op has since been removed** (`vpu.md`
+§Removed ops), and `VPU.GEOM` with it, so every VPU command is now the short form and the
+unit has exactly one command type.
 
 **Sticky geometry is queue state, not global state — and that is the actual fix.** `MXU.GEOM`
 persists until the next one, but it flows through the MXU's own in-order queue, so its scope

@@ -42,8 +42,8 @@ host stages the top three as zero trits (`adder_kernel.md` §2.6).
 The attention rows are recent too. `Q@K^T` and `P@V` are
 activation × activation, which this array cannot do — so they ran on the [VPU](vpu.md) as
 `vecmatmul`, one serial dot product per output element, and were the slowest thing in the
-shipped kernel. The fix was to pack the operand that lands on the *weight* side into
-this array's weight layout: K in `Q@K^T`, V in `P@V`, both written by `quant4` straight
+shipped kernel (36.4% of the whole run, `macro_ops.md` §7). The fix was to pack the
+operand that lands on the *weight* side into this array's weight layout: K in `Q@K^T`, V in `P@V`, both written by `quant4` straight
 into the packed 4-bit layout. See `accel/tpulang/adder_kernel.md` §2.5.
 
 There is no softmax to compute anywhere: attention is ReLU, so the only thing between the

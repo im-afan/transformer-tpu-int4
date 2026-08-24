@@ -158,10 +158,7 @@ module tpu_top #(
     logic [ADDR_W-1:0]   vpu_src0, vpu_src1, vpu_dst;
     logic [M0_W+N_W-1:0] vpu_rq_word;
     logic [9:0]          vpu_vlen;
-    logic [15:0]         vpu_rows, vpu_cols;
-    logic [ADDR_W-1:0]   vpu_row0, vpu_row1, vpu_crow;
     logic                vpu_busy, vpu_done;
-    logic                vpu_mm_busy;   // VPU busy on a vecmatmul (perf only)
 
     // ---- macro-op command plane ---------------------------------------------
     //   One producer (the CPU running
@@ -442,11 +439,6 @@ module tpu_top #(
         .vpu_rq_word (vpu_rq_word),
         .vpu_dst     (vpu_dst),
         .vpu_vlen    (vpu_vlen),
-        .vpu_rows    (vpu_rows),
-        .vpu_cols    (vpu_cols),
-        .vpu_row0    (vpu_row0),
-        .vpu_row1    (vpu_row1),
-        .vpu_crow    (vpu_crow),
         .vpu_done    (vpu_done),
         .issued (vpu_issued), .retired (vpu_retired), .level (vpu_level),
         .idle   (vpu_idle)
@@ -581,14 +573,8 @@ module tpu_top #(
         .vpu_rq_word (vpu_rq_word),
         .vpu_dst    (vpu_dst),
         .vpu_vlen   (vpu_vlen),
-        .vpu_rows   (vpu_rows),
-        .vpu_cols   (vpu_cols),
-        .vpu_row0   (vpu_row0),
-        .vpu_row1   (vpu_row1),
-        .vpu_crow   (vpu_crow),
         .vpu_busy    (vpu_busy),
         .vpu_done    (vpu_done),
-        .vpu_mm_busy (vpu_mm_busy),
 
         // V_rw (SIMD read/modify/write)
         .V_re    (V_re),
@@ -767,7 +753,7 @@ module tpu_top #(
     );
 
     // =========================================================================
-    // Performance counters — integrate seven event bits over one program run
+    // Performance counters — integrate ten event bits over one program run
     // (from 'G' to HALT), read over UART with the 'T' command. Nothing else in
     // the core observes them.
     //
@@ -783,13 +769,18 @@ module tpu_top #(
     //   3 vpu    VPU busy           (attention share vs. GEMM)
     //   4 dma    DMA busy           (memory-bound vs. compute-bound)
     //   5 swait  scalar in S_WAIT   (what issue-and-wait costs)
-    //   6 vmm    VPU on a vecmatmul (macro-op share of VPU time)
+    //   6 vmm    retired: was the VPU's vecmatmul share; reads 0
     //   7 idlec  no unit busy at all              (issue overhead)
     //   8 qfull  a producer stalled on a full queue (queue too shallow)
     //   9 ovlap  two or more units busy at once  (is overlap happening?)
     //
     // 0..6 are unchanged, deliberately: the 'T' reply stays prefix-compatible
     // with what the host already parses, so adding counters does not break it.
+    // That is also why 5 (`swait`) and 6 (`vmm`) are still *here* after the
+    // events behind them were removed — the scalar unit's issue-and-wait stall
+    // and the vecmatmul macro op. They are tied low rather than deleted,
+    // because renumbering would silently repoint every counter the host, the
+    // testbenches and the recorded numbers in docs/ name by index.
     //
     // 7..9 are the macro-op plane's own instrumentation, and they are the ones
     // that answer the question docs/picorv32_migration.md §9 is about.
@@ -807,17 +798,16 @@ module tpu_top #(
     // `ovlap` is the payoff side: it is zero under issue-and-wait by
     // construction, so it measures directly how much of §9.3's 1.45x is real.
     //
-    // These overlap by construction: under issue-and-wait `swait` covers nearly
-    // all of `mxu`+`vpu`+`dma`, `mload` is a subset of `mxu`, and `vmm` is a
-    // subset of `vpu`. They are fractions of a run, not a partition of it.
+    // These overlap by construction: `mload` is a subset of `mxu`, and `ovlap`
+    // of the three unit counters. They are fractions of a run, not a partition
+    // of it.
     //
-    // Counter 6 exists because `vpu` on its own conflates two very different
-    // costs. The primitive ops (add / relu / requant / dyt) stream LANES
-    // elements per chunk and are cheap per element; `vecmatmul` re-runs the
-    // inner dot product once per (row, col) pair and pays the S_RD0..S_WB round
-    // trip on each one, so a VPU share that looks high may be almost entirely
-    // one macro op. Which of the two it is decides whether the thing worth
-    // optimizing is the pointwise path or `vecmatmul`'s per-pair overhead.
+    // Counter 6 existed because `vpu` on its own conflated two very different
+    // costs: the pointwise ops stream LANES elements per chunk, while
+    // `vecmatmul` re-ran the inner dot product once per (row, col) pair and
+    // paid the S_RD0..S_WB round trip on each. With the macro op gone the VPU
+    // does only the first kind, so `vpu` is no longer ambiguous and the split
+    // has nothing left to measure.
     // =========================================================================
     localparam int PERF_RUN = 0, PERF_MXU  = 1, PERF_MLOAD = 2,
                    PERF_VPU = 3, PERF_DMA  = 4, PERF_SWAIT = 5,
@@ -836,7 +826,7 @@ module tpu_top #(
         perf_ev[PERF_VPU]    = vpu_busy;
         perf_ev[PERF_DMA]    = dma_busy;
         perf_ev[PERF_SWAIT]  = 1'b0;   // was the scalar unit's issue-and-wait stall
-        perf_ev[PERF_VMM]    = vpu_mm_busy;
+        perf_ev[PERF_VMM]    = 1'b0;   // was the VPU's vecmatmul macro op
         perf_ev[PERF_IDLEC]  = (n_busy == 2'd0);
         perf_ev[PERF_QFULL]  = p_cmd_we & p_cmd_full;
         perf_ev[PERF_OVLAP]  = (n_busy >= 2'd2);

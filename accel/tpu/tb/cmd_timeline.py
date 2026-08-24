@@ -37,11 +37,11 @@ U_MXU, U_VPU, U_DMA = 0, 1, 2
 UNIT = {U_MXU: "mxu", U_VPU: "vpu", U_DMA: "dma"}
 
 MXU_GEOM, MXU_MM = 0x01, 0x02
-VPU_OP, VPU_GEOM = 0x01, 0x02
+VPU_OP = 0x01          # 0x02 (VPU GEOM) retired with the vecmatmul macro op
 DMA_MOVE = 0x01
 
-# vpu.sv VOP_*
-VOP = {0: "vecdot", 1: "add", 3: "relu", 10: "requant", 13: "vecmatmul",
+# vpu.sv VOP_* (13 was vecmatmul, removed)
+VOP = {0: "vecdot", 1: "add", 3: "relu", 10: "requant",
        16: "dyt", 17: "quant4"}
 
 
@@ -94,8 +94,6 @@ class Cmd:
                 flags.append("acc")
             return "mxu matmul" + ("." + ".".join(flags) if flags else "")
         if self.unit == U_VPU:
-            if self.op == VPU_GEOM:
-                return "vpu geom"
             return "vpu " + VOP.get(self.vop, f"op{self.vop}")
         if self.op == DMA_MOVE:
             d = "spill" if self.dma_write else "fill"
@@ -179,8 +177,7 @@ def label_adder(cmds) -> None:
 
     # A GEOM carries no address of its own; it belongs to the matmul it precedes.
     for i, c in enumerate(cmds):
-        if (c.unit == U_MXU and c.op == MXU_GEOM) or \
-           (c.unit == U_VPU and c.op == VPU_GEOM):
+        if c.unit == U_MXU and c.op == MXU_GEOM:
             nxt = next((n for n in cmds[i + 1:] if n.unit == c.unit), None)
             if nxt is not None:
                 c.phase, c.label = nxt.phase, "geom"

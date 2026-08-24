@@ -271,17 +271,22 @@ keeping only the last 3 (gitignored; the committed `colab_*.pt` are not produced
   sync with the model**: it implements *softmax* attention and the model does ReLU attention,
   and nothing in `model/` loads it any more. It still passes its own self-contained test. Treat
   it as legacy unless someone re-syncs it.
-- **The VPU implements seven ops and nothing else.** `VOP_DOT`, `ADD`, `RELU`,
-  `REQUANT`, `DYT`, `TQUANT`, `VECMATMUL`. `TQUANT` (`0x22`, `VOP_TQUANT = 17`) is the
-  newest: `requant`'s fixed point clipped to +-1, written **2 bits wide** in the MXU's
-  weight encoding, four elements to a byte — int8 in, a packed ternary weight column
-  out. It is what lets an activation be a weight operand, and therefore what put
-  attention's `Q@K^T` and `P@V` on the array. With `Model.fc` ternary too, `VECMATMUL`
-  and `VOP_DOT` now have **no caller in the shipped kernel at all** — both are kept
-  for the model shape that needs an int8 x int8 matmul, and dropping them would mean
-  dropping the whole reduction path plus its counter block, which is an area decision
-  rather than a deletion. Its `vlen` must be a multiple of 4 (the write strobe is per
-  byte) and its destination advances a quarter as fast as its source. `GELU`, `EXP`, `SQUARE`, `ELEMENT_MUL`, `SCALAR_MUL/ADD/DIV`,
+- **The VPU implements six ops and nothing else.** `VOP_DOT`, `ADD`, `RELU`,
+  `REQUANT`, `DYT`, `QUANT4`. `QUANT4` (`0x22`, `VOP_QUANT4 = 17`, formerly `tquant`)
+  is the newest: `requant`'s fixed point clipped to `[-8, 7]`, written **4 bits wide**
+  in the MXU's weight encoding, two elements to a byte — int8 in, a packed int4 weight
+  row out. It is what lets an activation be a weight operand, and therefore what put
+  attention's `Q@K^T` and `P@V` on the array. Its `vlen` must be a multiple of 2 (the
+  write strobe is per byte) and its destination advances half as fast as its source.
+  **`VECMATMUL` was removed** once that left it with no caller: it sequenced one
+  `VOP_DOT` per (row, col) pair and was 36.4% of the whole run when attention still
+  ran on it (`docs/macro_ops.md` §7). Gone with it: the `mm_*` sequencer, `cfg` 10-14
+  (`vrows`/`vcols`/`vrow0`/`vrow1`/`vcrow`), the `VPU_GEOM` command (`cmd_vpu.sv`
+  `0x02`, so the VPU now has exactly one command type), `tpu_vpu_geom()` in `fw/tpu.h`,
+  and `vpu_mm_busy` — perf counter 6 (`vmm`) is tied low and kept only so the UART
+  `'T'` reply does not renumber. `VOP_DOT` stayed: it has no caller either, but it *is*
+  the reduction path (accumulator, fold, `S_WB` scalar store) and the only int8 x int8
+  reduction the ISA has. `GELU`, `EXP`, `SQUARE`, `ELEMENT_MUL`, `SCALAR_MUL/ADD/DIV`,
   `REDUCEMAX`, `REDUCESUM` and the `SOFTMAX` macro op were **removed** — they served a
   softmax/LayerNorm/GELU model and the current one is ReLU attention + DyT + ReLU FFN.
   Gone with them: both 256-entry activation ROMs, `rtl/luts/`, `accel/tpulang/luts.py`,
@@ -292,12 +297,15 @@ keeping only the last 3 (gitignored; the committed `colab_*.pt` are not produced
   (−64%)**. Full table and what restoring softmax would cost: `accel/tpu/docs/vpu.md`
   §Removed ops.
   - **Retired opcodes are holes, not free space.** `0x02`, `0x05`, `0x0A`–`0x0F`, `0x1B`,
-    `0x20` are not reallocated, so a stale binary decodes to an unknown op rather than a
-    different one. Likewise `cfg` index 9 (`vscalar`) is vacant — renumbering 10–17 would
-    silently repoint every `setcfg` in every program. `0x22` is now `tquant`; new ops go
-    at `0x23`+.
-  - **`vecdot` survives although no kernel issues it**: it is `vecmatmul`'s inner
-    primitive, so the datapath is mandatory and the opcode costs one decode arm.
+    `0x1E`, `0x20` are not reallocated, so a stale binary decodes to an unknown op rather
+    than a different one — likewise VPU op selector 13 and VPU command `0x02`. `cfg`
+    indices 9 (`vscalar`) and 10–14 (`vecmatmul`'s geometry) are vacant for the same
+    reason: renumbering would silently repoint 15–17, the DMA transpose geometry. `0x22`
+    is `quant4`; new ops go at `0x23`+.
+  - **`vecdot` survives although no kernel issues it**: it is the reduction datapath
+    itself — accumulator, lane fold and scalar store — and the only int8 x int8
+    reduction the ISA has, so the opcode costs one decode arm over hardware that has to
+    be there anyway.
 - **`tpu/`** — a SystemVerilog TPU running on a **Digilent Cmod A7-35T** (see
   `accel/tpu/README.md` and `accel/tpu/docs/`). The array, VPU, banked scratchpad, DMA +
   external SRAM, scalar unit and UART link are all synthesizable, and the design **fits**:
@@ -309,9 +317,9 @@ keeping only the last 3 (gitignored; the committed `colab_*.pt` are not produced
   `host/run_program.py`
   loads a program over UART, runs it, and checks the readback against both the ISS and PyTorch.
   Recent RTL work: `perf_counters.sv` (replaces `cycle_timer.sv`) and the **macro-op ISA**
-  (`docs/macro_ops.md`) — phases 0–5 are *built and passing*: `setcfgr`, MXU config strides,
-  `matmul_t` (hardware tile loop) and `vecmatmul`. Phase 5's hardware `softmax` was built,
-  validated, and then **removed** (see the VPU note above); `layernorm` + the `rsqrt` LUT
+  (`docs/macro_ops.md`) — phases 0–3 are *built and passing*: `setcfgr`, MXU config strides
+  and `matmul_t` (hardware tile loop). Phase 4's `vecmatmul` and phase 5's hardware
+  `softmax` were both built, validated, and then **removed** (see the VPU note above); `layernorm` + the `rsqrt` LUT
   are not built and are now dropped — DyT replaced LayerNorm and needs no macro op. Still stubbed: the inter-TPU LINK (`wrneigh` is a completing no-op).
 - **Dispatch is a 128-bit macro-op pushed into a per-unit queue, not a wire bundle
   plus a global config file.** `cmd_queue.sv` + `cmd_{mxu,vpu,dma}.sv` sit in front

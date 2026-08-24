@@ -6,24 +6,23 @@
 // from a single wide scratchpad read/modify/write port (V_rw), computing every
 // pointwise / reduction op that is not an int4-weight matmul.
 //
-// SCOPE. This unit implements exactly the ops
-// accel/tpulang/examples/adder_model.tpu issues, and nothing else:
+// SCOPE. This unit implements exactly these ops and nothing else:
 //
 //     VOP_DOT  VOP_ADD  VOP_RELU  VOP_REQUANT  VOP_DYT  VOP_QUANT4
-//     VOP_VECMATMUL
 //
-// VOP_DOT is the odd one out: no shipped kernel issues `vecdot`, but it is the
-// inner primitive VOP_VECMATMUL runs once per (row, col) pair, so its datapath
-// is not optional and keeping the opcode costs nothing.
+// **VOP_VECMATMUL was removed.** It sequenced one VOP_DOT per (row, col) pair,
+// and it was how attention's Q@K^T and P@V ran before K and V were packed to
+// int4 (VOP_QUANT4) and both matmuls moved onto the array; making Model.fc an
+// Int4Linear took the output head, its last caller, with them. Gone with it:
+// the macro-op sequencer (the `mm_*` registers), the five geometry inputs it
+// was the only reader of, and `vpu_mm_busy`, the perf event that measured its
+// share of VPU time. Opcode 13 is a retired hole, not free space.
 //
-// **VOP_VECMATMUL now has no caller either.** Packing K and V to int4
-// (VOP_QUANT4) moved both attention matmuls onto the MXU, and making Model.fc an
-// Int4Linear moved the output head — its last caller — with them. The pair
-// is kept because a model shape that needs an int8 x int8 matmul is one
-// checkpoint away, and because removing them is a real area decision rather
-// than a deletion: VOP_DOT is the reduction path (the accumulator, the fold and
-// the S_WB scalar store), and VOP_VECMATMUL is the counter block around it.
-// Nothing else in this unit uses either.
+// VOP_DOT stayed. No shipped kernel issues `vecdot` either, but it *is* the
+// reduction path — the accumulator, the lane fold and the S_WB scalar store —
+// and it is the only int8 x int8 reduction the ISA has, which is what a model
+// shape needing an int8 x int8 matmul would be rebuilt from. Restoring the
+// macro op means re-adding the wrapper, not the datapath.
 //
 // Everything else was removed deliberately (GELU, EXP, SQUARE, ELEMENT_MUL,
 // SCALAR_MUL/ADD/DIV, REDUCEMAX, REDUCESUM, SOFTMAX and its fused SM_EXP), along
@@ -76,8 +75,8 @@
 // result directly addressable as a `matmul_t` weight row, with no repacking pass
 // and no host round trip — and therefore what lets an *activation* be a weight
 // operand. The shipped kernel packs K and V with it, which is how attention's
-// Q@K^T and P@V left VOP_VECMATMUL (one serial dot product per output element)
-// for the array.
+// Q@K^T and P@V left the VPU (one serial dot product per output element) for
+// the array, and therefore why VOP_VECMATMUL could be deleted.
 //
 // Now that weights and activations are the same width this is usually a pure
 // repack — the source was already clipped to [-8, 7] by whatever requant
@@ -131,23 +130,10 @@ module vpu #(
     input  logic [M0_W+N_W-1:0]  vpu_rq_word,
     input  logic [ADDR_W-1:0]    vpu_dst,
     input  logic [9:0]           vpu_vlen,     // vector length in elements
-    // ---- Macro-op geometry (config registers; docs/macro_ops.md §5) --------
-    // Only read by the macro ops. `vpu_rows`/`vpu_cols` are independent because
-    // vecmatmul is not square in general: prefill attends T queries against T
-    // keys, decode attends *one* query against t+1 keys.
-    input  logic [15:0]          vpu_rows,     // query rows      (outer loop)
-    input  logic [15:0]          vpu_cols,     // key rows        (inner loop)
-    input  logic [ADDR_W-1:0]    vpu_row0,     // src0 row stride, bytes
-    input  logic [ADDR_W-1:0]    vpu_row1,     // src1 row stride, bytes
-    input  logic [ADDR_W-1:0]    vpu_crow,     // dst row stride, bytes (int32)
+    // Every op is one pass over one vector, so there is no geometry here: the
+    // five row/column inputs went with VOP_VECMATMUL, their only reader.
     output logic                 vpu_busy,
     output logic                 vpu_done,
-    // High on exactly the clocks this unit is executing a VOP_VECMATMUL
-    // dispatch — a strict subset of `vpu_busy`. Purely observational: nothing
-    // in the datapath reads it. tpu_top.sv feeds it to perf_counters.sv so the
-    // macro op's share of VPU time is separable from the primitive ops', which
-    // is the one split `vpu_busy` alone cannot show (docs/macro_ops.md §7).
-    output logic                 vpu_mm_busy,
 
     // ---- Scratchpad V_rw port (single logical read/modify/write, 512-bit) ----
     output logic                      V_re,
@@ -177,15 +163,11 @@ module vpu #(
     // field stays 5 bits because VOP_DYT is 16 — compacting the encoding would
     // save two flops on the dispatch bus and cost a four-way rename.
     localparam logic [4:0]
-        VOP_DOT         = 5'd0,   // also VOP_VECMATMUL's inner primitive
+        VOP_DOT         = 5'd0,   // the only reduction: one int32 scalar out
         VOP_ADD         = 5'd1,
         VOP_RELU        = 5'd3,
         VOP_REQUANT     = 5'd10,
-        // ---- Macro op (docs/macro_ops.md §5) --------------------------------
-        // Sequenced internally out of VOP_DOT. No new datapath: the wrapper
-        // re-runs the existing inner FSM with different operand addresses,
-        // which is why it costs counters rather than lanes.
-        VOP_VECMATMUL   = 5'd13,   // S[t][s] = Σ_d src0[t][d]·src1[s][d]
+        // 5'd13 was VOP_VECMATMUL and is now a retired hole; see the header.
         // dst[i] = clip_pm127((src0[i]*m0 + round) >> n) — DyT / hardtanh.
         // int32 in, int8 out, {m0,n} from the scalar operand, exactly like
         // VOP_REQUANT; see the header note for why the clip is symmetric.
@@ -311,40 +293,6 @@ module vpu #(
     // Chunk geometry.
     wire [10:0] chunk_active = (remaining >= LANES) ? 11'(LANES) : remaining;
     wire        last_chunk   = (remaining <= LANES);
-
-    // -------------------------------------------------------------------------
-    // vecmatmul macro-op state.
-    //
-    // The whole op is "run VOP_DOT once per (row, col) pair". `op_r` is set to
-    // VOP_DOT at dispatch so every existing path — needs_src1, is_reduction, the
-    // accumulator, the S_WB scalar store — works unchanged; `mm_active` is the
-    // only thing that remembers we are inside a macro op, and its sole effect is
-    // to send S_WB back to S_RD0 with the next pair's addresses instead of to
-    // S_DONE.
-    //
-    // Bases are stepped rather than multiplied out: one add per pair, no
-    // multiplier in the address path.
-    // -------------------------------------------------------------------------
-    logic              mm_active;
-    logic [15:0]       mm_rows, mm_cols;      // latched counts (>= 1)
-    logic [15:0]       mm_t, mm_s;            // current query row / key row
-    logic [9:0]        mm_vlen;               // contraction length, per pair
-    logic [ADDR_W-1:0] mm_row0, mm_row1, mm_crow;
-    logic [ADDR_W-1:0] mm_src1_base;          // src1 origin, to rewind each row
-    logic [ADDR_W-1:0] mm_a_base;             // src0 + t*row0
-    logic [ADDR_W-1:0] mm_b_base;             // src1 + s*row1
-    logic [ADDR_W-1:0] mm_d_row;              // dst  + t*crow   (row origin)
-    logic [ADDR_W-1:0] mm_d_ptr;              // dst  + t*crow + s*4
-
-    // Next-pair addresses, combinational so the sequential block can commit the
-    // counter and the pointers derived from it in the same cycle.
-    wire mm_s_last = ((mm_s + 16'd1) == mm_cols);
-    wire mm_last   = mm_s_last && ((mm_t + 16'd1) == mm_rows);
-    wire [ADDR_W-1:0] mm_a_next = mm_s_last ? (mm_a_base + mm_row0) : mm_a_base;
-    wire [ADDR_W-1:0] mm_b_next = mm_s_last ? mm_src1_base : (mm_b_base + mm_row1);
-    wire [ADDR_W-1:0] mm_drow_next = mm_s_last ? (mm_d_row + mm_crow) : mm_d_row;
-    wire [ADDR_W-1:0] mm_d_next = mm_s_last ? (mm_d_row + mm_crow)
-                                            : (mm_d_ptr + ADDR_W'(4));
 
     // Operand chunk registers (full port width; interpreted per element size).
     logic [SCRATCHPAD_W*8-1:0] V_data0;
@@ -484,10 +432,7 @@ module vpu #(
                             else                    state_n = S_DONE;
                         end else state_n = S_RD0;
                     end
-            // A reduction's scalar store. For a macro op this is one (row,col)
-            // pair finished: go straight back for the next one.
-            S_WB:   if (mm_active && !mm_last) state_n = S_RD0;
-                    else                       state_n = S_DONE;
+            S_WB:   state_n = S_DONE;   // the reduction's scalar store
             S_DONE: state_n = S_IDLE;
             default: state_n = S_IDLE;
         endcase
@@ -500,7 +445,6 @@ module vpu #(
         if (!rst_n) begin
             state         <= S_IDLE;
             op_r          <= '0;
-            mm_active     <= 1'b0;
             dst_r         <= '0;
             p_src0        <= '0;
             p_src1        <= '0;
@@ -515,29 +459,7 @@ module vpu #(
 
             unique case (state)
                 S_IDLE: if (vpu_start) begin
-                    // A macro op runs as its inner primitive; `mm_active` is the
-                    // only trace of the wrapper. A count of 0 reads as 1 so an
-                    // unset config register degrades to a single pair rather
-                    // than a dispatch that computes nothing.
-                    // A macro op enters as its inner primitive; `mm_active` is
-                    // the only trace of the wrapper.
-                    op_r          <= (vpu_op == VOP_VECMATMUL) ? VOP_DOT : vpu_op;
-                    mm_active     <= (vpu_op == VOP_VECMATMUL);
-
-                    mm_rows       <= (vpu_rows == '0) ? 16'd1 : vpu_rows;
-                    mm_cols       <= (vpu_cols == '0) ? 16'd1 : vpu_cols;
-                    mm_t          <= '0;
-                    mm_s          <= '0;
-                    mm_vlen       <= vpu_vlen;
-                    mm_row0       <= vpu_row0;
-                    mm_row1       <= vpu_row1;
-                    mm_crow       <= vpu_crow;
-                    mm_src1_base  <= vpu_src1;
-                    mm_a_base     <= vpu_src0;
-                    mm_b_base     <= vpu_src1;
-                    mm_d_row      <= vpu_dst;
-                    mm_d_ptr      <= vpu_dst;
-
+                    op_r          <= vpu_op;
                     dst_r         <= vpu_dst;
                     p_src0        <= vpu_src0;
                     p_src1        <= vpu_src1;
@@ -547,23 +469,6 @@ module vpu #(
                     // VOP_DOT is the only reduction left, so the accumulator
                     // always opens at zero.
                     acc           <= '0;
-                end
-
-                // One (row,col) pair has just been stored. Advance to the next
-                // and restart the inner dot product over the fresh operands.
-                S_WB: if (mm_active && !mm_last) begin
-                    mm_s      <= mm_s_last ? 16'd0 : (mm_s + 16'd1);
-                    mm_t      <= mm_s_last ? (mm_t + 16'd1) : mm_t;
-                    mm_a_base <= mm_a_next;
-                    mm_b_base <= mm_b_next;
-                    mm_d_row  <= mm_drow_next;
-                    mm_d_ptr  <= mm_d_next;
-
-                    p_src0    <= mm_a_next;
-                    p_src1    <= mm_b_next;
-                    dst_r     <= mm_d_next;
-                    remaining <= {1'b0, mm_vlen};
-                    acc       <= '0;
                 end
 
                 S_RD0D: V_data0 <= V_rdata;
@@ -588,12 +493,5 @@ module vpu #(
     // -------------------------------------------------------------------------
     assign vpu_busy = (state != S_IDLE);
     assign vpu_done = (state == S_DONE);
-
-    // `mm_active` is written at dispatch and then *held* until the next
-    // dispatch overwrites it, so on its own it stays high through the following
-    // idle. Qualifying it with `vpu_busy` is what makes this a per-op event;
-    // it also matches `vpu_busy`'s edges exactly, so the vecmatmul counter is a
-    // subset of the VPU counter clock for clock.
-    assign vpu_mm_busy = vpu_busy && mm_active;
 
 endmodule

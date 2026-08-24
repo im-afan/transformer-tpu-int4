@@ -25,7 +25,7 @@ Detailed per-component design notes (this file is the overview):
 | [scalar_unit.md](scalar_unit.md) | Control processor microarchitecture                   |
 | [scalar_unit_pipeline.md](scalar_unit_pipeline.md) | Plan to pipeline it — **proposal, not built**; the RTL is still the multi-cycle FSM |
 | [isa.md](isa.md)                 | Guide to writing TPU programs in tpulang (+ encoding/opcode appendix) |
-| [macro_ops.md](macro_ops.md)     | Moving tiling/attention into hardware (CISC macro-ops). Phases 0–4 **are built** (`setcfgr`, MXU strides, `matmul_t`, `vecmatmul`); `softmax` was built then removed and `layernorm` is dropped — see its banner |
+| [macro_ops.md](macro_ops.md)     | Moving tiling/attention into hardware (CISC macro-ops). Phases 0–3 **are built** (`setcfgr`, MXU strides, `matmul_t`); `vecmatmul` and `softmax` were built then removed, `layernorm` is dropped — see its banner |
 | [picorv32_migration.md](picorv32_migration.md) | The macro-op **dispatch plane**: 128-bit commands in per-unit queues instead of a global config file, and PicoRV32 as a second producer beside the scalar unit. RTL built and passing; the C toolchain is not. Supersedes macro_ops.md §1's rejection of a CPU |
 | [uart_host.md](uart_host.md)     | The host link: frame format, the five commands, arbitration |
 | [uart_selftest.md](uart_selftest.md) | The `cmod_a7_echo` bring-up image and how to use it |
@@ -62,7 +62,7 @@ The MXU output immediately gets written to another address in scratchpad memory.
 
 ### 3. VPU
 
-The VPU performs the remaining pointwise vector operations using SIMD: `relu`, vector add, the `requant`/`dyt`/`tquant` narrows, and the `vecmatmul` macro op (built on a dot-product reduction). `tquant` is the one that narrows to a *trit* rather than to int8, packed 2 bits wide in the MXU's weight layout — it is what makes K and V ternary and therefore what moved both attention matmuls onto the array. The output head went with them once `Model.fc` became ternary, so `vecmatmul` has no caller in the shipped kernel at all — it is kept for the model shape that needs an int8 × int8 matmul. It is deliberately no larger than that — the activation LUTs, broadcast/scalar ops, divider, reductions and the softmax macro op were removed once the model stopped needing them ([vpu.md §Removed ops](vpu.md#removed-ops)). 
+The VPU performs the remaining pointwise vector operations using SIMD: `relu`, vector add, and the `requant`/`dyt`/`quant4` narrows. `quant4` is the one whose destination is narrower than a byte: it writes a bare 4-bit nibble, two per byte, in the MXU's packed weight layout — which is what lets an *activation* be a weight operand, and therefore what moved both attention matmuls onto the array. The output head went with them once `Model.fc` became an `Int4Linear`, which left the `vecmatmul` macro op with no caller and is why it has been **removed** — along with its geometry registers and the `VPU_GEOM` command. The unit is deliberately no larger than this: the activation LUTs, broadcast/scalar ops, divider, reductions and the softmax macro op went the same way once the model stopped needing them ([vpu.md §Removed ops](vpu.md#removed-ops)). `vecdot` survives with no caller because it *is* the reduction datapath. 
 It contains multiple ALUs that act on data from a single scratchpad memory access.
 
 ### 4. Communication interface
@@ -90,8 +90,8 @@ how programs are written:
   `setcfg tlen` (MXU token count), `setcfg vlen` (VPU vector length), `setcfg len` (DMA byte
   count). Stale config is the most common silent bug in a tpulang program.
 
-The dispatched ops are `matmul` / `matmul_t` (with `.acc`/`.rq` flags), `vecmatmul`,
-`vecdot`, `vecadd`, `relu`, `requant`, `dyt`, and `tquant`; memory movement is `rdmem` / `wrmem` (DMA between DRAM and scratchpad) and
+The dispatched ops are `matmul` / `matmul_t` (with `.acc`/`.rq` flags),
+`vecdot`, `vecadd`, `relu`, `requant`, `dyt`, and `quant4`; memory movement is `rdmem` / `wrmem` (DMA between DRAM and scratchpad) and
 `wrneigh`; control is `adds`, `subs`, `muls`, `cmps`, `li`, `loads`, `stores`, `setcfg`,
 `branch` (and the `beq`/`bne`/`blt`/`bge` forms), `jmp`, `wait`, and `halt`.
 

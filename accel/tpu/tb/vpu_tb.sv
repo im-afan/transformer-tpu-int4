@@ -15,9 +15,9 @@
 // softmax macro op — were removed from vpu.sv because the current model does
 // not issue them (see that file's header), and their tests went with them.
 //
-// DOT is not reachable from the ISA; it is exercised here because it is the
-// inner primitive of VOP_VECMATMUL, whose row/column sequencing is covered at
-// the tpu_top level instead.
+// DOT has no caller in any shipped kernel — it used to be the inner primitive
+// of VOP_VECMATMUL, which is now removed — but it is the whole reduction path
+// (accumulator, lane fold, scalar store), so it is exercised here.
 //
 // Everything narrows to **int4** now, in an int8 container: REQUANT clips to
 // [-8, 7] and DYT to [-7, 7]. The two still share a fixed point and differ only
@@ -51,9 +51,8 @@ module vpu_tb;
 
     // ---- Op encoding (matches vpu.sv) ---------------------------------------
     localparam logic [4:0]
-        VOP_DOT       = 5'd0,  VOP_ADD       = 5'd1,  VOP_RELU = 5'd3,
-        VOP_REQUANT   = 5'd10, VOP_VECMATMUL = 5'd13, VOP_DYT  = 5'd16,
-        VOP_QUANT4    = 5'd17;
+        VOP_DOT       = 5'd0,  VOP_ADD  = 5'd1,  VOP_RELU   = 5'd3,
+        VOP_REQUANT   = 5'd10, VOP_DYT  = 5'd16, VOP_QUANT4 = 5'd17;
 
     // ---- Scratchpad address map (generous spacing; int8 chunks over-read) ---
     localparam logic [ADDR_W-1:0] A_ADDR  = 16'h1000;  // src0
@@ -73,10 +72,6 @@ module vpu_tb;
     // -------------------------------------------------------------------------
     logic                      vpu_start;
     logic [4:0]                vpu_op;
-    // Macro-op geometry (docs/macro_ops.md §5). Driven per test; the
-    // primitive-op tests leave them at the defaults set in `initial`.
-    logic [15:0]               vpu_rows, vpu_cols;
-    logic [ADDR_W-1:0]         vpu_row0, vpu_row1, vpu_crow;
     logic [ADDR_W-1:0]         vpu_src0, vpu_src1, vpu_dst;
     // The {m0,n} operand is a literal in the dispatch now rather than a
     // scratchpad address the VPU fetched over the V port before its first chunk
@@ -104,11 +99,6 @@ module vpu_tb;
         .vpu_src0(vpu_src0), .vpu_src1(vpu_src1),
         .vpu_rq_word(vpu_rq_word), .vpu_dst(vpu_dst),
         .vpu_vlen(vpu_vlen),
-        // Macro-op geometry: unused by the primitive ops this TB exercises.
-        // Rows/cols of 0 read as 1 inside the DUT, so even if a macro op were
-        // dispatched here it would degrade to a single pair rather than hang.
-        .vpu_rows(vpu_rows), .vpu_cols(vpu_cols),
-        .vpu_row0(vpu_row0), .vpu_row1(vpu_row1), .vpu_crow(vpu_crow),
         .vpu_busy(vpu_busy), .vpu_done(vpu_done),
         .V_re(V_re), .V_raddr(V_raddr), .V_rdata(V_rdata),
         .V_we(V_we), .V_waddr(V_waddr), .V_wdata(V_wdata), .V_wstrb(V_wstrb),
@@ -407,8 +397,6 @@ module vpu_tb;
     initial begin
         vpu_start = 1'b0; vpu_op = '0;
         vpu_src0 = '0; vpu_src1 = '0; vpu_rq_word = '0; vpu_dst = '0; vpu_vlen = '0;
-        vpu_rows = 16'd0; vpu_cols = 16'd0;
-        vpu_row0 = '0; vpu_row1 = '0; vpu_crow = '0;
         for (int i = 0; i < MEM_SZ; i++) mem[i] = '0;
 
         // Reset.
@@ -425,8 +413,8 @@ module vpu_tb;
         test_elem(VOP_ADD,          1, 0,   "ADD-len1");
         test_elem(VOP_RELU,        40, 0,   "RELU");
 
-        // The one reduction left: DOT, vecmatmul's inner primitive. 48 is three
-        // whole chunks, 7 a partial tail.
+        // The one reduction left: DOT. 48 is three whole chunks, 7 a partial
+        // tail.
         test_reduce(VOP_DOT, 40, "DOT");
         test_reduce(VOP_DOT, 48, "DOT-3chunk");
         test_reduce(VOP_DOT,  7, "DOT-tail");

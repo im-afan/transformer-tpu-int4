@@ -120,12 +120,16 @@ go    | 'G' | A2  | A1  | A0  |               timer   | 'T' |
   images with different counter sets mutually intelligible. The length is
   image-dependent: `uart_interface`'s `TIMER_WORDS` is 1 in the bring-up images
   (`cmod_a7_mem`, `cmod_a7_bram`, which have no core to measure) and `NPERF` in
-  `tpu_top`, currently **7** — run, mxu, mload, vpu, dma, swait, vmm. The
-  counters overlap rather than partitioning the run: `swait` shadows nearly all
-  of mxu/vpu/dma under issue-and-wait, `mload` is a sub-state of `mxu`, and
-  `vmm` (VPU on a `vecmatmul`) is a sub-state of `vpu`. `tpu_top.sv`'s
-  `PERF_*` indices define the wire order; `host/tpu_uart.py`'s `TIMER_COUNTERS`
-  decodes it.
+  `tpu_top`, currently **10** — run, mxu, mload, vpu, dma, swait, vmm, idlec,
+  qfull, ovlap. The counters overlap rather than partitioning the run: `mload`
+  is a sub-state of `mxu`, and `ovlap` of the three unit counters. Two of the
+  ten are **retired slots that always read 0** — `swait` (the scalar unit's
+  issue-and-wait stall; there is no scalar unit) and `vmm` (the VPU's
+  `vecmatmul` macro op, removed from `vpu.sv`). They are kept rather than
+  deleted precisely because word order is the protocol: renumbering would
+  silently repoint every counter a host reads by index. `tpu_top.sv`'s `PERF_*`
+  indices define the wire order; `host/tpu_uart.py`'s `TIMER_COUNTERS` decodes
+  it.
 
 `'T'` is the only command **not** subject to the arbitration rule in §6: it reads
 a counter, contends over nothing, and cannot corrupt a run, so it is answered

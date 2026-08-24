@@ -94,8 +94,12 @@ TIMER_COUNTERS = (
     "mload",  # MXU in its weight-load phase (subset of mxu)
     "vpu",    # VPU busy
     "dma",    # DMA busy
-    "swait",  # scalar unit blocked in S_WAIT (the cost of issue-and-wait)
-    "vmm",    # VPU running a `vecmatmul` macro op (subset of vpu)
+    # Two retired slots, kept so the counters after them do not shift and the
+    # reply stays prefix-compatible with what older hosts parse. Both read 0:
+    # `swait` was the scalar unit's issue-and-wait stall (the scalar unit is
+    # gone), `vmm` the VPU's `vecmatmul` macro op (removed from vpu.sv).
+    "swait",
+    "vmm",
     # Macro-op dispatch plane (docs/picorv32_migration.md §9.5). `swait` above
     # stopped meaning "control overhead" once dispatch went through per-unit
     # command queues; these three are what replace it.
@@ -768,9 +772,9 @@ class TPUUart:
         Returns a dict keyed by :data:`TIMER_COUNTERS`. ``run`` is the total
         busy interval and therefore the denominator for the others: divide to
         get the fraction of the run each unit was active. They **overlap** and
-        do not partition the run — under issue-and-wait ``swait`` covers nearly
-        all of ``mxu``/``vpu``/``dma``, ``mload`` is a subset of ``mxu``, and
-        ``vmm`` is a subset of ``vpu``.
+        do not partition the run — ``mload`` is a subset of ``mxu``, and
+        ``ovlap`` of the three unit counters. ``swait`` and ``vmm`` are retired
+        slots and always read 0.
 
         The frame is the single command byte; the reply is fixed-length with no
         status byte, so unlike every other command there is nothing to validate,
@@ -805,17 +809,14 @@ def format_counters(ctr: dict[str, int], indent: str = "  ") -> str:
     to more than 100%: the counters overlap rather than partitioning the run.
     Under issue-and-wait the scalar unit is parked in ``S_WAIT`` for nearly the
     whole of any dispatch, so ``swait`` shadows ``mxu``/``vpu``/``dma``,
-    ``mload`` is a sub-phase of ``mxu``, and ``vmm`` is a sub-phase of ``vpu``.
-    Read each line as "the fraction of the run this unit was active", not as a
-    slice of a pie.
+    ``mload`` is a sub-phase of ``mxu``. Read each line as "the fraction of the
+    run this unit was active", not as a slice of a pie.
     """
     labels = {
         "mxu":   "MXU busy",
         "mload": "  of which weight load",
         "vpu":   "VPU busy",
-        "vmm":   "  of which vecmatmul",
         "dma":   "DMA busy",
-        "swait": "scalar stalled (issue-and-wait)",
     }
     run = ctr.get("run", 0)
     lines = [f"{indent}run{'':<32} {run:>10} clocks"]

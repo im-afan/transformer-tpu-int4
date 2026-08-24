@@ -213,15 +213,16 @@ static inline void tpu_mxu_mm(uint32_t out_addr, uint32_t act_addr,
 
 /* ---- VPU (cmd_vpu.sv) --------------------------------------------------- */
 
+/* The VPU has one command. 0x02 was VPU_GEOM, carrying the vecmatmul macro
+ * op's row/column geometry; both were removed (rtl/vpu.sv header) and the
+ * opcode is a retired hole. */
 #define TPU_VPU_OP   0x01u
-#define TPU_VPU_GEOM 0x02u
 
-/* vpu.sv's VOP_* encodings — the opcode the unit decodes. */
+/* vpu.sv's VOP_* encodings — the opcode the unit decodes. 13 was VECMM. */
 #define TPU_V_DOT     0u
 #define TPU_V_ADD     1u
 #define TPU_V_RELU    3u
 #define TPU_V_REQUANT 10u
-#define TPU_V_VECMM   13u
 #define TPU_V_DYT     16u
 #define TPU_V_QUANT4  17u
 
@@ -239,19 +240,6 @@ static inline void tpu_vpu(unsigned op, uint32_t dst_addr, uint32_t src0_addr,
              TPU_VPU_OP | (op << 8) | (dst_addr << 16),
              src0_addr | (src1_addr << 16),
              count | (rq_word << 16),
-             0u);
-}
-
-/* Geometry for the vecmatmul macro op: rows x cols pairs with per-operand row
- * strides. Sticky in this unit's queue, exactly as MXU_GEOM is. */
-static inline void tpu_vpu_geom(uint32_t rows, uint32_t cols,
-                                uint32_t src0_row_bytes,
-                                uint32_t src1_row_bytes, uint32_t out_row_bytes)
-{
-    tpu_push(TPU_U_VPU,
-             TPU_VPU_GEOM | (rows << 16),
-             cols | (src0_row_bytes << 16),
-             src1_row_bytes | (out_row_bytes << 16),
              0u);
 }
 

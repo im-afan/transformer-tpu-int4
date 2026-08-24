@@ -38,14 +38,14 @@ What is left:
   an int8 mask and a `RELU`, both here. `QK^T` and `PV` used to be here too, as the
   `VECMATMUL` macro op — a serial `DOT` per (query, key) pair, and the slowest thing
   in the shipped kernel. They are now on the [MXU](mxu.md), because K and V are
-  **ternary activations**: the array multiplies an int8 activation by a ternary
-  weight, so ternarizing the operand that lands on the weight side is all it took.
-  `QUANT4` is the op that does that. The output head followed — `Model.fc` is an
-  `TernaryLinear` too — so `VECMATMUL` has **no caller in the shipped kernel at all**,
-  and neither does `DOT`. Both are kept: an int8 × int8 matmul is one model shape away,
-  and dropping them means dropping the whole reduction path (accumulator, fold, scalar
-  store) plus the counter block around it, which is an area decision to make on purpose
-  rather than a deletion.
+  packed to int4 by `QUANT4` and an int4 activation is a legal weight operand. The
+  output head followed once `Model.fc` became an `Int4Linear`, which left `VECMATMUL`
+  with **no caller at all** — and it has since been **removed**, along with the
+  geometry inputs and the `vpu_mm_busy` perf event that existed only for it.
+  `DOT` stayed. It has no caller either, but it *is* the reduction path (accumulator,
+  lane fold, scalar store) and the only int8 × int8 reduction the ISA has, so it is
+  what an int8 × int8 model shape would be rebuilt from; restoring the macro op means
+  re-adding the wrapper, not the datapath.
 
 ## Operations
 
@@ -58,18 +58,17 @@ The op is selected by the 5-bit `vpu_op` field driven by the scalar unit, matchi
 | `1`      | `ADD`       | elementwise | `src0`, `src1`           | `dst[i] = src0[i] + src1[i]`                 |
 | `3`      | `RELU`      | elementwise | `src0`                   | `dst[i] = max(src0[i], 0)`                   |
 | `10`     | `REQUANT`   | requant     | `src0`(int32), `scalar`  | `dst[i] = clip((src0[i]·m0 + rnd) >> n)`     |
-| `13`     | `VECMATMUL` | macro op    | `src0`, `src1`, geometry | `dst[t][s] = Σ_d src0[t][d]·src1[s][d]`      |
 | `16`     | `DYT`       | requant     | `src0`(int32), `scalar`  | `dst[i] = clip±127((src0[i]·m0 + rnd) >> n)` |
 | `17`     | `QUANT4`    | requant     | `src0`(**int8**), `scalar` | `dst[i] = clip[-8,7]((src0[i]·m0 + rnd) >> n)`, 4 bits wide |
 
-The gaps (`2`, `4`–`9`, `11`, `12`, `14`, `15`) are retired codes, not free encoding
+The gaps (`2`, `4`–`9`, `11`–`15`) are retired codes, not free encoding
 space — see [Removed ops](#removed-ops). They are left vacant so a stale binary decodes
 to an unknown op rather than a different one.
 
 `DOT` is the only reduction: it collapses the vector to one int32 scalar at `dst`. Every
-other op produces a same-length vector. `DOT` is also the sole reason `vecdot` still
-exists as an instruction — no shipped kernel issues it, but it is `VECMATMUL`'s inner
-primitive, so the datapath is mandatory and the opcode costs one decode arm.
+other op produces a same-length vector. No shipped kernel issues `vecdot`; it is kept
+because it is the reduction datapath itself and the only int8 × int8 reduction the ISA
+has, and it costs one decode arm.
 
 ### Removed ops
 
@@ -87,6 +86,7 @@ them had a caller.
 | `SCALAR_DIV` (12) | softmax's `Σexp`, LayerNorm variance | the shared restoring divider, `recip_R`/`div_*` state, the `S_RECIP` state, and the `RECIP_Q`/`DIV_Q` parameters |
 | `REDUCEMAX` (7), `REDUCESUM` (8) | softmax/LayerNorm statistics | the **max fold** in the reduction path — `acc` now always opens at zero, since `DOT` is the only reduction left |
 | `SOFTMAX` (14), `SM_EXP` (15) | the fused row-wise softmax macro op | its whole four-pass sequencer (`sm_*`), and `cfg vscalar` (index 9), the config register only it read |
+| `VECMATMUL` (13) | attention's `QK^T` and `PV`, before `QUANT4` put them on the array | its two-level pair counter and address steppers (`mm_*`), the five geometry inputs (`vrows`/`vcols`/`vrow0`/`vrow1`/`vcrow`, `cfg` 10–14), the `VPU_GEOM` command (`cmd_vpu.sv` `0x02`) that carried them, and `vpu_mm_busy` — `tpu_top.sv`'s counter 6 (`vmm`) is now tied low. **Not** `DOT`: the reduction datapath it wrapped is untouched |
 
 Two ISA-level consequences. `cfg vscalar` is **retired but its index is not reused**:
 renumbering `vrows`…`tdrow` would silently repoint every `setcfg` in every existing
@@ -115,6 +115,11 @@ if training bad"* next to its ReLU attention, and restoring it means restoring `
 `SCALAR_DIV` with its divider, `SM_EXP`, the four-pass sequencer and `cfg vscalar` —
 i.e. essentially this entire table. It is all recoverable from git history, but it is
 not a one-line revert. LayerNorm would additionally want `SQUARE` back.
+
+`vecmatmul` is the cheap one to bring back by comparison: `DOT` is still here, so it is
+the wrapper — the pair counter, the address steppers, the geometry command — and not
+any datapath. It is only worth doing for a model shape whose attention operand cannot
+be narrowed to int4, since on this one the array does the same work far faster.
 
 ### Datatypes and requant
 
@@ -228,13 +233,10 @@ scratchpad port for the duration of the op.
 | `vpu_vlen`  | in  | 10        | vector length in elements (config reg, ≤ 1023)      |
 | `vpu_busy`  | out | 1         | high from `start` until the op retires              |
 | `vpu_done`  | out | 1         | one-cycle pulse when the result is fully written    |
-| `vpu_mm_busy`| out| 1         | `vpu_busy` **and** the op is `VECMATMUL` (perf only)|
 
-`vpu_mm_busy` is not part of the dispatch handshake — the scalar unit never reads it.
-It exists so `perf_counters.sv` can separate the macro op's clocks from the primitive
-ops' (`tpu_top.sv`'s counter 6, `vmm`). `vpu_busy` alone conflates them, and they cost
-very differently: a pointwise op retires `LANES` elements per chunk, while `vecmatmul`
-pays a whole `S_RD0`…`S_WB` round trip per (row, col) pair. See macro_ops.md §7.
+There is no geometry on this interface and no `vpu_mm_busy`: both existed only for
+`VECMATMUL`, and went with it. `tpu_top.sv`'s counter 6 (`vmm`) is now tied low and
+kept as a retired slot so the UART `'T'` reply does not renumber.
 
 All addresses are byte offsets into the scratchpad and are captured on `vpu_start`, so
 the scalar unit may reuse its register file immediately after issue.
