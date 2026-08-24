@@ -2,6 +2,13 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+## Practices (VERY IMPORTANT)
+- Do NOT run non-trivial commands unless told to do so. This includes: running code, installing packages, pushing to git 
+- Respond to me concisely, and don't tell me things I didn't ask for. After making edits, create a summary of every change you made, but keep it short: concise bullet points for everything, not full paragraphs.
+- Don't use unneccessary jargon that just creates further confusion. For example, you once told me that a test has "teeth" when referring to a modified testbench... what does that even mean? Just keep the responses straightforward and simple.
+- Keep code self-documenting. Instead of writing long comments explaining everything, make variable names clear. Feel free to make names as long as needed!
+- Double-check before claiming something as fact. Don't state things confidently without a source - if you can't verify it, say so or go verify it first. Trust verified evidence over a single conflicting source.
+
 ## What this is
 
 A small decoder-style transformer trained to do multi-digit **addition** (a character-level
@@ -30,6 +37,19 @@ every activation stays resident and only the weights stream, which is a
 `fw/tiled.c` (`make fw FWPROG=tiled`) is the regression for the paths `adder.c`
 does not take — DRAM to DRAM, undersized arena, all three block loops running —
 and is checked against an independent Python matmul, not only against the ISS.
+
+[`accel/tpu/fw/infer.c`](accel/tpu/fw/infer.c) is the same model in the
+**generative** shape: a 15-token prefill, then 16 decode steps of M=1 against a
+statically allocated KV cache, 4606 commands, one run. Both halves are one
+`infer_block(rows, first_pos)` — the cache, the mask and `tpulib.h` do not care how many
+rows arrive at once, so **M is the only difference between the training shape and
+the generation shape**. It also closes the loop on the device: `cpu_subsys.sv`
+maps the scratchpad at `0x9xxx_xxxx`, so the CPU reads the head's logits back
+and argmaxes them itself, and the embedding "gather" is a DMA at an address it
+computed from the token it chose. The host tokenizes and nothing else.
+`python accel/tpulang/infer_export.py -n 256` scores **100.00% / 100.00%**
+*generating* — not teacher-forced — and picks the same sequence as the PyTorch
+model on 256 of 256 problems.
 
 Everything is int4 now, weights *and* activations, on both sides: the RTL and
 `iss.py` take **int4 weights in a row-major 4-bit packed layout** and every
@@ -107,18 +127,29 @@ one command producer, PicoRV32 firmware in `accel/tpu/fw/`:
 
 ```bash
 make -C accel/tpu/fw                        # C firmware -> matmul.hex (RISC-V gcc)
-make -C accel/tpu/fw PROG=adder             # ...or tiled / mha / ffn / matmul_loop
+make -C accel/tpu/fw PROG=adder             # ...or infer / tiled / mha / ffn / spadwin
 make -C accel/tpu/fw trace PROG=adder       # the kernel's command trace, host cc only
-python accel/tpulang/fw_vectors.py -t <trace> -o accel/tpu/tb/vectors_fw -k adder
+python accel/tpulang/fw_vectors.py -x accel/tpu/fw/adder.trace -o accel/tpu/tb/vectors_fw -k adder
 python accel/tpu/host/run_fw_matmul.py --dry-run   # operands + reference, no board
 cd accel/tpu/tb && make fw FWPROG=adder     # the kernel through the whole core (~3 min)
+cd accel/tpu/tb && make fw FWPROG=infer     # prefill + decode, KV cache, 4606 commands
+cd accel/tpu/tb && make fw FWPROG=infer GEN=3   # ...3 generated tokens instead of 17
 cd accel/tpu/tb && make fw FWPROG=tiled     # tpulib.h's block loops, ~20 s
+cd accel/tpu/tb && make fw FWPROG=spadwin   # the CPU's scratchpad window, ~1 s
 cd accel/tpu/tb && make fwuart FWPROG=ffn   # the same, but loaded over the simulated UART
 cd accel/tpu/tb && make list                # RTL testbenches (Icarus)
 
-python accel/tpulang/adder_export.py -n 256          # accuracy on the addition task
+python accel/tpulang/adder_export.py -n 256          # accuracy, teacher-forced
+python accel/tpulang/infer_export.py -n 256          # accuracy, generating
 python accel/tpulang/adder_export.py --dump-rq -n 0  # the 16 requant words per layer
 ```
+
+`fw_vectors.py` now takes the trace *binary* (`-x`) rather than a captured trace
+file, and runs it as a co-process. That is not a convenience: `infer.c` argmaxes
+its own logits over the scratchpad window and the token it picks lands in the
+*address* of the next DMA, so its command stream is not a function of the program
+alone — the ISS has to be executing the commands and answering the kernel's
+reads as they happen. `-t <file>` still works for a trace someone else captured.
 
 `make` targets in `tb/`: `sim` (default TB), `cosim` (host driver vs RTL over a
 simulated UART), `fw` / `fwuart` / `fwsweep` (C firmware; all need a RISC-V gcc,
@@ -366,22 +397,29 @@ keeping only the last 3 (gitignored; the committed `colab_*.pt` are not produced
   sign-extending, the testbenches' DRAM byte maps were sized off `ADDR_W` (so high expectations
   were *silently dropped* by `$readmemh`), and `tpu_top_tb`'s backdoor pokes truncated too.
   **When something addresses DRAM, check it is not using `ADDR_W`.**
-- **`tpulang/`** — three files, all that is left of the software stack after the
+- **`tpulang/`** — four files, all that is left of the software stack after the
   assembler and the `.tpu` language were deleted. `iss.py` (bit-exact with the RTL;
   the instruction decoder is gone, `exec_command`/`run_trace` are the way in),
   `fw_vectors.py` (a firmware kernel's command trace → golden DRAM images + the
   expected command stream, plus the **one** definition of each kernel's synthetic
-  operands), and `adder_export.py` (real checkpoint → requant table → trace →
-  accuracy). The directory name is now a fossil.
+  operands), `adder_export.py` (real checkpoint → requant table → trace →
+  accuracy, teacher-forced) and `infer_export.py` (the same checkpoint
+  *generating*, through `fw/infer.c`). The directory name is now a fossil.
+  - **`fw_vectors.py` runs the trace binary itself** (`-x`), as a co-process:
+    it executes each command on the ISS as it arrives and answers the kernel's
+    scratchpad reads out of the model's memory (`coexecute`). A kernel that
+    branches on its own results has no trace otherwise — `infer.c`'s argmax puts
+    the chosen token in the *address* of the next DMA. `-t` still reads a
+    captured file.
 - **`fw/tpulib.h` is the primitive layer, and it is written to be specialized.**
   `tpu_matmul` blocks a GEMM in rows (`t_len <= 32`), columns and the contraction,
   stages whichever operands are in DRAM through a caller-supplied `tpu_arena`,
   and requants on store when the contraction was unsplit or through the VPU when
   it was not; `tpu_add_narrow` / `tpu_relu_narrow` / `tpu_pack4` chunk the VPU
-  pairs at `vlen` and stream DRAM operands; `tpu_transpose8` and `tpu_move2d`
+  pairs at `vlen` and stream DRAM operands; `tpu_transpose_int8` and `tpu_move2d`
   cover the rest. Every primitive is **self-fencing** — it returns only once its
   commands have retired — so composing two is always safe.
-  - **`tpu_matmul`, `tpu_gemm_blocks` and `tpu_gemm_need` are `always_inline`,
+  - **`tpu_matmul`, `tpu_gemm_blocks` and `tpu_gemm_arena_bytes` are `always_inline`,
     and that is load-bearing, not cosmetic.** Everything a primitive computes
     before its first push is exposed clock for clock (the caller has just
     fenced) and the PicoRV32 is ~5-9 clocks per instruction with no cache, so
@@ -407,14 +445,39 @@ keeping only the last 3 (gitignored; the committed `colab_*.pt` are not produced
   weights, and under `tpu_matmul` a column slice of a fused block is strided and
   would cost D transfers.
   - **The requant table is a compile-time input**, because the `{m0,n}` word is a
-    literal in the macro-op and the CPU has no path to DRAM or the scratchpad.
-    `fw/adder_rq.h` is the checked-in default and is tuned for `fw_vectors.py`'s
-    synthetic operands, so the RTL regression needs no checkpoint;
-    `adder_export.py` generates a real one and compiles the kernel against it
-    with `-DADDER_RQ_H`.
+    literal in the macro-op and the CPU has no path to **DRAM**. (It does have
+    one to the scratchpad — see `infer.c` below — but a requant word arrives
+    with the command, not out of memory.) `fw/adder_rq.h` is the checked-in
+    default and is tuned for `fw_vectors.py`'s synthetic operands, so the RTL
+    regression needs no checkpoint; `adder_export.py` generates a real one and
+    compiles the kernel against it with `-DADDER_RQ_H`.
+- **`fw/infer.c` is the same model as inference**: a 15-token prefill and 16
+  decode steps of M=1 against a **statically allocated KV cache**, 4606 commands,
+  one run, the same `adder_rq.h` table. One `infer_block(rows, first_pos)` serves both, so
+  M is the only difference between the two shapes. Its contract is that file's
+  header and `fw/README.md`; the parts that are not obvious:
+  - **The cache is 3 KB per layer and each half is stored in the orientation its
+    matmul wants**, because the append is what a cache costs. V's is free (one
+    `quant4` row, exactly how V leaves its projection); K's is a *column* of a
+    column-major `[D][T]`, which is the transposing DMA (`fill.t`, `tdrow = T`) —
+    one command for any M. K stays int8 and is re-packed whole each layer-step:
+    the nibble for `(d, t)` is half a byte and no op writes half a byte.
+  - **Nothing is zeroed and nothing needs to be.** The mask that makes attention
+    causal (`-8` against an int4 score, then ReLU) is also what makes the
+    uninitialized tail of the cache exactly zero. So the scratchpad is not
+    cleared between problems, on the board or in `infer_export.py`.
+  - **The argmax and the embedding gather are on the device.** `cpu_subsys.sv`
+    maps the scratchpad at `0x9xxx_xxxx`, so the head writes its logits there and
+    the CPU reads them back (`tpu_spad_ld`) and gathers `DR_EMB + tok*D` with a
+    DMA. `adder.c`'s "the host owns these two, structurally" was true of the
+    command ISA and never of the machine. `fw/spadwin.c` is that window's own
+    ~1 s regression; the window is **unsynchronized** — a load is not a command,
+    so it needs the same `tpu_wait` a dependent command would, 32 bits wide and
+    4-byte aligned (the S port has no byte strobes).
 
 When touching attention numerics, keep the implementations in sync:
-`model/transformer.py` (reference), `fw/adder.c` + `iss.py`, and the RTL.
+`model/transformer.py` (reference), `fw/adder.c` + `fw/infer.c` + `iss.py`, and
+the RTL.
 
 ## The int8 finding, and why the model keeps changing
 
@@ -590,6 +653,17 @@ small kernels and would trip on this one while it worked perfectly).
 The split is `mxu = 206 361`, `dma = 131 200`, `vpu = 84 352`, `idlec = 31 864` (7.0%,
 which is what the CPU costs as a command producer). `qfull` and `ovlap` are both 0:
 nothing overlaps yet, because every primitive fences after every cross-unit dependency.
+
+`make fw FWPROG=infer` is longer still — 4606 commands, and each of the 17 generated
+tokens re-streams the same 96 KB of weights, so it is DMA-bound at an *estimated*
+~150 k clocks per token (the tb Makefile gives it a 400 ms watchdog to sit behind
+that). **Use `GEN=3` while iterating**: same prefill, same cache, three tokens.
+`infer` and `spadwin` have **not been run against the RTL yet** — they were written
+and verified on a machine with no RISC-V gcc and an Icarus too old to parse the
+RTL's `signed'()` casts, so the ISS and the cache-free reference are what stands
+behind them. `make fw FWPROG=spadwin` is the ~1 s one to run first: it is the only
+thing that exercises the CPU's scratchpad window, which no firmware touched before
+`infer.c`.
 
 **`make fwtime FWPROG=<kernel>` is the same run plus a per-command timeline** —
 `fw_matmul_tb.sv` dumps one with `+CMDLOG=`, `tb/cmd_timeline.py` turns it into

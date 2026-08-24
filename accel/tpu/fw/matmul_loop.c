@@ -1,43 +1,38 @@
-/* matmul_loop.c — the same C[M][N] = A[M][K] @ W[K][N] as matmul.c, with the
- * tile grid walked in firmware instead of by the MXU.
+/* matmul_loop.c — the same C = A @ W as matmul.c, with the tile grid walked in
+ * firmware instead of by the MXU.
  *
- * matmul.c sets KTILES/NTILES and issues ONE TPU_MM_TILED matmul: the array
- * walks the 4x2 grid itself, so the int32 partials stay in its result buffer
- * for a whole contraction and reach the scratchpad once per output tile. Here
- * the grid is a C `for` pair and each of the 8 tiles is its own MXU_MM, so the
- * partials round-trip through the scratchpad between contraction tiles —
- * k == 0 initialises the int32 tile, k > 0 adds into it with TPU_MM_ACC. That
- * is the same flag dance ../../tpulang/examples/tiled_matmul.tpu runs on the
- * scalar unit, and the C traffic the hardware loop was built to delete
- * (docs/macro_ops.md §4.2).
+ * matmul.c issues ONE tiled matmul and the array walks the grid itself, so the
+ * int32 partials stay in its result buffer for a whole contraction and reach
+ * the scratchpad once per output tile. Here the grid is a C `for` pair and each
+ * tile is its own dispatch, so the partials round-trip through the scratchpad
+ * between contraction tiles: the first depth tile initialises the int32 tile
+ * and the rest add into it with TPU_MM_ACC. That is the C traffic the hardware
+ * tile loop was built to delete (docs/macro_ops.md 4.2).
  *
- * A requantized result would put TPU_MM_RQ on the k == KTILES-1 dispatch only,
- * since the narrow has to see the finished sum. Not done here: matmul.c leaves
- * C int32 and this must match it byte for byte.
- *
- * Layout, addresses and result are identical to matmul.c, so
- * host/run_fw_matmul.py checks this one unchanged:
+ * A requantized result would set TPU_MM_RQ on the LAST depth tile only, since
+ * the narrow has to see the finished sum. Not done here: matmul.c leaves C
+ * int32 and this must match it byte for byte, so host/run_fw_matmul.py checks
+ * either one unchanged:
  *
  *     make -C accel/tpu/fw PROG=matmul_loop
  *     make -C accel/tpu/fw run PROG=matmul_loop PORT=COM5
  *
  * TPU_MM_TILED is still set on every dispatch, with both tile counts at 1. The
- * flag selects the configured strides over the single-tile constants
- * (rtl/mxu.sv, `act_row_stride_sel`); at a count of 1 the hardware's tile loop
- * runs exactly one pass, so nothing here is hardware-managed. Dropping the flag
- * would force arow = ROWS and crow = COLS*4 — a dense, tile-shaped operand,
- * which is the other way to write this: DMA each tile into a small fixed buffer
- * as tiled_matmul.tpu does, at one fill per tile. Keeping A, W and C resident
- * and flat is what makes this comparable to matmul.c.
+ * flag selects the configured strides over the single-tile constants (mxu.sv,
+ * `act_row_stride_sel`); at a count of 1 the hardware's loop runs exactly one
+ * pass, so nothing here is hardware-managed. Dropping the flag would force
+ * dense, tile-shaped operands instead — which is the other way to write this,
+ * at one DMA per tile. Keeping A, W and C resident and flat is what makes this
+ * comparable to matmul.c.
  *
- *   A : M x K int8, row-major            arow = K
- *   W : K x N int4, ROW-major 4-bit        wrow = N*4/8
- *   C : M x N int32                      crow = N*4
+ *   A : [M][K] int8, row-major      act_row = K
+ *   W : [K][N] int4, row-major      wgt_row = N/2
+ *   C : [M][N] int32                out_row = N*4
  */
 #include "tpu.h"
 
-#define ROWS 8                  /* MXU array geometry — fixed by the bitstream */
-#define COLS 8
+#define ARRAY_ROWS 8            /* MXU geometry — fixed by the bitstream */
+#define ARRAY_COLS 8
 
 /* Shape, overridable exactly as in matmul.c — the two must be built with the
  * same three numbers to be comparable. M <= 32 (mxu.sv MAX_TOKENS). */
@@ -45,42 +40,41 @@
 #define M      8                /* token rows */
 #endif
 #ifndef KTILES
-#define KTILES 4
+#define KTILES 4                /* array passes over the contraction */
 #endif
 #ifndef NTILES
-#define NTILES 2
+#define NTILES 2                /* array passes over the output columns */
 #endif
 
-#define K (KTILES * ROWS)
-#define N (NTILES * COLS)
+#define K (KTILES * ARRAY_ROWS)
+#define N (NTILES * ARRAY_COLS)
 
-#define AROW K                  /* A row stride, bytes */
-#define WROW ((N * 4) / 8)      /* W row stride, bytes (row-major int4) */
-#define CROW (N * 4)            /* C row stride, bytes (int32) */
+#define ACT_ROW K               /* bytes: int8 */
+#define WGT_ROW (N / 2)         /* bytes: int4, two nibbles per byte */
+#define OUT_ROW (N * 4)         /* bytes: int32 */
 
-/* Per-tile steps. The hardware derives these from the tile indices; with the
- * counts pinned at 1 they are the loop's own address arithmetic. */
-#define AKSTEP ROWS             /* 8  — one k tile along A's row            */
-/* Row-major weights swap these two relative to the column-major version: an
- * n tile is a step *along* a weight row by one array width of nibbles, and a
- * k tile is a step *down* ROWS whole rows. Same swap as mxu.sv's
- * wgt_ntile_step / wgt_ktile_step. */
-#define WKSTEP (ROWS * WROW)    /* one k tile down ROWS whole weight rows   */
-#define WNSTEP ((COLS * 4) / 8) /* 4  — one n tile along a weight row       */
-#define CNSTEP (COLS * 4)       /* 32 — one n tile of int32 C               */
+/* Per-tile address steps. The hardware derives these from the tile indices;
+ * with the counts pinned at 1 they are this loop's own address arithmetic.
+ * Row-major weights swap the two weight steps relative to the column-major
+ * version — an output-column tile steps ALONG a weight row, a depth tile steps
+ * DOWN whole weight rows. Same swap as mxu.sv's wgt_ntile_step/wgt_ktile_step. */
+#define ACT_DEPTH_STEP ARRAY_ROWS           /* 8  — one depth tile along a row */
+#define WGT_DEPTH_STEP (ARRAY_ROWS * WGT_ROW)
+#define WGT_COL_STEP   (ARRAY_COLS / 2)     /* 4  — one column tile along a row */
+#define OUT_COL_STEP   (ARRAY_COLS * 4)     /* 32 — one column tile of int32 C  */
 
 #define A_BYTES (M * K)
-#define W_BYTES (K * WROW)
+#define W_BYTES (K * WGT_ROW)
 #define C_BYTES (M * N * 4)
 
-/* Same value in DRAM and in the scratchpad, as in the .tpu examples. */
+/* Same address in DRAM and in the scratchpad. */
 #define A_ADDR 0x0000u
 #define W_ADDR 0x2000u
 #define C_ADDR 0x4000u
 
 int main(void)
 {
-    unsigned n, k;
+    unsigned col_tile, depth_tile;
 
     /* operands in */
     tpu_dma(A_ADDR, A_ADDR, A_BYTES, TPU_DMA_FILL);
@@ -88,19 +82,21 @@ int main(void)
     tpu_wait(TPU_U_DMA);        /* the MXU queue is not ordered against the DMA's */
 
     /* Strides describe the whole matrix; the counts describe one array pass. */
-    tpu_mxu_geom(AROW, CROW, WROW, 1u, 1u, M);
+    tpu_mxu_geom(ACT_ROW, OUT_ROW, WGT_ROW, 1u, 1u, M);
 
-    /* n outer, k inner — the order the hardware loop uses, so the two paths
-     * differ only in who walks the grid. No fence inside: one unit's queue is
-     * in-order, so the k > 0 read-modify-write of C cannot pass the k == 0
-     * store. Past the queue's 8 entries the ninth push stalls the CPU inside
-     * the store, which is why there is no software flow control here either. */
-    for (n = 0; n < NTILES; n++)
-        for (k = 0; k < KTILES; k++)
-            tpu_mxu_mm(C_ADDR + n * CNSTEP,
-                       A_ADDR + k * AKSTEP,
-                       W_ADDR + n * WNSTEP + k * WKSTEP,
-                       TPU_MM_TILED | (k ? TPU_MM_ACC : 0u),
+    /* Columns outer, depth inner — the order the hardware loop uses, so the two
+     * paths differ only in who walks the grid. No fence inside: one unit's
+     * queue is in-order, so a later accumulate cannot pass the store that
+     * initialised the tile. Past the queue's 8 entries the ninth push stalls
+     * the CPU inside the store, so there is no software flow control here
+     * either. */
+    for (col_tile = 0; col_tile < NTILES; col_tile++)
+        for (depth_tile = 0; depth_tile < KTILES; depth_tile++)
+            tpu_mxu_mm(C_ADDR + col_tile * OUT_COL_STEP,
+                       A_ADDR + depth_tile * ACT_DEPTH_STEP,
+                       W_ADDR + col_tile * WGT_COL_STEP
+                              + depth_tile * WGT_DEPTH_STEP,
+                       TPU_MM_TILED | (depth_tile ? TPU_MM_ACC : 0u),
                        0u);
     tpu_wait(TPU_U_MXU);
 

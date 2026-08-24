@@ -299,8 +299,18 @@ module tpu_top #(
     logic [31:0]           fw_wdata;
     logic                  cpu_run, cpu_busy, cpu_done, cpu_trap;
 
+    // IMEM_AW (the parallel load port) and FW_AW (the firmware RAM) are
+    // independent parameters, so the resize can be neither a truncation nor a
+    // zero-extension written by hand: with IMEM_AW < FW_AW (the board sets 10
+    // against 12) `imem_waddr[FW_AW-1:0]` is an out-of-range part select, which
+    // Vivado rejects outright. Assigning through an FW_AW-wide net resizes in
+    // whichever direction the two parameters happen to need.
+    logic [FW_AW-1:0]      fw_waddr_host, fw_waddr_uart;
+    assign fw_waddr_host = imem_waddr;
+    assign fw_waddr_uart = uart_imem_waddr;
+
     assign fw_we    = imem_we | uart_imem_we;
-    assign fw_waddr = uart_imem_we ? uart_imem_waddr[FW_AW-1:0] : imem_waddr[FW_AW-1:0];
+    assign fw_waddr = uart_imem_we ? fw_waddr_uart : fw_waddr_host;
     assign fw_wdata = uart_imem_we ? uart_imem_wdata : imem_wdata;
 
     // The CPU runs as a level, not a pulse: 'G' releases it from reset and it is

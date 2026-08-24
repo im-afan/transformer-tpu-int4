@@ -144,6 +144,18 @@ module cpu_subsys #(
 
     initial if (FW_INIT != "") $readmemh(FW_INIT, fw_mem);
 
+    // The array is driven from its own reset-free process, below. Writing it
+    // from the AXI FSM's `always_ff @(posedge clk or negedge rst_n)` instead
+    // puts the memory in a block with an asynchronous reset, and Vivado will
+    // not infer a block RAM from that -- it falls back to registers, and
+    // 4096x32 bits is far past the limit at which that is even attempted
+    // ("Unable to infer a block/distributed RAM for 'fw_mem_reg'", Synth
+    // 8-3391). The two write sources are mutually exclusive: the host load
+    // runs only while the core is held in reset.
+    logic [FW_AW-1:0] fw_wr_addr;
+    logic [3:0]       fw_wr_strb;
+    logic [31:0]      fw_wr_data;
+
     // =========================================================================
     // Transaction bookkeeping. One outstanding transaction, so this is two
     // flags and a small state.
@@ -255,12 +267,6 @@ module cpu_subsys #(
 
             // ---- perform the write -------------------------------------------
             if (aw_got && w_got && !m_bvalid && !cmd_stalled) begin
-                if (is_fw(wr_addr)) begin
-                    if (wr_strb[0]) fw_mem[wr_addr[FW_AW+1:2]][ 7: 0] <= wr_data[ 7: 0];
-                    if (wr_strb[1]) fw_mem[wr_addr[FW_AW+1:2]][15: 8] <= wr_data[15: 8];
-                    if (wr_strb[2]) fw_mem[wr_addr[FW_AW+1:2]][23:16] <= wr_data[23:16];
-                    if (wr_strb[3]) fw_mem[wr_addr[FW_AW+1:2]][31:24] <= wr_data[31:24];
-                end
                 if (wr_is_cmd && !wr_cmd_commit)
                     stage[wr_addr[3:2]] <= wr_data;
                 if (is_mmio(wr_addr) && (wr_addr[11:0] == MMIO_DONE))
@@ -282,7 +288,6 @@ module cpu_subsys #(
                 rd_busy <= 1'b1;
                 rd_addr <= m_araddr;
                 rd_wait <= 2'd1;              // one cycle of memory latency
-                fw_q    <= fw_mem[m_araddr[FW_AW+1:2]];
             end else if (rd_busy && !m_rvalid) begin
                 if (rd_is_spad) begin
                     // s_re is held until the grant arrives; data lands the cycle
@@ -303,10 +308,35 @@ module cpu_subsys #(
                 m_rvalid <= 1'b0;
                 rd_busy  <= 1'b0;
             end
-
-            // ---- host firmware load (core in reset) ---------------------------
-            if (fw_we && !cpu_run) fw_mem[fw_waddr] <= fw_wdata;
         end
+    end
+
+    // =========================================================================
+    // Firmware RAM ports. Byte strobes on the write side so the compiler's `sb`
+    // and `sh` work; one registered read, enabled when an AR is accepted.
+    // =========================================================================
+    wire fw_axi_we = aw_got && w_got && !m_bvalid && !cmd_stalled && is_fw(wr_addr);
+
+    always_comb begin
+        if (fw_axi_we) begin
+            fw_wr_addr = wr_addr[FW_AW+1:2];
+            fw_wr_strb = wr_strb;
+            fw_wr_data = wr_data;
+        end else begin
+            // ---- host firmware load (core in reset) ---------------------------
+            fw_wr_addr = fw_waddr;
+            fw_wr_strb = (fw_we && !cpu_run) ? 4'hf : 4'h0;
+            fw_wr_data = fw_wdata;
+        end
+    end
+
+    always_ff @(posedge clk) begin
+        if (fw_wr_strb[0]) fw_mem[fw_wr_addr][ 7: 0] <= fw_wr_data[ 7: 0];
+        if (fw_wr_strb[1]) fw_mem[fw_wr_addr][15: 8] <= fw_wr_data[15: 8];
+        if (fw_wr_strb[2]) fw_mem[fw_wr_addr][23:16] <= fw_wr_data[23:16];
+        if (fw_wr_strb[3]) fw_mem[fw_wr_addr][31:24] <= fw_wr_data[31:24];
+
+        if (m_arvalid && m_arready) fw_q <= fw_mem[m_araddr[FW_AW+1:2]];
     end
 
 endmodule

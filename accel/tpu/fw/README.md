@@ -14,8 +14,10 @@ were deleted with phase 5.
 | `ffn.c` | the feed-forward block, `X@W1 → relu → requant → @W2`. The first kernel to issue a **VPU** command |
 | `mha.c` | one head of ReLU attention: all three DMA modes including the transposing spill, plus the `quant4` pack that turns an activation into a weight operand |
 | `tiled.c` | `tpulib.h` past the scratchpad: three DRAM-to-DRAM problems sized so the row, column and contraction loops all have to run |
+| `spadwin.c` | the **scratchpad window** on its own: the CPU reads a tensor back, writes one, and issues a DMA at an address it computed from what it read |
 | `adder.c` | **the whole shipped model** — four transformer layers and the output head, 534 commands, one run |
-| `adder_rq.h` | `adder.c`'s 16 requant `{m0,n}` words per layer. The checked-in copy is tuned for the synthetic operands; a real checkpoint overrides it (below) |
+| `infer.c` | the same model as **inference**: prefill, then decode against a statically allocated KV cache, argmax and embedding on the device. Token ids in, token ids out, 4606 commands, one run |
+| `adder_rq.h` | the 16 requant `{m0,n}` words per layer, shared by `adder.c` and `infer.c`. The checked-in copy is tuned for the synthetic operands; a real checkpoint overrides it (below) |
 | `memops.c` | `memcpy`/`memset`, which gcc emits calls to whatever the flags say. Nothing links it today — see its header |
 | `mock/tpu_trace.c` | the host-side `tpu_push`/`tpu_wait`, so `-DTPU_TRACE` turns any kernel here into its own command-trace producer |
 | `start.S` | reset entry: `gp`/`sp`, zero `.bss`, `main`, then raise `done` |
@@ -23,10 +25,11 @@ were deleted with phase 5.
 | `bin2hex.py` | `.bin` → one 32-bit word per line, for `'I'` and for `$readmemh` |
 
 Two layers, and which one a kernel is written against is a real choice.
-`matmul.c`, `matmul_loop.c`, `ffn.c` and `mha.c` are written straight against
-`tpu.h`: they are ISA tests, and the point of them is that every field is
-visible. `adder.c` and `tiled.c` are written against `tpulib.h`, because they
-are *programs* — what they need visible is the model, not the field widths.
+`matmul.c`, `matmul_loop.c`, `ffn.c`, `mha.c` and `spadwin.c` are written
+straight against `tpu.h`: they are ISA tests, and the point of them is that
+every field is visible. `adder.c`, `infer.c` and `tiled.c` are written against
+`tpulib.h`, because they are *programs* — what they need visible is the model,
+not the field widths.
 
 ## Build
 
@@ -40,6 +43,15 @@ Current sizes, all text, no `.data`/`.bss`, against 16 KB of firmware RAM:
 `adder` 1992. The whole four-layer model is 2 KB of RISC-V because the per-layer
 body is a loop over a base register, not unrolled — depth costs no instructions
 at all.
+
+`spadwin` and `infer` have only been built with **clang** (`zig cc
+-target riscv32-freestanding-none`, on a machine with no riscv gcc): 304 bytes
+and 15088. Clang is about 4.6x gcc on this code — it builds `adder` at 9120
+against gcc's 1992 — so expect roughly 3.5 KB from the gcc above for `infer`,
+which carries two specialized copies of the layer body (prefill's M=15 and
+decode's M=1). It fits either way; if a future toolchain disagrees, the knob is
+`infer_block`'s `always_inline`, and giving it up costs runtime rather than
+correctness (see `tpulib.h`'s note on why).
 
 ```bash
 make -C accel/tpu/fw            # -> matmul.hex
@@ -68,7 +80,15 @@ cd accel/tpu/tb
 make fw                     # ../fw/matmul.hex
 make fw FWPROG=matmul_loop  # the software tile loop, same expectations
 make fw FWPROG=tiled        # tpulib.h's block loops, checked against Python
+make fw FWPROG=spadwin      # the CPU's scratchpad window, ~1 s
+make fw FWPROG=infer        # prefill + decode with a KV cache, 4606 commands
 ```
+
+The golden vectors come out of the kernel's own native build either way, but
+`fw_vectors.py` now **runs** that build (`-x`) instead of being handed a trace
+captured by a shell redirect — `infer.c` reads its own logits back and puts the
+token it chose into the address of a later command, so its trace only exists if
+something answers those reads. Kernels that read nothing see no difference.
 
 Both pass: `matmul` halts after 2 209 clocks (MXU 289, DMA 1 548, 372 with no
 unit busy), `matmul_loop` after 2 586 (MXU 392, same DMA, 646 idle). The 103
@@ -150,7 +170,7 @@ and fences between the units on the way:
 | --- | --- |
 | `tpu_matmul(&gemm, &arena)` | `C[m][n] = A[m][k] @ W[k][n]`, any size, each operand in either memory. Blocks in rows, columns and the contraction; stages what is in DRAM; requants on store when it can and through the VPU when a split contraction stopped it |
 | `tpu_add_narrow`, `tpu_relu_narrow`, `tpu_pack4` | the widening/narrowing VPU pairs, chunked at `vlen`, streaming through the arena when an operand is in DRAM |
-| `tpu_transpose8` | `dst[c][r] = src[r][c]`, out through DRAM and back, split by rows past 64 KB |
+| `tpu_transpose_int8` | `dst[c][r] = src[r][c]`, out through DRAM and back, split by rows past 64 KB |
 | `tpu_move`, `tpu_move2d` | a linear or strided block between the two memories |
 | `tpu_arena` | a bump allocator over one scratchpad region. Each primitive takes what it needs and rewinds, so the high-water mark is the largest primitive, not their sum |
 
@@ -309,6 +329,126 @@ Measured on `model/saved/int4_d64_f256_l4.pt`, 256 problems: **100.00%
 exact-sequence, 100.00% token** — identical to the PyTorch QAT model it came
 from, with 0 of 4352 scored argmax positions differing.
 
+## `infer.c` — the same model, generating
+
+`adder.c` is one T=32 forward pass: every position at once, against a causal
+mask, over a sequence somebody already knows. That is the *training* shape.
+Generating an answer that way costs a whole 32-token forward per token emitted
+and recomputes K and V for the prefix every time.
+
+[`infer.c`](infer.c) is the generative shape — **prefill, then decode against a
+statically allocated KV cache** — and closes the loop on the device:
+
+```bash
+cd accel/tpu/tb && make fw FWPROG=infer          # 4606 commands
+cd accel/tpu/tb && make fw FWPROG=infer GEN=3    # 3 tokens instead of 17, for speed
+python accel/tpulang/infer_export.py -n 256      # accuracy, generating
+```
+
+```
+prefill   the 15 prompt tokens (numbers_data.EQUALS_POS) in ONE block. Their K
+          and V land in the cache; the last row's logits are the first answer
+          digit.
+decode    16 steps of M=1. The new token's K and V are appended and attention
+          contracts against the whole cache.
+```
+
+Both are the same code. `infer_block(rows, first_pos)` runs `rows` new rows starting at
+position `t0`, prefill calls it as `(15, 0)` and a decode step as `(1, t)`, and
+`always_inline` specializes the two. The cache, the mask and `tpulib.h`'s block
+loops do not care how many rows arrive at once, so **M is the only difference
+between the training shape and the generation shape on this machine.**
+
+### The cache, and why each half is stored the way it is
+
+3 KB per layer, scratchpad-resident, never moved:
+
+| | |
+| --- | --- |
+| `SP_K_CACHE[l]` | `[D][T]` int8 — K **transposed**, 2048 B |
+| `SP_V_CACHE[l]` | `[T][D]` int4 — V packed as a weight operand, 1024 B |
+
+Each is in the orientation its matmul needs, because what a cache costs is the
+*append*:
+
+- **V is free.** `P @ V` contracts over keys, so its weight is `V[s][h]` — row
+  `s` contiguous over `h`, exactly how V leaves its projection. Appending token
+  `t` is one `quant4` writing one 32-byte row.
+- **K is a column.** `Q @ K^T`'s weight is `K^T[h][s]` — row `h` contiguous over
+  *s* — so the cache is column-major and appending writes one byte into each of
+  D rows. That scatter is the transposing DMA (`fill.t` with `tdrow = T`), one
+  command whatever M is.
+
+K is kept int8 and re-`quant4`ed whole into a scratch `[D][T]` once per layer per
+step. That looks wasteful — 2048 elements packed to use at most `t+1` columns —
+and it is 4 VPU commands against the ~24 000 DMA clocks the same layer spends
+fetching weights. The alternative does not exist: the nibble for `(d, t)` sits in
+the middle of a byte and no op writes half a byte.
+
+**Nothing is zeroed, and nothing needs to be.** Cache columns past the current
+position hold whatever the last problem left there and reach S as garbage — but
+S is int4 and the mask is `-8`, so a masked score is at most `-1` and ReLU takes
+it to exactly zero. The mask that makes attention causal is the same mask that
+makes an uninitialized cache safe, which is why `infer_export.py` runs every
+problem through one TPU instance rather than a fresh one: not a shortcut, the
+test.
+
+### What moved from the host to the device
+
+`adder.c`'s header calls the token embedding and the argmax the host's job
+"structurally": the ISA has no gather and nothing returns an index. Both are
+true of the *command* ISA and neither is true of the machine — `cpu_subsys.sv`
+decodes `0x9xxx_xxxx` onto the scratchpad's S port, and always did.
+
+| | |
+| --- | --- |
+| argmax | the head writes 13 int32 logits to the **scratchpad**, and the CPU reads them back with `tpu_spad_ld` and compares |
+| gather | the embedding table is a DRAM tensor and a DMA takes a *computed* address, so `DR_EMB + tok*D` is the gather. The index never leaves the CPU |
+
+So the host stages the weights, the mask, the head, the embedding table and the
+prompt's token **ids**, presses `'G'` once, and reads a finished sequence out of
+`DR_TOKENS`. Nothing round trips per token. What it still does is tokenize.
+[`spadwin.c`](spadwin.c) is that window on its own, in 304 bytes and 4 commands
+— run it first if anything here misbehaves.
+
+### Tracing a kernel that branches on its own results
+
+The command stream now depends on what the array computed: the token the argmax
+picked is in the *address* of the next gather. So a producer with no model of the
+machine cannot emit this kernel's trace, and `make trace PROG=infer` gives a
+structurally-right, numerically-meaningless one (a read with no driver attached
+returns 0).
+
+The real trace comes from co-execution: `fw_vectors.py -x` runs the `-DTPU_TRACE`
+binary as a **co-process**, executing each command on `iss.py` as it arrives and
+answering the kernel's scratchpad reads out of the model's own memory. That is
+what `make fw FWPROG=infer` does, and it makes the golden command stream a real
+forward pass's — so if the RTL picks a different token anywhere, the run fails at
+*that command* rather than merely producing a different answer.
+
+`fw_vectors.py` also carries `reference_infer`, which recomputes the whole model
+from scratch at every step, in integer numpy, with **no cache at all**, and
+checks every generated token and every logit. That is the check that matters
+here for the same reason `tiled.c` has one: a cache column written at the wrong
+offset, the mask row of the wrong position, an argmax over the wrong words — the
+ISS reproduces all of them exactly as faithfully as the hardware would.
+
+### Measured
+
+`python accel/tpulang/infer_export.py -n 256` on
+`model/saved/int4_d64_f256_l4.pt`, generating the whole 17-token answer field
+from the prompt ids and nothing else:
+
+| | exact-sequence | token |
+| --- | --- | --- |
+| QAT model, greedy | 100.00% | 100.00% |
+| this kernel, generating | **100.00%** | **100.00%** |
+
+and the device chose the *same sequence* as the PyTorch model on 256 of 256
+problems. Unlike `adder_export.py`'s number this is not teacher forcing: the
+device is fed the prompt and its own output, so one wrong digit would derail
+every digit after it.
+
 ## Run it on the board
 
 ```bash
@@ -334,7 +474,7 @@ against 8 single-tile dispatches with `.acc` across the contraction.
 The board must be running `board=cmod_a7` and the bitstream must be new enough
 to contain `cpu_subsys.sv`.
 
-## Two things that are software's problem now
+## Three things that are software's problem now
 
 - **Cross-unit ordering.** Each unit has its own queue, so a `matmul` will start
   on top of a DMA that has not finished. `tpu_wait(unit)` — retired caught up
@@ -342,6 +482,12 @@ to contain `cpu_subsys.sv`.
 - **Queue-ordered geometry.** `MXU_GEOM` sticks until the next one, but only
   within the MXU's own command stream, so it cannot be corrupted by another unit
   or an earlier program the way the old `cfg` registers could.
+- **The scratchpad window is unsynchronized.** `tpu_spad_ld` / `tpu_spad_st`
+  bypass the queues entirely — they are loads and stores — so a read of a tensor
+  a queued command has not written yet is simply stale, and needs the same
+  `tpu_wait` a dependent command would. Two more rules, both from
+  `cpu_subsys.sv`: 32-bit accesses only (the S port has no byte strobes, so an
+  `sb` writes its three neighbours) and 4-byte-aligned.
 
 Flow control is *not* software's problem: a full queue withholds the write
 response on the fourth word and the CPU stalls inside the store.

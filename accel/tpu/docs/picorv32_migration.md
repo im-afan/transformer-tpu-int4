@@ -41,6 +41,7 @@ What passes today, on the tree as it stands:
 | `make fwuart FWPROG=<kernel>` - the same kernels with **nothing backdoored**: image, operands and results all over the simulated UART (§9.11) | 0 errors on every kernel; **`adder`: 531 102 checks, 534/534 commands, and a counter block identical to `make fw`'s** (`run=453 777 mxu=206 361 vpu=84 352 dma=131 200 idlec=31 864`) |
 | `make fwsweep` - both kernels over 11 shapes, vectors regenerated per shape | 22 of 22, 0 failures (largest: 260 commands) |
 | `make all` | 15 of 15 |
+| `make fw FWPROG=spadwin` / `FWPROG=infer` - the CPU's scratchpad window, and the model as prefill + KV-cached decode (§9.12) | **not run** - written where there was no RISC-V gcc and no Icarus new enough for this tree. Both pass on the ISS against independent references (4 and 4606 commands), and `infer_export.py` scores the second at 100.00% exact-sequence *generating* on a real checkpoint |
 
 `make examples` is the one that matters most: between them the ten kernels cover
 every path a dispatch can take through the new plane - single-tile `matmul`,
@@ -1053,6 +1054,60 @@ because `done_r` is already clear out of reset).
 
 This is invisible to `make fw`, `make fwsweep` and `cpu_smoke_tb`: every one of
 them runs exactly one program per reset.
+
+### 9.12 The producer can read the machine back (`fw/infer.c`)
+
+Everything above treats the CPU as a *write-only* producer: it pushes commands
+and polls a retired counter. That is what the command aperture is, and it is why
+`adder.c`'s header hands the token embedding and the argmax to the host as
+"structural" — the ISA has no gather and nothing returns an index.
+
+Both are properties of the command plane and neither is a property of the
+machine. `cpu_subsys.sv` has always decoded `0x9xxx_xxxx` onto the scratchpad's
+S port (§6), so the CPU can read a tensor a unit just wrote. `fw/infer.c` — the
+model as *inference*, a prefill plus 16 decode steps against a KV cache — is
+what uses it:
+
+- the output head writes its 13 int32 logits to the **scratchpad**, and the CPU
+  reads them back and argmaxes them (`tpu_spad_ld`);
+- the embedding "gather" is then a plain DMA at `DR_EMB + tok*D`, an address the
+  CPU computed from data it read.
+
+So the autoregressive loop closes on the device: one `'G'`, and the host reads a
+finished sequence out of DRAM instead of round-tripping per token. Three
+consequences worth writing down.
+
+**The window is outside the queues.** `tpu_spad_ld` is a load, not a command, so
+it has no ordering relationship with anything in flight: a read of a tensor a
+queued command has not written yet is stale, and needs the same `tpu_wait` a
+dependent command would. It is also 32 bits wide and 4-byte aligned by
+necessity — the S port has no byte strobes (`scratchpad.sv` drives
+`{S_BYTES{1'b1}}` for it), so an `sb` writes its three neighbours. And it sits
+below the MXU and the VPU in the read arbiter, so a read taken while the array
+is running stalls the core inside the load rather than returning something
+wrong.
+
+**A kernel that branches on its own results has no static trace.** §8.1's whole
+argument for the native trace producer is that the same C, compiled twice,
+cannot drift — but the token `infer.c` chooses ends up in the *address* of the
+next DMA, so its command stream is not a function of the program alone. The fix
+keeps the property: `fw_vectors.py -x` runs the `-DTPU_TRACE` binary as a
+co-process, executes each command on `iss.py` as it arrives, and answers the
+kernel's scratchpad reads (`SRD`) out of the model's own memory. The trace that
+comes out is a real forward pass's, and the RTL has to reproduce it command for
+command — so a hardware divergence that changes one token fails *at that
+command*, not merely in the answer.
+
+**Status.** `infer.c` (4606 commands) and `spadwin.c` (4 commands, the window on
+its own) have **not been run against the RTL**: they were written on a machine
+with no RISC-V gcc and an Icarus too old to parse this tree's `signed'()` casts.
+What does stand behind them is the ISS, run through the real firmware binary,
+plus an independent cache-free recompute of the whole model in
+`fw_vectors.py::reference_infer` — and, on a real checkpoint,
+`accel/tpulang/infer_export.py`, which scores **100.00% exact-sequence over 256
+problems while generating** and picks the same sequence as the PyTorch model on
+256 of 256. `make fw FWPROG=spadwin` is the ~1 s check to run first: the window is
+the one path here that no firmware exercised before.
 
 ---
 

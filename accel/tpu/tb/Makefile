@@ -122,10 +122,13 @@ sim: $(TB) $(RTL)
 #   make fw M=8 KTILES=16 NTILES=16   a different shape -- the firmware, the
 #                                     native trace and the golden operands are
 #                                     all rebuilt at it (see FWSHAPEARGS)
+#   make fw FWPROG=infer        prefill + decode with a KV cache, 4606 commands
+#   make fw FWPROG=infer GEN=3  ...generating 3 tokens instead of 17, for speed
 FWPROG ?= matmul
 M      ?=
 KTILES ?=
 NTILES ?=
+GEN    ?=
 FWSHAPE := $(if $(M),-DFW_M=$(M)) $(if $(KTILES),-DFW_KT=$(KTILES)) \
            $(if $(NTILES),-DFW_NT=$(NTILES))
 
@@ -134,6 +137,9 @@ FWSHAPE := $(if $(M),-DFW_M=$(M)) $(if $(KTILES),-DFW_KT=$(KTILES)) \
 # kernel rather than globally, because a watchdog that never fires on a hang is
 # worth nothing -- and skipped entirely if IVFLAGS already sets one.
 FW_WATCHDOG_adder := 60000000
+# infer is a prefill plus 16 decode steps in one run, and every step re-streams
+# 96 KB of weights: ~150 k clocks per generated token.
+FW_WATCHDOG_infer := 400000000
 FW_WATCHDOG := $(if $(findstring WATCHDOG,$(IVFLAGS)),,\
                  $(if $(FW_WATCHDOG_$(FWPROG)),-DWATCHDOG_NS=$(FW_WATCHDOG_$(FWPROG))))
 
@@ -141,6 +147,13 @@ FW_WATCHDOG := $(if $(findstring WATCHDOG,$(IVFLAGS)),,\
 # compiled natively (-DTPU_TRACE, no cross toolchain needed), its trace is run
 # through iss.py, and the testbench checks both the DRAM image and the command
 # stream the real CPU issued. docs/picorv32_migration.md §8.1.
+#
+# fw_vectors.py *runs* that native binary (-x) rather than being handed a trace
+# captured by a shell redirect, because `infer` reads its own logits back over
+# the scratchpad window and puts the token it chose into the address of a later
+# command. Its trace exists only if something answers those reads, and the ISS
+# is the only thing that can. Kernels that read nothing are unaffected: same
+# trace, one less redirect.
 FWVEC := vectors_fw
 
 # The shape now has to agree in THREE places — the RISC-V image, the native
@@ -159,15 +172,14 @@ FWVEC := vectors_fw
 # having tested almost nothing. run_fw_sweep.sh always passed the shape properly
 # and is unaffected.
 FWSHAPEARGS = $(if $(M),M=$(M)) $(if $(KTILES),KTILES=$(KTILES)) \
-              $(if $(NTILES),NTILES=$(NTILES))
+              $(if $(NTILES),NTILES=$(NTILES)) $(if $(GEN),GEN=$(GEN))
 
 .PHONY: fwvec
 fwvec: | $(FWVEC)
 	@$(MAKE) --no-print-directory -C ../fw clean
 	@$(MAKE) --no-print-directory -C ../fw $(FWPROG).hex $(FWPROG).trace \
 	         PROG=$(FWPROG) $(FWSHAPEARGS)
-	../fw/$(FWPROG).trace > $(FWVEC)/$(FWPROG).trace.txt
-	python $(TPULANG)/fw_vectors.py -t $(FWVEC)/$(FWPROG).trace.txt -o $(FWVEC) \
+	python $(TPULANG)/fw_vectors.py -x ../fw/$(FWPROG).trace -o $(FWVEC) \
 	       -k $(FWPROG) \
 	       -M $(or $(M),8) --ktiles $(or $(KTILES),4) --ntiles $(or $(NTILES),2)
 

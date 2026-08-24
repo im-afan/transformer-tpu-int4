@@ -45,11 +45,13 @@ CFLAGS  := $(ARCH) -Os -ffreestanding -nostdlib -fno-builtin -Wall -Wextra \
 # Problem shape. Empty = the kernel's own #defines. Make does not track a
 # changed -D, so `make clean` first when sweeping (../tb/run_fw_sweep.sh does).
 #   make M=8 KTILES=16 NTILES=16
+#   make PROG=infer GEN=3     tokens for infer.c to generate (default T-PROMPT)
 M      ?=
 KTILES ?=
 NTILES ?=
+GEN    ?=
 CFLAGS += $(if $(M),-DM=$(M)) $(if $(KTILES),-DKTILES=$(KTILES)) \
-          $(if $(NTILES),-DNTILES=$(NTILES))
+          $(if $(NTILES),-DNTILES=$(NTILES)) $(if $(GEN),-DINFER_GEN=$(GEN))
 LDFLAGS := $(ARCH) -nostdlib -Wl,-T,link.ld -Wl,--gc-sections
 
 PROG ?= matmul
@@ -100,14 +102,20 @@ run: $(PROG).hex
 HOSTCC   ?= cc
 TRACEFLAGS := -DTPU_TRACE -I. -Wall -Wextra -O1 \
               $(if $(M),-DM=$(M)) $(if $(KTILES),-DKTILES=$(KTILES)) \
-              $(if $(NTILES),-DNTILES=$(NTILES))
+              $(if $(NTILES),-DNTILES=$(NTILES)) $(if $(GEN),-DINFER_GEN=$(GEN))
 
 # The host build gets memcpy from libc, so memops.c is not in this line.
 %.trace: %.c mock/tpu_trace.c tpu.h tpulib.h
 	$(HOSTCC) $(TRACEFLAGS) -o $@ $< mock/tpu_trace.c
 
+# stdin closed on purpose. A kernel that reads the scratchpad window blocks for
+# an answer here (mock/tpu_trace.c), and there is nobody to give it one: this
+# target prints a program's commands, it does not run its arithmetic. At EOF the
+# read returns 0 with a warning, so `make trace PROG=infer` shows the shape of
+# the kernel instead of hanging. The trace that *means* something comes from
+# fw_vectors.py -x, which runs this same binary with the ISS on the other end.
 trace: $(PROG).trace
-	./$(PROG).trace
+	./$(PROG).trace < /dev/null
 
 clean:
 	rm -f *.o *.d *.elf *.bin *.hex *.map *.trace

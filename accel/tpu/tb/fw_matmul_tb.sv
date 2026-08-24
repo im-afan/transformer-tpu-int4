@@ -104,9 +104,11 @@ module fw_matmul_tb;
     // this run", which is how the expected image stays sparse without needing a
     // separate mask: only the bytes fw_vectors.py recorded are compared.
     // matmul_loop issues 1 + KTILES*NTILES matmuls plus 3 DMAs, so the sweep's
-    // largest shape (16x16 tiles) needs 260. Overflow is reported, not silently
-    // truncated — a capped trace would compare equal on its first 256 entries.
-    localparam int MAX_CMDS = 1024;
+    // largest shape (16x16 tiles) needs 260; `adder` is 534 and `infer` — a
+    // whole prefill plus 16 decode steps in one run — is 4606. Overflow is
+    // reported, not silently truncated: a capped trace would compare equal on
+    // its first MAX_CMDS entries and say nothing about the rest.
+    localparam int MAX_CMDS = 8192;
     logic [7:0]  dram_in  [0:(1<<MEM_ADDR_W)-1];
     logic [7:0]  dram_exp [0:(1<<MEM_ADDR_W)-1];
     logic [31:0] cmd_exp  [0:MAX_CMDS*5-1];

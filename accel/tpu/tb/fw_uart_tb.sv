@@ -126,7 +126,7 @@ module fw_uart_tb;
 
     localparam int SRAM_SZ = 1 << MEM_ADDR_W;
     localparam int FW_DEPTH = 1 << FW_AW;
-    localparam int MAX_CMDS = 1024;
+    localparam int MAX_CMDS = 8192;   // `infer` is 4606 (fw_matmul_tb.sv)
 
     int errors = 0, checks = 0;
     int unsigned cyc = 0;

@@ -8,8 +8,8 @@ command trace a natively-compiled firmware kernel emitted and runs it through
 `iss.py`'s *command* decoder — the same op bodies underneath, so the two paths
 cannot disagree about numerics without disagreeing everywhere.
 
-    make -C ../tpu/fw trace > matmul.trace.txt
-    python fw_vectors.py -t matmul.trace.txt -o ../tpu/tb/vectors_fw
+    make -C ../tpu/fw PROG=matmul matmul.trace
+    python fw_vectors.py -x ../tpu/fw/matmul.trace -o ../tpu/tb/vectors_fw
 
 Three files come out, all `$readmemh`-able:
 
@@ -28,11 +28,21 @@ capability the abandoned RV32IM interpreter was really being bought for
 **The operand formulas live here and nowhere else.** They used to be duplicated
 between `fw_matmul_tb.sv` and `host/run_fw_matmul.py`, which is exactly the
 drift this phase exists to remove.
+
+**The trace is produced here too** (`-x`), rather than redirected into a file by
+the caller. That is not tidiness: `fw/infer.c` reads its own results back over
+the scratchpad window and branches on them, so its command stream is not a
+function of the program alone and a producer with no model of the machine cannot
+emit it. Running the kernel binary as a co-process — the ISS executing each
+command as it arrives and answering the kernel's scratchpad reads out of its own
+memory — is what makes a data-dependent kernel traceable at all. See
+:func:`coexecute`. `-t` still reads a trace someone else captured.
 """
 from __future__ import annotations
 
 import argparse
 import os
+import subprocess
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -94,6 +104,74 @@ def put_rowmajor_i4(img: dict, base: int, rows: int, cols: int, fn) -> None:
             cur = img.get(addr, 0)
             nib = fn(r, c) & 0xF
             img[addr] = ((cur & 0xF0) | nib) if c % 2 == 0 else ((cur & 0x0F) | (nib << 4))
+
+
+# =============================================================================
+# Running the kernel.
+# =============================================================================
+def coexecute(tpu: TPU, exe: str, quiet: bool = False) -> tuple:
+    """Run a `-DTPU_TRACE` kernel binary against `tpu`; return (cmds, lines).
+
+    The kernel prints one record per line and this executes them as they arrive,
+    which is the same thing :meth:`TPU.run_trace` does to a captured file —
+    except for the one record that needs an answer.
+
+    ``SRD <addr>`` is the CPU reading a scratchpad word through cpu_subsys.sv's
+    0x9xxx_xxxx window. A kernel that argmaxes its own logits and then gathers an
+    embedding row at ``base + tok*D`` puts that token into the *address* of a
+    later command, so its trace cannot be produced by a program that does not
+    know what the array computed. So the kernel asks: it blocks on stdin and this
+    replies out of the model's scratchpad. ``SWR`` is the same window in the
+    write direction and needs no reply, only application.
+
+    The upshot is that the returned command stream is a real forward pass's, and
+    the RTL has to reproduce it exactly — including every address the firmware
+    derived from a token it chose. If the hardware picks a different token
+    anywhere, the trace diverges at that command rather than merely producing a
+    different answer, which is a much more specific failure.
+
+    `lines` is the transcript, with the two scratchpad records commented out so
+    the file stays `parse_trace`-able (and `cmd_timeline.py`-able).
+    """
+    proc = subprocess.Popen([exe], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                            text=True, bufsize=1)
+    cmds, lines, n_rd, n_wr = [], [], 0, 0
+    try:
+        for line in proc.stdout:
+            f = line.split()
+            if not f:
+                continue
+            if f[0] == "CMD" and len(f) == 6:
+                unit, w = int(f[1]), [int(x, 16) for x in f[2:6]]
+                tpu.exec_command(unit, *w)
+                cmds.append((unit, *w))
+                lines.append(line)
+            elif f[0] == "WAIT" and len(f) == 2:
+                lines.append(line)
+            elif f[0] == "SRD" and len(f) == 2:
+                val = tpu.rd_u32(int(f[1], 16))
+                proc.stdin.write(f"{val:08x}\n")
+                proc.stdin.flush()
+                lines.append(f"# SRD {f[1]} -> {val:08x}\n")
+                n_rd += 1
+            elif f[0] == "SWR" and len(f) == 3:
+                # track=False: this is the CPU writing, not a unit, and
+                # `written` is the compute-side record.
+                tpu.wr_i32(int(f[1], 16), int(f[2], 16), track=False)
+                lines.append(f"# SWR {f[1]} {f[2]}\n")
+                n_wr += 1
+            else:
+                raise SystemExit(f"coexecute: cannot parse {line!r}")
+    finally:
+        if proc.stdin:
+            proc.stdin.close()
+        rc = proc.wait()
+    if rc != 0:
+        raise SystemExit(f"coexecute: {exe} exited {rc}")
+    if (n_rd or n_wr) and not quiet:
+        print(f"co-execution: {n_rd} scratchpad reads answered, {n_wr} writes "
+              f"applied")
+    return cmds, lines
 
 
 # =============================================================================
@@ -187,6 +265,130 @@ def operands_adder(args) -> dict:
     return img
 
 
+# ---- spadwin.c --------------------------------------------------------------
+SW_VEC, SW_TAB, SW_OUT = 0x0000, 0x0100, 0x0200
+SW_N, SW_ROWB, SW_ROWS = 16, 16, 13
+
+
+def _sw_vec(i: int) -> int:
+    """A permutation of 0..15 scaled out of int8 range, so the max is unique.
+
+    5 is coprime to 16, so `(5i+3) % 16` hits every value once: exactly one word
+    is the largest, and it is at index 12 rather than at either end.
+    """
+    return ((i * 5 + 3) % 16) * 137 - 900
+
+
+def _sw_tab(r: int, c: int) -> int:
+    return ((r * 7 + c * 3) % 251) - 128
+
+
+def operands_spadwin(args) -> dict:
+    """spadwin.c: a vector for the CPU to scan and a table for it to gather from."""
+    del args
+    img: dict = {}
+    for i in range(SW_N):
+        for b in range(4):
+            img[SW_VEC + i * 4 + b] = (_sw_vec(i) >> (8 * b)) & 0xFF
+    put_rowmajor_i8(img, SW_TAB, SW_ROWS, SW_ROWB, SW_ROWB, _sw_tab)
+    return img
+
+
+def reference_spadwin(tpu: TPU) -> None:
+    """What the CPU should have found, computed here instead.
+
+    The ISS cannot check this one against itself at all: the argmax happens in
+    the *firmware*, and every command that follows it is already conditioned on
+    the answer. So the only statement worth making is the independent one.
+    """
+    vals = [_sw_vec(i) for i in range(SW_N)]
+    best = max(range(SW_N), key=lambda i: (vals[i], -i))
+
+    def dram_i32(addr):
+        v = sum(tpu.dram[addr + b] << (8 * b) for b in range(4))
+        return v - (1 << 32) if v >= (1 << 31) else v
+
+    want = {SW_OUT + 0: best, SW_OUT + 4: vals[best], SW_OUT + 8: best}
+    bad = [f"[0x{a:04x}] = {dram_i32(a)}, expected {w}"
+           for a, w in sorted(want.items()) if dram_i32(a) != w]
+    for c in range(SW_ROWB):
+        got = tpu.dram[SW_OUT + 16 + c]
+        exp = _sw_tab(best, c) & 0xFF
+        if got != exp:
+            bad.append(f"gathered row byte {c} = 0x{got:02x}, expected 0x{exp:02x} "
+                       f"(row {best})")
+    if bad:
+        for b in bad[:8]:
+            print(f"  REF FAIL {b}", file=sys.stderr)
+        raise SystemExit("spadwin: the scratchpad window did not behave — the "
+                         "CPU's read, its write, or the DMA address it derived")
+    print(f"reference: the CPU found max {vals[best]} at index {best} and "
+          f"gathered row {best}")
+
+
+# ---- infer.c ----------------------------------------------------------------
+# Its DRAM map. Everything it shares with adder.c is at the same address; what
+# was the embedded X0 is now the embedding table and the token sequence, because
+# this kernel embeds and argmaxes on the device.
+IN_EMB, IN_TOK, IN_MASK, IN_WFC, IN_LOG = (0x00000, 0x00400, 0x00800,
+                                           0x01400, 0x01800)
+IN_T, IN_D, IN_DFF, IN_NH, IN_LAYERS = 32, 64, 256, 4, 4
+IN_VOCAB, IN_VPAD, IN_PROMPT = 13, 16, 15
+IN_DH = IN_D // IN_NH
+
+# The synthetic prompt: "321+54" then pads to 14 and '=', which is the shape
+# numbers_data emits (digits least-significant first, answer at EQUALS_POS=15).
+# The weights below are not a checkpoint, so this decodes to nothing — it is
+# here because a prompt that looks like a prompt makes a wrong gather obvious.
+IN_PROMPT_IDS = [3, 2, 1, 10, 5, 4] + [12] * 8 + [11]
+
+# fw/adder_rq.h's table, which fw/infer.c compiles in. DUPLICATED FROM THAT
+# HEADER on purpose: the reference below has to know the fixed point to predict
+# a single byte, and there is no path from a C macro to here. If the two drift
+# the reference fails loudly on the first requant, which is the failure mode to
+# want.
+IN_RQ = {"Q": (1, 5), "K": (1, 5), "V": (1, 5), "KP": (1, 0), "VP": (1, 0),
+         "S": (1, 3), "ID": (1, 0), "P": (1, 0), "A": (1, 5), "O": (1, 5),
+         "XO": (1, 0), "X1": (1, 1), "H": (1, 5), "HR": (1, 0), "F": (1, 6),
+         "X2": (1, 1)}
+
+
+def emb_val(v: int, d: int) -> int:
+    """An int4 embedding row. Distinct per token id, or a wrong gather is invisible."""
+    return ((v * 7 + d * 3) % 9) - 4
+
+
+def operands_infer(args) -> dict:
+    """infer.c: the embedding table, the prompt ids, the mask, the head, the weights.
+
+    Same synthetic weights as :func:`operands_adder`, at the same addresses and
+    the same salts, so the two kernels are running one model — that is what lets
+    a divergence between them mean something.
+    """
+    del args
+    img: dict = {}
+
+    put_rowmajor_i8(img, IN_EMB, IN_VOCAB, IN_D, IN_D, emb_val)
+    for i, tok in enumerate(IN_PROMPT_IDS):        # int32, little-endian
+        for b in range(4):
+            img[IN_TOK + i * 4 + b] = (tok >> (8 * b)) & 0xFF
+    for t in range(IN_T):
+        for s in range(IN_T):
+            img[IN_MASK + t * IN_T + s] = (0 if s <= t else -8) & 0xFF
+    put_rowmajor_i4(img, IN_WFC, IN_D, IN_VPAD, lambda r, c: w_hash(r, c, 0))
+
+    for l in range(IN_LAYERS):
+        base = 0x02000 + l * 0x06000
+        for i, off in enumerate((0x0000, 0x0800, 0x1000, 0x1800)):   # Wq Wk Wv Wo
+            put_rowmajor_i4(img, base + off, IN_D, IN_D,
+                            lambda r, c, s=6 * l + i + 1: w_hash(r, c, s))
+        put_rowmajor_i4(img, base + 0x2000, IN_D, IN_DFF,
+                        lambda r, c, s=6 * l + 5: w_hash(r, c, s))
+        put_rowmajor_i4(img, base + 0x4000, IN_DFF, IN_D,
+                        lambda r, c, s=6 * l + 6: w_hash(r, c, s))
+    return img
+
+
 # ---- tiled.c ----------------------------------------------------------------
 # Its DRAM map, written once and read by both the operand builder and the
 # reference below.
@@ -221,6 +423,8 @@ OPERANDS = {
     "ffn": operands_ffn,
     "mha": operands_mha,
     "adder": operands_adder,
+    "infer": operands_infer,
+    "spadwin": operands_spadwin,
     "tiled": operands_tiled,
 }
 
@@ -276,8 +480,136 @@ def reference_tiled(tpu: TPU) -> None:
     print(f"reference: {len(want)} result bytes match an independent matmul")
 
 
+def _rq(acc, mn, lo=-8, hi=7):
+    """`clip((acc*m0 + 2**(n-1)) >> n)` — iss.requant8, over a numpy array.
+
+    numpy's `>>` on a signed integer is arithmetic, i.e. it floors, which is
+    what Verilog's `>>>` and Python's own `>>` do. dyt is this with lo=-7.
+    """
+    import numpy as np
+
+    m0, n = mn
+    v = (acc.astype(np.int64) * m0 + ((1 << (n - 1)) if n else 0)) >> n
+    return np.clip(v, lo, hi)
+
+
+def reference_infer(tpu: TPU) -> None:
+    """infer.c's generated tokens and logits, computed WITHOUT a KV cache.
+
+    `tiled.c` has an independent reference for one reason and this needs one for
+    the same reason, more so: every bug specific to this kernel — a cache column
+    written at the wrong offset, the mask row of the wrong position, an argmax
+    over the wrong words, an embedding gathered from the wrong row — is a bug
+    the ISS reproduces as faithfully as the hardware would, because the ISS is
+    executing the commands the kernel *asked* for.
+
+    So this recomputes the whole model from scratch at every step, over the
+    prefix the device has generated so far, in plain integer numpy: no cache, no
+    tiling, and no requant table but `IN_RQ` above. If the device's cache is
+    right, a cached step and a full recompute are the same arithmetic — that is
+    the claim the kernel is making, and this is the check of it.
+    """
+    try:
+        import numpy as np
+    except ImportError:     # not a declared dep of the repo, but torch's own
+        raise SystemExit("infer's reference needs numpy (which torch installs)")
+
+    def wblk(rows, cols, salt):
+        return np.array([[w_hash(r, c, salt) for c in range(cols)]
+                         for r in range(rows)], dtype=np.int64)
+
+    emb = np.array([[emb_val(v, d) for d in range(IN_D)]
+                    for v in range(IN_VOCAB)], dtype=np.int64)
+    wfc = wblk(IN_D, IN_VPAD, 0)
+    lay = [{"q": wblk(IN_D, IN_D, 6 * l + 1), "k": wblk(IN_D, IN_D, 6 * l + 2),
+            "v": wblk(IN_D, IN_D, 6 * l + 3), "o": wblk(IN_D, IN_D, 6 * l + 4),
+            "w1": wblk(IN_D, IN_DFF, 6 * l + 5), "w2": wblk(IN_DFF, IN_D, 6 * l + 6)}
+           for l in range(IN_LAYERS)]
+
+    # How many tokens the run actually generated, from what it spilled — so a
+    # kernel built with -DINFER_GEN=n needs no second copy of n over here.
+    n_gen = len([a for a in tpu.dram_written
+                 if IN_TOK + IN_PROMPT * 4 <= a < IN_TOK + IN_T * 4]) // 4
+    if n_gen == 0:
+        raise SystemExit("infer: the run generated no tokens at all")
+
+    toks = list(IN_PROMPT_IDS)
+    want_tok, want_log = {}, {}
+
+    for step in range(n_gen):
+        pos = IN_PROMPT - 1 + step          # the row whose logits pick the next
+        X = emb[toks[:pos + 1]]             # [pos+1][D], int4 codes
+
+        for w in lay:
+            n = X.shape[0]
+            Q = _rq(X @ w["q"], IN_RQ["Q"])
+            K = _rq(X @ w["k"], IN_RQ["K"])
+            V = _rq(X @ w["v"], IN_RQ["V"])
+            A = np.zeros((n, IN_D), dtype=np.int64)
+            for h in range(IN_NH):
+                sl = slice(h * IN_DH, (h + 1) * IN_DH)
+                S = _rq(Q[:, sl] @ K[:, sl].T, IN_RQ["S"])          # [n][n]
+                # The causal mask, as the kernel applies it: -8 against an int4
+                # score is at most -1, and ReLU takes it to exactly zero. The
+                # cache's uninitialized tail dies the same way, which is why
+                # this reference can simply not have one.
+                S = np.tril(_rq(S, IN_RQ["ID"]))
+                P = _rq(np.maximum(S, 0), IN_RQ["P"])
+                A[:, sl] = _rq(P @ V[:, sl], IN_RQ["A"])
+            O = _rq(A @ w["o"], IN_RQ["O"])
+            XO = _rq(X + O, IN_RQ["XO"])
+            X1 = _rq(XO + X, IN_RQ["X1"], lo=-7)                    # dyt
+            H = _rq(X1 @ w["w1"], IN_RQ["H"])
+            HR = _rq(np.maximum(H, 0), IN_RQ["HR"])
+            F = _rq(HR @ w["w2"], IN_RQ["F"])
+            X = _rq(X1 + F, IN_RQ["X2"], lo=-7)                     # dyt
+
+        logits = X[pos] @ wfc                                       # int32, raw
+        want_log[pos] = logits
+        nxt = int(np.argmax(logits[:IN_VOCAB]))                     # ties -> lowest
+        want_tok[pos + 1] = nxt
+        toks.append(nxt)
+
+    # ---- compare ------------------------------------------------------------
+    def dram_i32(addr):
+        v = sum(tpu.dram[addr + b] << (8 * b) for b in range(4))
+        return v - (1 << 32) if v >= (1 << 31) else v
+
+    bad = []
+    for pos, want in sorted(want_tok.items()):
+        got = dram_i32(IN_TOK + pos * 4)
+        if got != want:
+            bad.append(f"token[{pos}] = {got}, expected {want}")
+    n_log = 0
+    for pos, want in sorted(want_log.items()):
+        for j in range(IN_VPAD):
+            got = dram_i32(IN_LOG + (pos * IN_VPAD + j) * 4)
+            n_log += 1
+            if got != int(want[j]):
+                bad.append(f"logit[{pos}][{j}] = {got}, expected {int(want[j])}")
+
+    if bad:
+        for b in bad[:8]:
+            print(f"  REF FAIL {b}", file=sys.stderr)
+        raise SystemExit(f"infer: {len(bad)} values disagree with the "
+                         f"cache-free reference — the KV cache, the mask window "
+                         f"or the argmax is wrong, not just the datapath's copy "
+                         f"of it")
+
+    # A run that emitted one token over and over, or all-zero logits, would
+    # match a reference that did the same and test nothing. Say what it was.
+    seq = [want_tok[p] for p in sorted(want_tok)]
+    if len(set(seq)) == 1:
+        print(f"  WARNING: every generated token is {seq[0]} — the synthetic "
+              f"weights have collapsed and this check is weak", file=sys.stderr)
+    print(f"reference: {len(seq)} generated tokens and {n_log} logits match a "
+          f"cache-free recompute; sequence {seq}")
+
+
 REFERENCES = {
     "tiled": reference_tiled,
+    "infer": reference_infer,
+    "spadwin": reference_spadwin,
 }
 
 
@@ -327,8 +659,12 @@ def write_cmds(path: str, cmds: list, header: str) -> None:
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("-t", "--trace", required=True,
-                    help="command trace from a -DTPU_TRACE firmware build")
+    ap.add_argument("-x", "--exec", dest="exe",
+                    help="a -DTPU_TRACE firmware binary to run against the ISS, "
+                         "answering its scratchpad reads (the only way to trace "
+                         "a kernel that branches on its own results)")
+    ap.add_argument("-t", "--trace",
+                    help="...or a command trace already captured from one")
     ap.add_argument("-o", "--out", required=True, help="output directory")
     ap.add_argument("-k", "--kernel", default="matmul",
                     help="which kernel's operand image to build "
@@ -338,14 +674,27 @@ def main() -> int:
     ap.add_argument("--ntiles", type=int, default=2)
     args = ap.parse_args()
 
-    k, n = args.ktiles * ROWS, args.ntiles * COLS
+    if bool(args.exe) == bool(args.trace):
+        raise SystemExit("pass exactly one of -x (run the kernel binary) and "
+                         "-t (read a captured trace)")
 
     tpu = TPU(rows=ROWS, cols=COLS)
     dram_in = build_operands(tpu, args)
 
-    with open(args.trace) as f:
-        records = parse_trace(f.read())
-    cmds = tpu.run_trace(records)
+    os.makedirs(args.out, exist_ok=True)
+    if args.exe:
+        # The operands are already in DRAM, which they have to be *before* the
+        # first command runs: a kernel that reads its own results is executing
+        # against this model as it goes, not replaying into it afterwards.
+        cmds, lines = coexecute(tpu, args.exe)
+        src = os.path.join(args.out, f"{args.kernel}.trace.txt")
+        with open(src, "w") as f:
+            f.writelines(lines)
+    else:
+        src = args.trace
+        with open(src) as f:
+            records = parse_trace(f.read())
+        cmds = tpu.run_trace(records)
 
     if args.kernel in REFERENCES:
         REFERENCES[args.kernel](tpu)
@@ -354,14 +703,13 @@ def main() -> int:
     # write tracking — no second reference implementation to keep in step.
     dram_exp = {a: tpu.dram[a] for a in sorted(tpu.dram_written)}
 
-    os.makedirs(args.out, exist_ok=True)
     shape = f"{args.kernel}, int4 row-major weights"
     write_hex(os.path.join(args.out, "fw_dram_in.hex"), dram_in,
               f"firmware operands: {shape}")
     write_hex(os.path.join(args.out, "fw_dram_exp.hex"), dram_exp,
               f"firmware golden DRAM output (ISS-computed): {shape}")
     write_cmds(os.path.join(args.out, "fw_cmds.hex"), cmds,
-               f"expected command trace, {len(cmds)} commands, from {args.trace}")
+               f"expected command trace, {len(cmds)} commands, from {src}")
 
     print(f"{len(cmds)} commands, {len(dram_in)} operand bytes in, "
           f"{len(dram_exp)} bytes out -> {args.out}")
