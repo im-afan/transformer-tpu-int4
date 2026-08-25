@@ -16,3 +16,15 @@
     - synthesize spad as true dual port bram
     - protect against conflicts in software
 - need to test full KV cached inference
+
+# 8/25:
+- wide model (d=128, f=512, T=64/128) is the live shape; `adder_int4_wide` in transformer.py
+- digits reversed in numbers_data — carries go the direction the model can see
+- infer.c rewritten: every tensor in DRAM, scratchpad is an arena + mailbox, BATCH/BLOCK/PHASE
+- weight prefetch landed in tpulib.h (contraction split only, opt-in per call site)
+- still to do:
+    - adder.c not migrated to the wide shape; fw_vectors/adder_export already moved
+    - infer.c is building at LAYERS=2, put it back to 4
+    - no trained wide checkpoint — make_dummy_checkpoint is plumbing only
+    - infer.hex is 15772 of 16384 bytes; watch the firmware RAM
+    - prefill measures 1.77M clocks against a ~800k roofline

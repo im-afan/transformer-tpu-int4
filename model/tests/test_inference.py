@@ -21,16 +21,18 @@ def time_func(f, samples, *args, **kwargs):
 # choose architecture
 import argparse
 parser = argparse.ArgumentParser()
-parser.add_argument('--arch', choices=['vanilla', 'gqa', 'int4'], default='int4', help='Which adder architecture to use')
-parser.add_argument('--model-path', type=str, default='saved/colab_ternary_mha_small.pt')
+parser.add_argument('--arch', choices=['vanilla', 'gqa', 'int4', 'int4_wide'], default='int4_wide', help='Which adder architecture to use')
+parser.add_argument('--model-path', type=str, default='model/saved/int4_d128_f512_l4.pt')
 args = parser.parse_args()
 
 if args.arch == 'gqa':
 	model = transformer.adder_gqa()
 elif args.arch == 'vanilla':
 	model = transformer.adder_vanilla()
-else:
+elif args.arch == 'int4':
 	model = transformer.adder_int4_vanilla()
+else:
+	model = transformer.adder_int4_wide()
 
 state = torch.load(args.model_path, map_location="cpu")
 model.load_state_dict(state)
@@ -40,7 +42,7 @@ model = model.to(device)
 
 ans_pos = numbers_data.EQUALS_POS
 
-batch, tokens, attn_mask = numbers_data.create_addition_batch(1, 64)
+batch, tokens, attn_mask = numbers_data.create_addition_batch(1, numbers_data.MAX_TOKENS)
 attn_mask = torch.stack(attn_mask).to(device)
 x = torch.tensor(tokens).to(device)
 y = torch.tensor(tokens)[:, ans_pos:].to(device)

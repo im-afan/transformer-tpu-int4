@@ -1,30 +1,33 @@
 # Accelerators
 
-> **The scalar unit and tpulang are gone.** The TPU has **one** command
-> producer: PicoRV32 firmware in `accel/tpu/fw/`, pushing 128-bit macro-ops
-> through the MMIO aperture. `scalar_unit.sv`, `assembler.py`, `gen_vectors.py`,
-> `torch_ref.py`, `pytpu.py`, `adder_export.py`, every `examples/*.tpu`, the
-> `.tpu` testbenches and `isa.md` were deleted; `iss.py` survives as the golden
-> numerics behind `fw_vectors.py`'s command front end. Anything below that
-> describes a `.tpu` program, an assembler or the scalar unit is history.
-> See `docs/picorv32_migration.md` §11.
+Hardware/backend implementations of the operations in [`../model`](../model). The PyTorch
+model is the golden reference; every backend is checked against it numerically.
 
+| Directory | What it is | State |
+| --- | --- | --- |
+| [`tpu/`](tpu/README.md) | Custom SystemVerilog TPU on a Digilent Cmod A7-35T, plus its firmware, host driver and Vivado build | **live** — runs the whole model |
+| [`tpulang/`](tpulang) | The TPU's software stack: bit-exact ISS, golden-vector generator, checkpoint exporters | **live** |
+| `cuda/` | Hand-written CUDA MHA/GQA kernel | **legacy** — implements softmax attention; the model uses ReLU attention, and nothing in `model/` loads it |
 
+## The TPU has one command producer
 
-Hardware/backend implementations of the operations in the `../model` reference. Each backend
-is validated against the PyTorch golden model.
+PicoRV32 firmware in [`tpu/fw/`](tpu/fw/README.md) pushes 128-bit macro-ops through an
+MMIO aperture into per-unit queues. There is no assembler and no `.tpu` language.
 
-- **`cuda/`** — custom CUDA MHA/GQA kernel loaded into PyTorch via `torch.utils.cpp_extension`.
-  Serves as the GPU reference and correctness baseline.
-- **`tpu/`** — custom SystemVerilog TPU targeting a Digilent Cmod A7-35T, plus its host
-  driver and Vivado build. Runs real programs on real silicon over a UART link.
-  See [`tpu/README.md`](tpu/README.md).
-- **`tpulang/`** — the TPU's software stack: the `.tpu` assembly language and assembler, an
-  instruction-set simulator that is bit-exact with the RTL, the activation-LUT generator,
-  PyTorch references for the example kernels, and the golden-vector generator that feeds
-  `tpu/tb/`. See [`tpulang/README.md`](tpulang/README.md).
+Deleted with the scalar unit: `scalar_unit.sv`, `assembler.py`, `gen_vectors.py`,
+`torch_ref.py`, `pytpu.py`, every `examples/*.tpu`, the `.tpu` testbenches and `isa.md`.
+Anything describing a `.tpu` program or the scalar unit is history.
 
-There is no `compiler/`: the job that name implied — turning a model into a TPU instruction
-stream — is done by hand in `tpulang/`, and nothing traces PyTorch with `torch.fx`.
-`torch_ref.py` runs in the other direction, as an independent check on kernels the ISS and
-the FPGA have already executed.
+`iss.py` survived: its op bodies are still the golden numerics, now driven by command
+traces instead of by an instruction decoder.
+
+## `tpulang/` — four files
+
+- `iss.py` — bit-exact with the RTL. `exec_command` / `run_trace` are the way in.
+- `fw_vectors.py` — runs a firmware kernel's native build as a co-process, executes each
+  command on the ISS as it arrives, and emits golden DRAM images + the expected command
+  stream. Also the single definition of each kernel's synthetic operands.
+- `adder_export.py` — real checkpoint → requant table → trace → accuracy, teacher-forced.
+- `infer_export.py` — the same checkpoint *generating*, through `fw/infer.c`.
+
+The directory name is a fossil.

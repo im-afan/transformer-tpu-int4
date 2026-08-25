@@ -1,103 +1,80 @@
-# TPU Design Doc
+# TPU design docs
 
-> **The scalar unit and tpulang are gone.** The TPU has **one** command
-> producer: PicoRV32 firmware in `accel/tpu/fw/`, pushing 128-bit macro-ops
-> through the MMIO aperture. `scalar_unit.sv`, `assembler.py`, `gen_vectors.py`,
-> `torch_ref.py`, `pytpu.py`, `adder_export.py`, every `examples/*.tpu`, the
-> `.tpu` testbenches and `isa.md` were deleted; `iss.py` survives as the golden
-> numerics behind `fw_vectors.py`'s command front end. Anything below that
-> describes a `.tpu` program, an assembler or the scalar unit is history.
-> See `docs/picorv32_migration.md` §11.
+Per-block notes. Where one of these disagrees with the RTL, the RTL wins.
 
+| Doc | Component |
+| --- | --- |
+| [scratchpad.md](scratchpad.md) | On-chip BRAM working memory: banking, ports, arbitration |
+| [mxu.md](mxu.md) | Weight-stationary int4 systolic array |
+| [vpu.md](vpu.md) | SIMD vector unit — the six ops it has, and what was removed |
+| [dma.md](dma.md) | DMA engine and the external SRAM controller ("DRAM") |
+| [macro_ops.md](macro_ops.md) | The macro-op ISA: what each command carries |
+| [picorv32_migration.md](picorv32_migration.md) | The dispatch plane and the CPU producer — design record + measurements |
+| [uart_host.md](uart_host.md) | The host link: frame format, the five commands, arbitration |
+| [uart_selftest.md](uart_selftest.md) | The `cmod_a7_echo` bring-up image |
+| [synth.md](synth.md) | Vivado build flow, Cmod A7-35T deployment, sizing |
+| [comms.md](comms.md) | 2D inter-TPU link — **designed, not built** |
+| [scheduler_plan.md](scheduler_plan.md) | Sketch for overlapping DMA and compute in hardware — **not built** |
+| [development_notes.md](development_notes.md) | Dated working notes |
 
+Firmware is documented in [`../fw/README.md`](../fw/README.md); the host driver in
+[`../host/README.md`](../host/README.md).
 
-## Component docs
+## The machine in one page
 
-Detailed per-component design notes (this file is the overview):
-
-| Doc                              | Component                                              |
-| -------------------------------- | ----------------------------------------------------- |
-| [scratchpad.md](scratchpad.md)   | On-chip BRAM working memory, banking, sizing          |
-| [mxu.md](mxu.md)                 | Weight-stationary ternary systolic matrix unit        |
-| [vpu.md](vpu.md)                 | SIMD vector unit: activations, reductions, attention  |
-| [dma.md](dma.md)                 | DMA engine and the external SRAM controller ("DRAM")  |
-| [comms.md](comms.md)             | 2D inter-TPU link for scale-out (**stubbed in RTL**)  |
-| [scalar_unit.md](scalar_unit.md) | Control processor microarchitecture                   |
-| [scalar_unit_pipeline.md](scalar_unit_pipeline.md) | Plan to pipeline it — **proposal, not built**; the RTL is still the multi-cycle FSM |
-| [isa.md](isa.md)                 | Guide to writing TPU programs in tpulang (+ encoding/opcode appendix) |
-| [macro_ops.md](macro_ops.md)     | Moving tiling/attention into hardware (CISC macro-ops). Phases 0–3 **are built** (`setcfgr`, MXU strides, `matmul_t`); `vecmatmul` and `softmax` were built then removed, `layernorm` is dropped — see its banner |
-| [picorv32_migration.md](picorv32_migration.md) | The macro-op **dispatch plane**: 128-bit commands in per-unit queues instead of a global config file, and PicoRV32 as a second producer beside the scalar unit. RTL built and passing; the C toolchain is not. Supersedes macro_ops.md §1's rejection of a CPU |
-| [uart_host.md](uart_host.md)     | The host link: frame format, the five commands, arbitration |
-| [uart_selftest.md](uart_selftest.md) | The `cmod_a7_echo` bring-up image and how to use it |
-| [synth.md](synth.md)             | Vivado build flow, Cmod A7-35T deployment, sizing reality check |
-
-The assembly language that lowers 1:1 onto the ISA is documented in
-[`accel/tpulang/README.md`](../../tpulang/README.md), and the host driver that speaks the
-protocol in [`accel/tpu/host/README.md`](../host/README.md).
-
-> **This file is the original design sketch**, kept because §1 is still an accurate
-> statement of intent. Where it disagrees with a component doc above, the component doc
-> wins — §4's instruction list in particular predates the real ISA (see
-> [isa.md](isa.md) for what the machine actually implements).
-
-## 1. Overview
-
-This is a design for a TPU that goes on low-end FPGA boards for inferencing transformers.
-To minimize area usage, we target highly quantized neural networks: those with weights in ${1, 0, -1}$ 
-and 8-bit activations. We target running a ternary version of the digit-predicting adder LLM. We also design for scale-out,
-allowing multiple devices to communicate during inference.
-
-We use the same general architecture as google TPU:
+```
+  cpu_subsys (PicoRV32 + AXI4-Lite MMIO aperture)
+     |  128-bit macro-ops pushed into per-unit queues
+     +--> cmd_mxu --> mxu    weight-stationary int4 systolic array
+     +--> cmd_vpu --> vpu    SIMD pointwise / narrowing
+     +--> cmd_dma --> dma <--> sram_controller <--> external SRAM ("DRAM", 512 KB)
+                       |
+              scratchpad (BRAM, 64 KB) <-- all three units
+```
 
 ### 1. Scratchpad
 
-We will use DMA to access RAM and load into a specific address in our scratchpad memory, which uses FPGA BRAM. 
+Banked BRAM working memory. Every unit reads and writes it; DRAM is only reachable through
+the DMA. Wide enough to feed one full activation column per clock into the MXU.
 
 ### 2. MXU
 
-The MXU is a weight-stationary systolic array. It will load the ternary weights from scratchpad memory into registers in each PE.
-Then, it loads activations from the scratchpad into the activation buffer and feeds them into the systolic array in a staggered order. 
-The scratchpad should consist of enough BRAM blocks to fully load 1 column of activations in 1 clock.
-The MXU output immediately gets written to another address in scratchpad memory.
+Weight-stationary systolic array. Loads packed **int4** weights from the scratchpad into
+per-PE registers, streams int8 activations in staggered, writes results back to the
+scratchpad. `matmul_t` walks a tile grid in hardware.
 
 ### 3. VPU
 
-The VPU performs the remaining pointwise vector operations using SIMD: `relu`, vector add, and the `requant`/`dyt`/`quant4` narrows. `quant4` is the one whose destination is narrower than a byte: it writes a bare 4-bit nibble, two per byte, in the MXU's packed weight layout — which is what lets an *activation* be a weight operand, and therefore what moved both attention matmuls onto the array. The output head went with them once `Model.fc` became an `Int4Linear`, which left the `vecmatmul` macro op with no caller and is why it has been **removed** — along with its geometry registers and the `VPU_GEOM` command. The unit is deliberately no larger than this: the activation LUTs, broadcast/scalar ops, divider, reductions and the softmax macro op went the same way once the model stopped needing them ([vpu.md §Removed ops](vpu.md#removed-ops)). `vecdot` survives with no caller because it *is* the reduction datapath. 
-It contains multiple ALUs that act on data from a single scratchpad memory access.
+SIMD, one scratchpad access feeding many ALUs. Six ops and nothing else: `DOT`, `ADD`,
+`RELU`, `REQUANT`, `DYT`, `QUANT4`.
 
-### 4. Communication interface
+`QUANT4` is the important one: `requant`'s fixed point clipped to `[-8, 7]` and written
+**four bits wide**, two elements per byte, in the MXU's packed weight encoding. That is
+what lets an *activation* be a weight operand, and therefore what put `Q@K^T` and `P@V` on
+the array instead of the VPU.
 
-Furthermore, we implement an inter-TPU interface that allows a TPU to receive requests to write to the RAM of its neighbors. For now, we implement a 2d connection scheme (4 neighbors).
+The unit is deliberately no larger than this — activation LUTs, broadcast/scalar ops, the
+divider, reductions, `vecmatmul` and the `softmax` macro op were all removed once the model
+stopped needing them. See [vpu.md](vpu.md).
 
-*Status: designed in [comms.md](comms.md), but not built. `tpu_top.sv` ties the `nb_*` port
-off, so the `wrneigh` instruction completes as a no-op in both the RTL and the ISS.*
+### 4. DMA + SRAM
 
-### 5. Scalar Unit
+`sram.sv` moves **ranges**, not bytes: one request is a start address, a byte count and an
+address stride. 1 clock/byte on fills, 2 on spills. The DMA also does a **transposing**
+mode, which is how a column-major KV cache gets appended to.
 
-Handles all the control, dispatches instructions to the VPU and MXU. Reads from instruction memory.
-Also handles scalar operations such as adding, multiplying numbers in memory.
+### 5. Command plane
 
-The instruction set that grew out of this sketch is specified in [isa.md](isa.md) and
-summarized, with assembler syntax, in
-[`accel/tpulang/README.md`](../../tpulang/README.md#14-instruction-set). Two things about the
-real ISA differ from the shape implied above and are worth stating here, because they change
-how programs are written:
+A dispatch is a 128-bit macro-op carrying its own operands and geometry, pushed into that
+unit's queue. Nothing an earlier dispatch left in a register can reach it, and the units can
+run at once — scratchpad access is arbitrated with real grants.
 
-- **Operands are registers, not immediates.** An instruction names registers; the register
-  *contents* are the byte addresses the unit operates on. So `matmul rout, ract, rweight`,
-  after an `li` puts each address in a register.
-- **Sizes are not in the instruction.** They come from config registers set beforehand —
-  `setcfg tlen` (MXU token count), `setcfg vlen` (VPU vector length), `setcfg len` (DMA byte
-  count). Stale config is the most common silent bug in a tpulang program.
+Retired opcodes are **holes, not free space**: `0x02`, `0x05`, `0x0A`–`0x0F`, `0x1B`,
+`0x1E`, `0x20` are not reallocated, so a stale binary decodes to an unknown op rather than a
+different one. Same for VPU op selector 13, VPU command `0x02`, and `cfg` indices 9 and
+10–14. `0x22` is `quant4`; new ops go at `0x23`+.
 
-The dispatched ops are `matmul` / `matmul_t` (with `.acc`/`.rq` flags),
-`vecdot`, `vecadd`, `relu`, `requant`, `dyt`, and `quant4`; memory movement is `rdmem` / `wrmem` (DMA between DRAM and scratchpad) and
-`wrneigh`; control is `adds`, `subs`, `muls`, `cmps`, `li`, `loads`, `stores`, `setcfg`,
-`branch` (and the `beq`/`bne`/`blt`/`bge` forms), `jmp`, `wait`, and `halt`.
+### 6. Inter-TPU link
 
-
-
-
-
-
-
+Designed in [comms.md](comms.md), **not built**. `tpu_top.sv` ties the `nb_*` port off, so
+`wrneigh` completes as a no-op.

@@ -530,6 +530,30 @@ def adder_gqa():
     return model
 
 
+def adder_int4_wide():
+    # The shape `accel/tpu/fw/adder.c` is compiled for: d=128, f=512, layers=4,
+    # q_heads=kv_heads=4, so head_dim = 32. Same QAT scheme as
+    # `adder_int4_vanilla` in every other respect — int4 weights and int4
+    # activations, LSQ-learned ActQuant at every requant site, shared instances
+    # where the hardware pins one site to another's scale, DyT pinned to 1/7,
+    # no bias.
+    #
+    # Nothing here depends on the sequence length: there is no positional
+    # encoding, so T lives in numbers_data (EQUALS_POS = 64, MAX_TOKENS = 128)
+    # and in the kernel, not in the model.
+    model = Model(
+        len(numbers_data.VOCAB),
+        d=128,
+        f=512,
+        layers=4,
+        q_heads=4,
+        kv_heads=4,
+        use_int4=True,
+        use_bias=False,
+    )
+    return model
+
+
 def adder_int4_vanilla():
     # int4 weights and int4 activations throughout, same QAT scheme as the
     # ternary config it replaces: every requant site is an LSQ-learned

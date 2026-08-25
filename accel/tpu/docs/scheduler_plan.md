@@ -1,4 +1,7 @@
-# Plan to support overlapping DMA and compute using out-of-order execution in hardware
+# Plan: overlap DMA and compute with out-of-order dispatch in hardware
+
+> **Not built.** Overlap today is firmware's: `fw/tpulib.h`'s weight prefetch
+> double-buffers a staged weight block. This is the sketch for doing it generally.
 
 - First, we synthesize the scratchpad memory as true dual port BRAM instead of simple dual port to not have to deal with arbitration when both the MXU/VPU and DMA are running. 
 - The indidivdual command queues for each module is replaced with a global command queue and a scheduler. 

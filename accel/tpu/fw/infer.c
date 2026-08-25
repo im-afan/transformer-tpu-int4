@@ -1,116 +1,168 @@
-/* infer.c — the int4 adder model as INFERENCE: prefill, then decode, against a
- * statically allocated KV cache. Tokens in, tokens out, one run.
+/* infer.c — the int4 adder model as inference: prefill, then decode against a
+ * KV cache. Token ids in, token ids out, one run.
  *
- * `fw/adder.c` is the same four layers as one T=32 forward pass — the training
- * shape, every position computed at once from a sequence somebody already
- * knows. Generating an answer that way costs a whole T-token forward per token
- * emitted and re-derives K and V for the prefix every time. This kernel is the
- * generative shape instead:
+ * `adder.c` is the training shape — every position at once over a sequence
+ * somebody already knows. This is the generative one. Both are the same code:
+ * `infer_block(rows, first_pos)` runs `rows` new positions per sequence, so the
+ * row count is the only difference between them.
  *
- *   prefill   the PROMPT tokens up to and including '=', in ONE block of 15
- *             rows. Their K and V land in the cache; the last row's logits give
- *             the first answer digit.
- *   decode    one token at a time. The new token's K and V are appended and
- *             attention contracts against the whole cache, so a step is one row
- *             everywhere — 4 KB of arithmetic instead of 130 KB.
+ * Shape: `model/transformer.py::adder_int4_wide` — d=128, f=512, 4 layers, 4
+ * heads of 32, int4 weights and activations, no bias, no LayerNorm, no
+ * positional encoding, T=64 (a 32-token prompt and the answer after it).
  *
- * Both are the same code: `infer_block(rows, first_pos)` runs `rows` new
- * positions starting at `first_pos`. The cache, the mask and tpulib.h's block
- * loops do not care how many rows arrive at once, so the row count is the ONLY
- * difference between the training shape and the generation shape.
+ * ---- phases, for benchmarking ----------------------------------------------
  *
- * ---- what the device owns that adder.c gave to the host ---------------------
+ * INFER_PREFILL and INFER_DECODE select which half of a generation this image
+ * runs; both default to 1, which is the whole thing and is what the accuracy
+ * path builds. `make PROG=infer PHASE=prefill|decode|both` sets them.
  *
- * cpu_subsys.sv decodes 0x9xxx_xxxx onto the scratchpad's S port, so:
+ * The counters cannot be read mid-run — they reset at `G` and freeze at the
+ * halt — so an image that runs one half IS the measurement of that half, for
+ * every counter rather than only the total. The decode-only image starts from
+ * the prompt's last token instead of the one the prefill would have produced:
+ * a step's cost is not data-dependent, so the clocks are the same and the
+ * tokens it emits are not scored.
  *
- *   argmax    the head writes 13 int32 logits to the SCRATCHPAD instead of
- *             DRAM, and the CPU reads them back and compares (tpu_spad_ld).
- *   gather    the embedding table is a DRAM tensor and a DMA takes a COMPUTED
- *             address, so `DR_EMBED + token*D` is the gather. The token index
- *             never leaves the CPU.
+ * ---- batching --------------------------------------------------------------
  *
- * The whole autoregressive loop therefore closes on the device: the host stages
- * the weights, the mask, the embedding table and the prompt's token ids,
- * presses 'G' once, and reads a finished sequence back out of DR_TOKENS.
+ * BATCH independent sequences share every weight stream. X is [BATCH][rows][D]
+ * — sequence-major — so the three projections, Wo and both FFN matmuls run once
+ * over BATCH*rows rows and the weight is staged once for all of them. Attention
+ * stays per sequence, because each one has its own KV cache.
  *
- * ---- the KV cache -----------------------------------------------------------
+ * That is the whole point at decode: a step is one row of arithmetic against
+ * ~390 KB of weights, so BATCH rows cost the same DMA as one. What it costs is
+ * DRAM — the cache is 48 KB per sequence at this shape — and DR_END's assert is
+ * what says whether a given BATCH still fits under the weights.
  *
- * Statically allocated, scratchpad-resident, 3 KB per layer. Each half is
- * stored in the orientation its matmul wants, because the cost of a cache is
- * what you pay to APPEND to it:
+ * ---- where tensors live ----------------------------------------------------
  *
- *   V   [T][D] int4.  `P @ V` contracts over keys, so its weight is V[s][h] —
- *       exactly how V leaves its projection. Appending is one `quant4` writing
- *       one 32-byte row. Free.
- *   K   [D][T] int8.  `Q @ K^T`'s weight is K^T[h][s], so the cache is
- *       column-major and appending a token writes one byte into each of D rows.
- *       That scatter is the transposing DMA, which is one command for any
- *       number of rows.
+ * Every tensor's home is DRAM. The scratchpad holds the staging arena and a
+ * mailbox for the values the CPU has to touch. On top of that the kernel
+ * promotes some tensors to a scratchpad copy — a performance choice with a DRAM
+ * fallback, not a requirement. Drop every promotion and this computes the same
+ * bytes, slower, which is why nothing here asserts a tensor fits.
  *
- * The K cache stays int8 and is re-packed to int4 whole (into SP_KT_INT4) once
- * per layer per step. That looks wasteful — 2048 elements packed to use at most
- * first_pos+1 columns — but it is 4 VPU commands against the ~24 000 DMA clocks
- * the same layer spends fetching weights, and the alternative cannot be done:
- * the nibble for (d, t) sits in the middle of the byte at row d, and no op
- * writes half a byte.
+ * Rows block at TPU_TOKENS_MAX, the array's dispatch limit, so the prefill is
+ * one pass per sequence at this prompt length and each weight streams once.
  *
- * NOTHING IS ZEROED, and nothing needs to be. Cache columns past the current
- * position hold whatever the last problem left there and reach S as garbage —
- * but S is int4 and the mask is -8, so a masked score is at most -1 whatever
- * the garbage was, and ReLU takes it to exactly zero. The mask that makes
- * attention causal is the same mask that makes an uninitialized cache safe.
+ * ---- the KV cache ----------------------------------------------------------
  *
- * ---- what the host stages ---------------------------------------------------
+ * Each half is stored in the orientation its matmul wants, because a cache
+ * costs what you pay to append to it. V is [T][D] int4 — exactly how V leaves
+ * its projection, so the append IS the pack. K is [D][T] int8, column-major,
+ * so appending writes one byte into each of D rows: that scatter is the
+ * transposing DMA, one command for any number of rows. K stays int8 and is
+ * re-packed to int4 whole each layer-step because the nibble for (d, t) sits in
+ * the middle of a byte and no op writes half a byte.
  *
- *   DR_TOKENS[0 .. PROMPT-1]   the prompt, as int32 token ids
- *   DR_EMBED                   the embedding table, already quantized onto s_x0
- *   DR_MASK, DR_HEAD_WGT, the six weight blocks per layer   as adder.c
+ * NOTHING IS ZEROED. Cache columns past the current position are garbage and
+ * reach S as garbage, but S is int4 and the mask is -8, so a masked score is at
+ * most -1 and ReLU takes it to exactly zero. The mask that makes attention
+ * causal is what makes an uninitialized cache safe.
  *
- * and reads back DR_TOKENS[PROMPT .. T-1] (the generated ids) and, to check the
- * arithmetic rather than the answer, DR_LOGITS.
+ * ---- the host --------------------------------------------------------------
  *
- * The requant table is the same 16 {m0,n} words per layer as adder.c, from the
- * same header: this is the same arithmetic in a different order, so a
- * checkpoint exported for one runs the other unchanged.
+ * Stages DR_TOKENS (the prompt ids), DR_EMBED, DR_MASK, DR_HEAD_WGT and the six
+ * weight blocks per layer; presses 'G'; reads DR_TOKENS[seq][PROMPT..] back.
+ * The argmax and the embedding gather are on the device — cpu_subsys.sv maps
+ * the scratchpad at 0x9xxx_xxxx, and a DMA takes an address the CPU computed.
+ *
+ * The weight blocks are at adder.c's addresses so one staging pass feeds either
+ * kernel; everything below them is computed off the shape AND off BATCH, so a
+ * batched image moves the mask, the head and the caches — `infer_export.layout`
+ * walks the same chain. The requant table is not shared — adder.c runs T=128
+ * and its shifts are set by its own contractions.
  */
 #include "tpulib.h"
 
 #ifdef ADDER_RQ_H
 #include ADDER_RQ_H
 #else
-#include "adder_rq.h"
+#include "infer_rq.h"
 #endif
 
-#define T         32            /* tokens (train.py --max_tokens) */
-#define D         64            /* model width */
-#define DFF       256           /* feed-forward width */
-#define HEADS     4             /* q_heads == kv_heads */
-#define HEAD_DIM  (D / HEADS)   /* 16 */
-#define LAYERS    4
+#define T         64
+#define D         128
+#define DFF       512
+#define HEADS     4
+#define HEAD_DIM  (D / HEADS)
+#define LAYERS    2
 #define VOCAB     13
 #define VOCAB_PAD 16            /* the 13 logits, padded to a whole array tile */
 
-/* The prompt length is a compile-time constant because the dataset makes it
- * one: numbers_data.EQUALS_POS = 15 is the index of the first ANSWER digit and
- * operands are padded so that holds for every problem, so '=' is at 14 and the
- * prompt is exactly 15 tokens. A model with varying prompts would pass this in
- * and lose the constant folding in the prefill block only. */
+/* '=' is at 31 and operands are padded so that holds for every problem. */
 #ifndef PROMPT
-#define PROMPT 15
+#define PROMPT 32
 #endif
 
-/* Tokens to generate: one from the prefill, then a decode step each. T - PROMPT
- * fills the sequence; lower it for a quick regression, since an RTL decode step
- * costs ~150 k clocks. */
 #ifndef INFER_GEN
 #define INFER_GEN (T - PROMPT)
 #endif
 
+/* Independent sequences sharing one weight stream. */
+#ifndef BATCH
+#define BATCH 1
+#endif
+
+/* Which half of a generation this image runs. Both on is the whole thing. */
+#ifndef INFER_PREFILL
+#define INFER_PREFILL 1
+#endif
+#ifndef INFER_DECODE
+#define INFER_DECODE 1
+#endif
+
+/* A prompt longer than one BLOCK costs a weight stream per BLOCK rows, which is
+ * what keeping a pass's intermediates local is worth paying. */
+#ifndef BLOCK
+#define BLOCK TPU_TOKENS_MAX
+#endif
+
+#define PREFILL_PASSES  (PROMPT / BLOCK)
+#define PREFILL_TAIL    (PROMPT % BLOCK)
+#define LAST_PASS_ROWS  (PREFILL_TAIL ? PREFILL_TAIL : BLOCK)
+
+/* The prefill produces the token at PROMPT, so a generation of INFER_GEN tokens
+ * is that one plus INFER_GEN-1 decode steps. The decode-only image runs those
+ * same INFER_GEN-1 steps, which is what makes its clocks the prefill-only
+ * image's complement rather than something to be scaled. */
+#define DECODE_STEPS (INFER_GEN - 1u)
+
+/* Where the generated ids land, and how many there are. Decode-only never
+ * writes the token at PROMPT (that is the prefill's), so it starts one later. */
+#if INFER_PREFILL
+#define TOK_FIRST PROMPT
+#define TOK_COUNT (1u + (INFER_DECODE ? DECODE_STEPS : 0u))
+#else
+#define TOK_FIRST (PROMPT + 1u)
+#define TOK_COUNT DECODE_STEPS
+#endif
+
+/* Rows per sequence in the widest pass this image runs, and the row count a
+ * batched matmul sees. A decode-only image never runs a prefill block, so its
+ * activation buffers are BATCH rows rather than BATCH*BLOCK. */
+#define PREFILL_ROWS ((PROMPT < BLOCK) ? PROMPT : BLOCK)
+#if INFER_PREFILL
+#define MAX_SEQ_ROWS PREFILL_ROWS
+#else
+#define MAX_SEQ_ROWS 1u
+#endif
+#define ROWS_MAX (BATCH * MAX_SEQ_ROWS)
+
+_Static_assert(INFER_PREFILL || INFER_DECODE, "build at least one phase");
 _Static_assert(PROMPT + INFER_GEN <= T, "generation runs past the sequence");
 _Static_assert(PROMPT >= 1, "the prefill needs at least one token");
+_Static_assert(BATCH >= 1, "BATCH is a sequence count");
+_Static_assert(!INFER_DECODE || INFER_GEN >= 2,
+               "a decode step needs INFER_GEN >= 2; GEN counts the prefill's "
+               "token too");
+_Static_assert(BLOCK <= TPU_TOKENS_MAX,
+               "a dispatch takes at most TPU_TOKENS_MAX rows");
+_Static_assert(BLOCK * D <= TPU_DMA_BYTES_MAX,
+               "the K append is one transposing DMA and would not fit in one");
 
-/* Requant sites, in block order — identical to adder.c's enum: same sites, same
- * order, same header. */
+/* Requant sites, in block order — adder.c's enum, same sites and same header. */
 enum {
     RQ_Q, RQ_K, RQ_V,           /* the three projections            */
     RQ_KP, RQ_VP,               /* quant4 packs — {1,0}, both int4  */
@@ -130,267 +182,344 @@ enum {
 
 static const uint16_t rq_table[LAYERS][RQ_N] = ADDER_RQ_INIT;
 
-/* Bytes in one row of a row-major int4 weight, i.e. two nibbles per byte. */
-#define WGT_ROW(cols) ((cols) / 2)
+#define I4_ROW(cols) ((cols) / 2)       /* bytes in a row-major int4 row */
 
-/* ---- DRAM ----------------------------------------------------------------
- * Everything this kernel shares with adder.c is at the same address, so one
- * host stages either. What used to be the embedded X0 is now the embedding
- * table plus the token sequence. */
-#define DR_EMBED        0x00000u  /* [VOCAB][D] int8 — the embedding, host   */
-#define DR_TOKENS       0x00400u  /* [T] int32 — prompt in, generated out    */
-#define DR_MASK         0x00800u  /* [T][T]  int8  — causal mask, host       */
-#define DR_KT_SCRATCH   0x00C00u  /* [D][T]  int8  — cache-append staging    */
-#define DR_HEAD_WGT     0x01400u  /* [D][16] int4  — output head, host       */
-#define DR_LOGITS       0x01800u  /* [T][16] int32 — per-position logits, out*/
-#define DR_LAYER0       0x02000u  /* layer 0's weight block...               */
-#define DR_LAYER_STRIDE 0x06000u  /* ...and the stride between layers        */
+/* ---- DRAM (512 KB) --------------------------------------------------------
+ * A computed chain, so a shape change re-lays it out and DR_END's assert says
+ * whether the result still fits. Three rotating temporaries are the whole
+ * activation working set — an intermediate dies as soon as its consumer has
+ * read it, so the roles are:
+ *
+ *   DR_TMP_A  K_new -> A -> X+O -> F
+ *   DR_TMP_B  V_new -> O -> X1
+ *
+ * and DR_SCRATCH holds whichever phase of the layer is running: Q, KT and S
+ * while attention does, H once the FFN starts.
+ *
+ * Anything per-sequence is indexed [seq] and anything per-row is [seq][row],
+ * sequence-major, so a matmul over BATCH*rows rows walks one dense tensor.
+ */
+#define DR_ALIGN(a) (((a) + 63u) & ~63u)
 
-#define LW_WQ  0x0000u          /* [D][D]   int4, 2048 B */
-#define LW_WK  0x0800u
-#define LW_WV  0x1000u
-#define LW_WO  0x1800u
-#define LW_FF1 0x2000u          /* [D][DFF] int4, 8192 B */
-#define LW_FF2 0x4000u          /* [DFF][D] int4, 8192 B */
+#define DR_EMBED    0x00000u                                          /* host      */
+#define DR_TOKENS   DR_ALIGN(DR_EMBED   + VOCAB * D)                  /* host, out */
+#define DR_LOGITS   DR_ALIGN(DR_TOKENS  + BATCH * T * 4u)             /* out       */
+#define DR_MASK     DR_ALIGN(DR_LOGITS  + BATCH * T * VOCAB_PAD * 4u) /* host      */
+#define DR_HEAD_WGT DR_ALIGN(DR_MASK    + T * T)                      /* host      */
+#define DR_K_CACHE  DR_ALIGN(DR_HEAD_WGT + D * I4_ROW(VOCAB_PAD))
+#define DR_V_CACHE  DR_ALIGN(DR_K_CACHE + BATCH * LAYERS * D * T)
+#define DR_X        DR_ALIGN(DR_V_CACHE + BATCH * LAYERS * T * I4_ROW(D))
+#define DR_TMP_A    DR_ALIGN(DR_X       + ROWS_MAX * D)
+#define DR_TMP_B    DR_ALIGN(DR_TMP_A   + ROWS_MAX * D)
 
-/* ---- scratchpad (64 KB) --------------------------------------------------
- * The arena, then the KV cache (the only tensors that live across a step), then
- * one block's worth of everything else. BLOCK_ROWS is the widest any activation
- * has to be: the prefill's, since a decode step is a single row. */
-#define BLOCK_ROWS PROMPT
+/* Attention's working set and the FFN's hidden layer never coexist, so they
+ * are one region and the layer costs the larger of the two rather than the sum.
+ *
+ * Q, KT and S are all read for the last time by the per-head loop, and A@Wo is
+ * the dispatch that ends it; H is not written until X1 exists, two residual
+ * adds later, and is dead again at HR@W2 — before the next layer's Q
+ * projection. Nothing else in the layer reads either group.
+ *
+ * This is the only aliasing in the map. X, TMP_A and TMP_B are live across the
+ * whole layer (TMP_A is K_new, then A, then X+O, then F; TMP_B is V_new, then
+ * O, then X1, which the last add still needs), so none of them can share. */
+#define DR_SCRATCH  DR_ALIGN(DR_TMP_B   + ROWS_MAX * D)
+#define DR_Q        DR_SCRATCH
+#define DR_KT       DR_ALIGN(DR_Q       + ROWS_MAX * D)
+#define DR_S        DR_ALIGN(DR_KT      + D * I4_ROW(T))
+#define DR_ATTN_END DR_ALIGN(DR_S       + MAX_SEQ_ROWS * T)
+#define DR_H        DR_SCRATCH
+#define DR_FFN_END  DR_ALIGN(DR_H       + ROWS_MAX * DFF)
+#define DR_END      ((DR_ATTN_END > DR_FFN_END) ? DR_ATTN_END : DR_FFN_END)
 
-#define SP_ARENA       0x0000u  /* 8192 — the largest weight block is 8 KB */
-#define SP_ARENA_BYTES 0x2000u
+#define DR_LAYER0        0x20000u       /* adder.c's weight map, byte for byte */
+#define DR_LAYER_STRIDE  0x18000u
+#define LW_WQ  0x00000u                 /* [D][D]   int4 */
+#define LW_WK  0x02000u
+#define LW_WV  0x04000u
+#define LW_WO  0x06000u
+#define LW_FF1 0x08000u                 /* [D][DFF] int4 */
+#define LW_FF2 0x10000u                 /* [DFF][D] int4 */
 
-#define SP_MASK      0x2000u    /* [T][T] int8                      1024 B  */
-#define SP_K_CACHE   0x2400u    /* LAYERS x [D][T] int8   K^T       2048 B ea*/
-#define SP_V_CACHE   0x4400u    /* LAYERS x [T][D] int4   V packed  1024 B ea*/
-#define SP_KT_INT4   0x5400u    /* [D][T] int4 — the K cache, packed 1024 B  */
+#define K_CACHE(seq, layer) \
+    (DR_K_CACHE + ((seq) * LAYERS + (layer)) * (D * T))
+#define V_CACHE(seq, layer) \
+    (DR_V_CACHE + ((seq) * LAYERS + (layer)) * (T * I4_ROW(D)))
 
-#define SP_X         0x5800u    /* [BLOCK_ROWS][D] int8 — residual stream   */
-#define SP_Q         0x5C00u    /* [BLOCK_ROWS][D] int8                     */
-#define SP_K_NEW     0x6000u    /* [BLOCK_ROWS][D] int8 — this block's K    */
-#define SP_V_NEW     0x6400u    /* [BLOCK_ROWS][D] int8 — this block's V    */
-#define SP_S         0x6800u    /* [BLOCK_ROWS][T] int8 — raw scores        */
-#define SP_S_MASKED  0x6A00u    /* [BLOCK_ROWS][T] int8 — S + causal mask   */
-#define SP_P         0x6C00u    /* [BLOCK_ROWS][T] int8 — relu of that      */
-#define SP_A         0x6E00u    /* [BLOCK_ROWS][D] int8 — attention output  */
-#define SP_O         0x7200u    /* [BLOCK_ROWS][D] int8 — A @ Wo            */
-#define SP_X_PLUS_O  0x7600u    /* [BLOCK_ROWS][D] int8                     */
-#define SP_X1        0x7A00u    /* [BLOCK_ROWS][D] int8 — after DyT         */
-#define SP_H         0x7E00u    /* [BLOCK_ROWS][DFF] int8                   */
-#define SP_H_RELU    0x8E00u    /* [BLOCK_ROWS][DFF] int8                   */
-#define SP_FFN_OUT   0x9E00u    /* [BLOCK_ROWS][D] int8                     */
-#define SP_LOGITS    0xA200u    /* [VOCAB_PAD] int32 — the CPU reads these  */
-#define SP_TOKENS    0xA240u    /* [T] int32 — the sequence, prompt included*/
-#define SP_END       0xA2C0u
+/* Two levers when this fires, in this order: lower BLOCK (the per-sequence row
+ * count, which scales X, TMP_A, TMP_B and the scratch union and costs one
+ * weight stream per extra pass), then lower BATCH. The KV cache is 48 KB per
+ * sequence here and no aliasing reaches it, so BATCH is the hard wall. */
+_Static_assert(DR_END <= DR_LAYER0,
+               "the activation map runs into layer 0's weights: lower BLOCK, "
+               "then BATCH");
+_Static_assert(DR_LAYER0 + LAYERS * DR_LAYER_STRIDE <= 0x80000u,
+               "the weights overrun the 512 KB SRAM");
 
-/* The map above is hand-packed, so check it: a tensor that outgrew its slot
- * would otherwise show up as a wrong answer several blocks later. */
-_Static_assert(SP_K_CACHE + LAYERS * (D * T) <= SP_V_CACHE,
-               "K cache overruns the V cache");
-_Static_assert(SP_V_CACHE + LAYERS * (T * D / 2) <= SP_KT_INT4,
-               "V cache overruns SP_KT_INT4");
-_Static_assert(SP_KT_INT4 + (D * T / 2) <= SP_X, "SP_KT_INT4 overruns SP_X");
-_Static_assert(BLOCK_ROWS * D <= SP_Q - SP_X,
-               "a [BLOCK_ROWS][D] activation does not fit");
-_Static_assert(BLOCK_ROWS * T <= SP_S_MASKED - SP_S,
-               "a [BLOCK_ROWS][T] activation does not fit");
-_Static_assert(BLOCK_ROWS * DFF <= SP_H_RELU - SP_H,
-               "a [BLOCK_ROWS][DFF] activation does not fit");
-_Static_assert(SP_LOGITS + VOCAB_PAD * 4 <= SP_TOKENS,
-               "the logits overrun SP_TOKENS");
-_Static_assert(SP_TOKENS + T * 4 <= SP_END, "the token block overruns the map");
-_Static_assert(SP_END <= 0x10000u, "the scratchpad is 64 KB");
+/* ---- scratchpad (64 KB) ---------------------------------------------------
+ * The CPU has no path to DRAM, so what it reads (the prompt ids) and writes
+ * (the token it chose) lives in a fixed mailbox the scratchpad window reaches.
+ * That is the only fixed allocation here; the rest is arena. */
+#define SP_BYTES    0x10000u
+#define SP_MAILBOX  (SP_BYTES - (VOCAB_PAD * 4u + BATCH * T * 4u))
+#define SP_LOGITS   SP_MAILBOX                   /* [VOCAB_PAD] int32 */
+#define SP_TOKENS   (SP_LOGITS + VOCAB_PAD * 4u) /* [BATCH][T] int32  */
 
-#define K_CACHE(layer) (SP_K_CACHE + (layer) * (D * T))
-#define V_CACHE(layer) (SP_V_CACHE + (layer) * (T * D / 2))
+#define SP_TOKEN_AT(seq, pos) (SP_TOKENS + ((seq) * T + (pos)) * 4u)
+
+/* ---- residency ------------------------------------------------------------
+ * Tensors the kernel also keeps on chip, in falling order of DMA saved per byte
+ * of arena spent. The cascade stops when a promotion would leave less than
+ * SP_STAGE_RESERVE for the primitives to stage into, so a wider model runs more
+ * of itself out of DRAM.
+ *
+ * The reserve is the tuning knob. Measured on the ISS at this shape (prefill
+ * plus one decode step), the default beats a reserve big enough to keep every
+ * weight fill a single dense command: 2743 commands and ~976 k DMA clocks
+ * against 7179 and ~1 447 k. H's three DRAM passes cost more than the 128
+ * column-split fill commands W1 takes when H stays local. */
+#ifndef SP_STAGE_RESERVE
+#define SP_STAGE_RESERVE (D * I4_ROW(D) + TPU_CHUNK * 7u)
+#endif
+
+#define SZ_S     (MAX_SEQ_ROWS * T)
+#define SZ_TMP_A (ROWS_MAX * D)
+#define SZ_TMP_B (ROWS_MAX * D)
+#define SZ_X     (ROWS_MAX * D)
+#define SZ_H     (ROWS_MAX * DFF)
+#define SZ_KT    (D * I4_ROW(T))
+#define SZ_Q     (ROWS_MAX * D)
+#define SZ_V4    (T * I4_ROW(D))        /* one sequence's V cache, one layer */
+
+// #define PROMO_FITS(end) ((end) + SP_STAGE_RESERVE <= SP_MAILBOX)
+#define PROMO_FITS(end) false
+
+#define SP_S        0u
+#define PROMO_S     PROMO_FITS(SP_S + SZ_S)
+#define SP_TMP_A    (SP_S + (PROMO_S ? SZ_S : 0u))
+#define PROMO_TMP_A PROMO_FITS(SP_TMP_A + SZ_TMP_A)
+#define SP_TMP_B    (SP_TMP_A + (PROMO_TMP_A ? SZ_TMP_A : 0u))
+#define PROMO_TMP_B PROMO_FITS(SP_TMP_B + SZ_TMP_B)
+#define SP_X        (SP_TMP_B + (PROMO_TMP_B ? SZ_TMP_B : 0u))
+#define PROMO_X     PROMO_FITS(SP_X + SZ_X)
+#define SP_H        (SP_X + (PROMO_X ? SZ_X : 0u))
+#define PROMO_H     PROMO_FITS(SP_H + SZ_H)
+#define SP_KT       (SP_H + (PROMO_H ? SZ_H : 0u))
+#define PROMO_KT    PROMO_FITS(SP_KT + SZ_KT)
+#define SP_Q        (SP_KT + (PROMO_KT ? SZ_KT : 0u))
+#define PROMO_Q     PROMO_FITS(SP_Q + SZ_Q)
+#define SP_V4       (SP_Q + (PROMO_Q ? SZ_Q : 0u))
+#define PROMO_V4    PROMO_FITS(SP_V4 + SZ_V4)
+#define SP_ARENA    (SP_V4 + (PROMO_V4 ? SZ_V4 : 0u))
+
+#define SP_ARENA_BYTES (SP_MAILBOX - SP_ARENA)
+
+_Static_assert(SP_ARENA_BYTES >= SP_STAGE_RESERVE,
+               "the cascade promoted past its own reserve");
+
+/* The conditions are compile-time, so tpu_matmul still folds its staging
+ * branches away at every call site (tpulib.h's INLINING note). */
+#define B_S     (PROMO_S     ? TPU_SPAD_ROWS(SP_S, T)      : TPU_DRAM_ROWS(DR_S, T))
+#define B_TMP_A (PROMO_TMP_A ? TPU_SPAD_ROWS(SP_TMP_A, D)  : TPU_DRAM_ROWS(DR_TMP_A, D))
+#define B_TMP_B (PROMO_TMP_B ? TPU_SPAD_ROWS(SP_TMP_B, D)  : TPU_DRAM_ROWS(DR_TMP_B, D))
+#define B_X     (PROMO_X     ? TPU_SPAD_ROWS(SP_X, D)      : TPU_DRAM_ROWS(DR_X, D))
+#define B_H     (PROMO_H     ? TPU_SPAD_ROWS(SP_H, DFF)    : TPU_DRAM_ROWS(DR_H, DFF))
+#define B_KT    (PROMO_KT    ? TPU_SPAD_ROWS(SP_KT, I4_ROW(T)) \
+                             : TPU_DRAM_ROWS(DR_KT, I4_ROW(T)))
+#define B_Q     (PROMO_Q     ? TPU_SPAD_ROWS(SP_Q, D)      : TPU_DRAM_ROWS(DR_Q, D))
 
 static tpu_arena arena;
 
-/* ---- one block of new tokens ---------------------------------------------
+/* X holds the embeddings for positions first_pos .. first_pos+rows-1 of each of
+ * the BATCH sequences, sequence-major, and on return the residual stream after
+ * all four layers.
  *
- * X at SP_X holds the input embeddings for positions first_pos ..
- * first_pos+rows-1; on return it holds the residual stream after all four
- * layers, and the KV cache has `rows` more columns/rows in it.
+ * `rows` is rows PER SEQUENCE; the weight matmuls run over BATCH*rows of them
+ * so one weight stream serves the whole batch. Attention does not batch — each
+ * sequence attends over its own cache — so that loop is per sequence.
  *
- * `always_inline` with `rows` a literal at both call sites is what keeps this
- * affordable: it folds tpu_matmul's block chooser, block loops and staging
- * branches at all eight matmul sites, specializing the two calls to the
- * prefill's shape and the decode's. `first_pos` stays a runtime value — the
- * library folds on SHAPE, and an address costs nothing to compute. */
+ * `always_inline` with `rows` a literal at both call sites folds tpu_matmul's
+ * block chooser and staging branches at all eight matmul sites, specializing
+ * the prefill's shape and the decode's. `first_pos` stays a runtime value. */
 __attribute__((always_inline))
 static inline void infer_block(unsigned rows, unsigned first_pos)
 {
+    const unsigned rows_all = BATCH * rows;
+
     for (unsigned layer = 0; layer < LAYERS; layer++) {
         const uint16_t *rq = rq_table[layer];
         const uint32_t layer_wgt = DR_LAYER0 + layer * DR_LAYER_STRIDE;
-        const uint32_t k_cache = K_CACHE(layer);
-        const uint32_t v_cache = V_CACHE(layer);
 
-        /* ---- Q, K, V ----
-         * Three [D][D] projections off the same X, separate because each weight
+        /* Three [D][D] projections off the same X, separate because each weight
          * has its own scale and so its own {m0,n}. */
         tpu_matmul(&(const tpu_gemm){
-            .rows = rows, .depth = D, .cols = D,
-            .act = TPU_SPAD_ROWS(SP_X, D),
-            .wgt = TPU_DRAM_ROWS(layer_wgt + LW_WQ, WGT_ROW(D)),
-            .out = TPU_SPAD_ROWS(SP_Q, D),
+            .rows = rows_all, .depth = D, .cols = D,
+            .act = B_X,
+            .wgt = TPU_DRAM_ROWS(layer_wgt + LW_WQ, I4_ROW(D)),
+            .out = B_Q,
             .rq_word = rq[RQ_Q] }, &arena);
         tpu_matmul(&(const tpu_gemm){
-            .rows = rows, .depth = D, .cols = D,
-            .act = TPU_SPAD_ROWS(SP_X, D),
-            .wgt = TPU_DRAM_ROWS(layer_wgt + LW_WK, WGT_ROW(D)),
-            .out = TPU_SPAD_ROWS(SP_K_NEW, D),
+            .rows = rows_all, .depth = D, .cols = D,
+            .act = B_X,
+            .wgt = TPU_DRAM_ROWS(layer_wgt + LW_WK, I4_ROW(D)),
+            .out = B_TMP_A,                     /* K_new */
             .rq_word = rq[RQ_K] }, &arena);
         tpu_matmul(&(const tpu_gemm){
-            .rows = rows, .depth = D, .cols = D,
-            .act = TPU_SPAD_ROWS(SP_X, D),
-            .wgt = TPU_DRAM_ROWS(layer_wgt + LW_WV, WGT_ROW(D)),
-            .out = TPU_SPAD_ROWS(SP_V_NEW, D),
+            .rows = rows_all, .depth = D, .cols = D,
+            .act = B_X,
+            .wgt = TPU_DRAM_ROWS(layer_wgt + LW_WV, I4_ROW(D)),
+            .out = B_TMP_B,                     /* V_new */
             .rq_word = rq[RQ_V] }, &arena);
 
-        /* ---- append to the K cache ----
-         * The new [rows][D] K becomes columns first_pos.. of the [D][T] cache.
-         * The DMA is the only unit that transposes and one of its sides is
-         * always DRAM, so it is a linear spill followed by a transposing fill:
-         * the fill reads DRAM row-major over D columns and writes
-         * k_cache + d*T + row — one command for any number of rows. It moves
-         * bytes, which is why the cache is int8 and the pack comes after. */
-        tpu_move(SP_K_NEW, DR_KT_SCRATCH, rows * D, TPU_DMA_SPILL);
-        tpu_dma_transpose(k_cache + first_pos, DR_KT_SCRATCH, rows * D,
-                          TPU_DMA_FILL, D, D, T);
-        tpu_wait(TPU_U_DMA);
+        /* Per sequence: append to its cache, then attend over it. Sequence
+         * `seq`'s scores overwrite its own rows of K_new with A, which is safe
+         * because a later sequence's K_new lives in the rows below. */
+        for (unsigned seq = 0; seq < BATCH; seq++) {
+            const uint32_t k_cache = K_CACHE(seq, layer);
+            const uint32_t v_cache = V_CACHE(seq, layer);
+            const uint32_t seq_off = seq * rows * D;  /* into an X-shaped tensor */
+            /* Not promoted, this IS the DRAM cache — nothing to copy in or out. */
+            const tpu_buf b_v4 = PROMO_V4
+                ? TPU_SPAD_ROWS(SP_V4, I4_ROW(D))
+                : TPU_DRAM_ROWS(v_cache, I4_ROW(D));
 
-        /* ---- append to the V cache ----
-         * V leaves its projection in exactly the orientation `P @ V` wants, so
-         * the append IS the pack: `rows` rows of D nibbles, starting at row
-         * first_pos. Both packs here are the {1,0} identity — K and V are
-         * already int4, whatever requant produced them clipped to [-8, 7]. */
-        tpu_pack4(TPU_SPAD_AT(v_cache + first_pos * (D / 2)),
-                  TPU_SPAD_AT(SP_V_NEW), rows * D, rq[RQ_VP], &arena);
+            /* K_new becomes columns first_pos.. of the [D][T] cache. The DMA
+             * always has DRAM on one side, so a DRAM K_new has to bounce
+             * through the arena instead of spilling straight out. */
+#if PROMO_TMP_A
+            tpu_dma_transpose(SP_TMP_A + seq_off, k_cache + first_pos, rows * D,
+                              TPU_DMA_SPILL, D, D, T);
+            tpu_wait(TPU_U_DMA);
+#else
+            tpu_transpose_dram_int8(k_cache + first_pos, T, DR_TMP_A + seq_off,
+                                    D, rows, D, rows, &arena);
+#endif
 
-        /* The Q@K^T weight operand: the whole cache, packed. Columns past the
-         * current position are garbage and stay garbage — the mask below
-         * deletes them. */
-        tpu_pack4(TPU_SPAD_AT(SP_KT_INT4), TPU_SPAD_AT(k_cache), D * T,
-                  rq[RQ_KP], &arena);
+            tpu_pack4(B_KT, TPU_DRAM_AT(k_cache), D * T, rq[RQ_KP], &arena);
 
-        for (unsigned head = 0; head < HEADS; head++) {
-            /* S = requant(Q_head @ K_head^T) over the WHOLE cache width. A head
-             * is a column slice of Q and a row slice of K^T, both addressed in
-             * place. Contracting over all T keys rather than first_pos+rows of
-             * them costs a few tiles and keeps the shape constant, which is
-             * worth more than the tiles: a runtime column count would unfold
-             * the block loop. */
-            tpu_matmul(&(const tpu_gemm){
-                .rows = rows, .depth = HEAD_DIM, .cols = T,
-                .act = TPU_SPAD_ROWS(SP_Q + head * HEAD_DIM, D),
-                .wgt = TPU_SPAD_ROWS(SP_KT_INT4 + head * HEAD_DIM * WGT_ROW(T),
-                                     WGT_ROW(T)),
-                .out = TPU_SPAD_ROWS(SP_S, T),
-                .rq_word = rq[RQ_S] }, &arena);
+            /* V's append is the pack. Both packs are the {1,0} identity: K and
+             * V are already int4, whatever requant produced them clipped
+             * them. */
+#if PROMO_V4
+            tpu_move(SP_V4, v_cache, T * I4_ROW(D), TPU_DMA_FILL);
+            tpu_wait(TPU_U_DMA);
+#endif
+            tpu_pack4(tpu_buf_off(b_v4, first_pos * I4_ROW(D)),
+                      tpu_buf_off(B_TMP_B, seq_off), rows * D, rq[RQ_VP],
+                      &arena);
+#if PROMO_V4
+            tpu_move(SP_V4 + first_pos * I4_ROW(D),
+                     v_cache + first_pos * I4_ROW(D), rows * I4_ROW(D),
+                     TPU_DMA_SPILL);
+            tpu_wait(TPU_U_DMA);
+#endif
 
-            /* P = requant(relu(requant(S + mask))), over mask rows
-             * first_pos.. . The mask is 0 or -8 and S is int4, so a masked
-             * entry is at most -1 whatever s_s is and ReLU takes it to exactly
-             * zero. That is what makes both causality and the uninitialized
-             * tail of the cache exact rather than approximate. */
-            tpu_add_narrow(TPU_V_REQUANT, TPU_SPAD_AT(SP_S_MASKED),
-                           TPU_SPAD_AT(SP_S),
-                           TPU_SPAD_AT(SP_MASK + first_pos * T), rows * T,
-                           rq[RQ_ID], &arena);
-            tpu_relu_narrow(TPU_SPAD_AT(SP_P), TPU_SPAD_AT(SP_S_MASKED),
-                            rows * T, rq[RQ_P], &arena);
+            for (unsigned head = 0; head < HEADS; head++) {
+                /* Contracting over all T keys rather than first_pos+rows of
+                 * them keeps the shape constant; a runtime column count would
+                 * unfold the block loop, which costs more than the extra
+                 * tiles. */
+                tpu_matmul(&(const tpu_gemm){
+                    .rows = rows, .depth = HEAD_DIM, .cols = T,
+                    .act = tpu_buf_off(B_Q, seq_off + head * HEAD_DIM),
+                    .wgt = tpu_buf_off(B_KT, head * HEAD_DIM * I4_ROW(T)),
+                    .out = B_S,
+                    .rq_word = rq[RQ_S] }, &arena);
 
-            /* A_head = requant(P @ V_head), into A's column block. The
-             * contraction is the full T: cache rows past the current position
-             * are multiplied by a P of exactly zero. */
-            tpu_matmul(&(const tpu_gemm){
-                .rows = rows, .depth = T, .cols = HEAD_DIM,
-                .act = TPU_SPAD_ROWS(SP_P, T),
-                .wgt = TPU_SPAD_ROWS(v_cache + head * HEAD_DIM / 2,
-                                     WGT_ROW(D)),
-                .out = TPU_SPAD_ROWS(SP_A + head * HEAD_DIM, D),
-                .rq_word = rq[RQ_A] }, &arena);
+                /* P = requant(relu(requant(S + mask))), both passes in place.
+                 * Safe because a VPU pair reads its chunk into the arena's
+                 * int32 temp before writing the same chunk of destination. */
+                tpu_add_narrow(TPU_V_REQUANT, B_S, B_S,
+                               TPU_DRAM_ROWS(DR_MASK + first_pos * T, T),
+                               rows * T, rq[RQ_ID], &arena);
+                tpu_relu_narrow(B_S, B_S, rows * T, rq[RQ_P], &arena);
+
+                tpu_matmul(&(const tpu_gemm){
+                    .rows = rows, .depth = T, .cols = HEAD_DIM,
+                    .act = B_S,
+                    .wgt = tpu_buf_off(b_v4, head * I4_ROW(HEAD_DIM)),
+                    .out = tpu_buf_off(B_TMP_A, seq_off + head * HEAD_DIM),
+                    .rq_word = rq[RQ_A] }, &arena);        /* A */
+            }
         }
 
-        /* ---- O = requant(A @ Wo), pinned to s_x by the residual ---- */
         tpu_matmul(&(const tpu_gemm){
-            .rows = rows, .depth = D, .cols = D,
-            .act = TPU_SPAD_ROWS(SP_A, D),
-            .wgt = TPU_DRAM_ROWS(layer_wgt + LW_WO, WGT_ROW(D)),
-            .out = TPU_SPAD_ROWS(SP_O, D),
+            .rows = rows_all, .depth = D, .cols = D,
+            .act = B_TMP_A,                     /* A */
+            .wgt = TPU_DRAM_ROWS(layer_wgt + LW_WO, I4_ROW(D)),
+            .out = B_TMP_B,                     /* O; V_new is dead */
             .rq_word = rq[RQ_O] }, &arena);
 
-        /* ---- the double residual, then DyT ----
-         * MultiHeadAttention.forward ends in `O + X` and Transformer.forward
+        /* MultiHeadAttention.forward ends in `O + X` and Transformer.forward
          * adds X again, so this is 2X + O in two adds. */
-        tpu_add_narrow(TPU_V_REQUANT, TPU_SPAD_AT(SP_X_PLUS_O),
-                       TPU_SPAD_AT(SP_X), TPU_SPAD_AT(SP_O), rows * D,
+        tpu_add_narrow(TPU_V_REQUANT, B_TMP_A, B_X, B_TMP_B, rows_all * D,
                        rq[RQ_XO], &arena);
-        tpu_add_narrow(TPU_V_DYT, TPU_SPAD_AT(SP_X1),
-                       TPU_SPAD_AT(SP_X_PLUS_O), TPU_SPAD_AT(SP_X), rows * D,
+        tpu_add_narrow(TPU_V_DYT, B_TMP_B, B_TMP_A, B_X, rows_all * D,
                        rq[RQ_X1], &arena);
 
-        /* ---- the feed-forward block ---- */
+        /* Both ask for the weight prefetch and only W2 can take it: the
+         * prefetch splits the contraction, and a split contraction leaves
+         * rows*cols int32 partials, which at DFF columns is more than the whole
+         * scratchpad. W1 falls back to a column split. */
         tpu_matmul(&(const tpu_gemm){
-            .rows = rows, .depth = D, .cols = DFF,
-            .act = TPU_SPAD_ROWS(SP_X1, D),
-            .wgt = TPU_DRAM_ROWS(layer_wgt + LW_FF1, WGT_ROW(DFF)),
-            .out = TPU_SPAD_ROWS(SP_H, DFF),
-            .rq_word = rq[RQ_H] }, &arena);
-        tpu_relu_narrow(TPU_SPAD_AT(SP_H_RELU), TPU_SPAD_AT(SP_H), rows * DFF,
-                        rq[RQ_HR], &arena);
+            .rows = rows_all, .depth = D, .cols = DFF,
+            .act = B_TMP_B,                     /* X1 */
+            .wgt = TPU_DRAM_ROWS(layer_wgt + LW_FF1, I4_ROW(DFF)),
+            .out = B_H,
+            .rq_word = rq[RQ_H], .prefetch = 1 }, &arena);
+        tpu_relu_narrow(B_H, B_H, rows_all * DFF, rq[RQ_HR], &arena);
         tpu_matmul(&(const tpu_gemm){
-            .rows = rows, .depth = DFF, .cols = D,
-            .act = TPU_SPAD_ROWS(SP_H_RELU, DFF),
-            .wgt = TPU_DRAM_ROWS(layer_wgt + LW_FF2, WGT_ROW(D)),
-            .out = TPU_SPAD_ROWS(SP_FFN_OUT, D),
-            .rq_word = rq[RQ_F] }, &arena);
+            .rows = rows_all, .depth = DFF, .cols = D,
+            .act = B_H,
+            .wgt = TPU_DRAM_ROWS(layer_wgt + LW_FF2, I4_ROW(D)),
+            .out = B_TMP_A,                     /* F; X+O is dead */
+            .rq_word = rq[RQ_F], .prefetch = 1 }, &arena);
 
-        tpu_add_narrow(TPU_V_DYT, TPU_SPAD_AT(SP_X), TPU_SPAD_AT(SP_X1),
-                       TPU_SPAD_AT(SP_FFN_OUT), rows * D, rq[RQ_X2], &arena);
+        tpu_add_narrow(TPU_V_DYT, B_X, B_TMP_B, B_TMP_A, rows_all * D,
+                       rq[RQ_X2], &arena);
     }
 }
 
-/* Row `token` of the embedding table into row `dst_row` of X. The ISA has no
- * gather; a DMA whose DRAM address the CPU computed is one. */
+/* The ISA has no gather; a DMA whose DRAM address the CPU computed is one. */
 static void embed(unsigned dst_row, unsigned token)
 {
-    tpu_move(SP_X + dst_row * D, DR_EMBED + token * D, D, TPU_DMA_FILL);
+    const uint32_t src = DR_EMBED + token * D;
+
+#if PROMO_X
+    tpu_move(SP_X + dst_row * D, src, D, TPU_DMA_FILL);
+#else
+    const uint32_t mark = arena.next_free;
+    const uint32_t bounce = tpu_arena_alloc(&arena, D);
+
+    /* No barrier between them: the DMA queue is in-order. */
+    tpu_move(bounce, src, D, TPU_DMA_FILL);
+    tpu_move(bounce, DR_X + dst_row * D, D, TPU_DMA_SPILL);
+    arena.next_free = mark;
+#endif
     tpu_wait(TPU_U_DMA);
 }
 
-/* ---- the head, the argmax, and the next token -----------------------------
- *
- * `x_row_addr` is the row of X that position `pos` ended up in; the token this
- * returns is the one at pos+1.
- *
- * The logits are never requantized — an argmax does not care about scale — so
- * the raw int32 accumulator is what the array stores. It stores it to the
- * SCRATCHPAD rather than to DRAM, which is the whole difference between this
- * kernel and adder.c: the CPU can read the scratchpad, so the comparison
- * happens here instead of on the host. The DRAM copy is for the host to check
- * against PyTorch; nothing on the device reads it back. */
-static unsigned head_argmax(uint32_t x_row_addr, unsigned pos)
+/* Logits for the row of X at `x_row`; returns sequence `seq`'s token at pos+1.
+ * They are never requantized — an argmax does not care about scale — and they
+ * land in the mailbox so the CPU can read them. The DRAM copy is the host's, to
+ * check against PyTorch. */
+static unsigned head_argmax(unsigned x_row, unsigned seq, unsigned pos)
 {
     unsigned best_token = 0;
     int32_t best_logit;
 
     tpu_matmul(&(const tpu_gemm){
         .rows = 1, .depth = D, .cols = VOCAB_PAD,
-        .act = TPU_SPAD_ROWS(x_row_addr, D),
-        .wgt = TPU_DRAM_ROWS(DR_HEAD_WGT, WGT_ROW(VOCAB_PAD)),
+        .act = tpu_buf_off(B_X, x_row * D),
+        .wgt = TPU_DRAM_ROWS(DR_HEAD_WGT, I4_ROW(VOCAB_PAD)),
         .out = TPU_SPAD_ROWS(SP_LOGITS, VOCAB_PAD * 4),
         .rq_word = 0u }, &arena);   /* 0 = store int32, do not narrow */
 
-    tpu_move(SP_LOGITS, DR_LOGITS + pos * (VOCAB_PAD * 4), VOCAB_PAD * 4,
-             TPU_DMA_SPILL);
+    tpu_move(SP_LOGITS, DR_LOGITS + (seq * T + pos) * (VOCAB_PAD * 4),
+             VOCAB_PAD * 4, TPU_DMA_SPILL);
     tpu_wait(TPU_U_DMA);
 
-    /* Strictly greater, so a tie takes the lowest id — torch.argmax's rule, and
-     * the only place the two could disagree on a checkpoint whose logits tie. */
+    /* Strictly greater, so a tie takes the lowest id — torch.argmax's rule. */
     best_logit = (int32_t)tpu_spad_ld(SP_LOGITS);
     for (unsigned token = 1; token < VOCAB; token++) {
         int32_t logit = (int32_t)tpu_spad_ld(SP_LOGITS + token * 4);
@@ -401,47 +530,80 @@ static unsigned head_argmax(uint32_t x_row_addr, unsigned pos)
         }
     }
 
-    tpu_spad_st(SP_TOKENS + (pos + 1) * 4, best_token);
+    tpu_spad_st(SP_TOKEN_AT(seq, pos + 1), best_token);
     return best_token;
 }
 
 int main(void)
 {
-    unsigned next_token;
+    unsigned next_token[BATCH];
+    unsigned seq;
 
     tpu_arena_init(&arena, SP_ARENA, SP_ARENA_BYTES);
 
-    /* The mask is read by every layer of every step. The prompt is read once,
-     * by the CPU — which has no path to DRAM at all, so a DMA into the
-     * scratchpad and a load through the window is how a host-written NUMBER
-     * reaches it. */
-    tpu_move(SP_MASK, DR_MASK, T * T, TPU_DMA_FILL);
-    tpu_move(SP_TOKENS, DR_TOKENS, PROMPT * 4, TPU_DMA_FILL);
+    /* The CPU has no path to DRAM, so a host-written number reaches it as a DMA
+     * into the mailbox and a load through the window. The prompt only: pulling
+     * the answer field in would put the host's own bytes back in the output. */
+    for (seq = 0; seq < BATCH; seq++)
+        tpu_move(SP_TOKEN_AT(seq, 0), DR_TOKENS + seq * T * 4u, PROMPT * 4,
+                 TPU_DMA_FILL);
     tpu_wait(TPU_U_DMA);
 
-    /* ---- prefill: PROMPT tokens in one block ---- */
-    for (unsigned pos = 0; pos < PROMPT; pos++)
-        embed(pos, tpu_spad_ld(SP_TOKENS + pos * 4) & 0xFFu);
+#if INFER_PREFILL
+    {
+        unsigned base = 0;
 
-    infer_block(PROMPT, 0);
-    next_token = head_argmax(SP_X + (PROMPT - 1) * D, PROMPT - 1);
-
-    /* ---- decode: one token per step ----
-     * Step `pos` embeds the token the previous step chose — the one at position
-     * pos — into row 0 of X, runs it through every layer against the cache, and
-     * produces the token at pos+1. The prefill already produced the token at
-     * PROMPT, so this runs INFER_GEN-1 times. */
-    for (unsigned pos = PROMPT; pos < PROMPT + INFER_GEN - 1; pos++) {
-        embed(0, next_token);
-        infer_block(1, pos);
-        next_token = head_argmax(SP_X, pos);
+        /* Chunking is safe because a pass runs every layer before the next
+         * starts, so the cache a later pass attends over is complete at every
+         * depth. */
+        for (unsigned pass = 0; pass < PREFILL_PASSES; pass++, base += BLOCK) {
+            for (seq = 0; seq < BATCH; seq++)
+                for (unsigned row = 0; row < BLOCK; row++)
+                    embed(seq * BLOCK + row,
+                          tpu_spad_ld(SP_TOKEN_AT(seq, base + row)) & 0xFFu);
+            infer_block(BLOCK, base);
+        }
+#if PREFILL_TAIL
+        for (seq = 0; seq < BATCH; seq++)
+            for (unsigned row = 0; row < PREFILL_TAIL; row++)
+                embed(seq * PREFILL_TAIL + row,
+                      tpu_spad_ld(SP_TOKEN_AT(seq, base + row)) & 0xFFu);
+        infer_block(PREFILL_TAIL, base);
+#endif
+        for (seq = 0; seq < BATCH; seq++)
+            next_token[seq] =
+                head_argmax(seq * LAST_PASS_ROWS + LAST_PASS_ROWS - 1u, seq,
+                            PROMPT - 1);
     }
+#else
+    /* Decode-only: no prefill ran, so the step at PROMPT starts from the
+     * prompt's last token instead of from the one the prefill would have
+     * produced. A step's cost is not data-dependent, so this measures the same
+     * clocks; the ids it emits are not scored. */
+    for (seq = 0; seq < BATCH; seq++)
+        next_token[seq] = tpu_spad_ld(SP_TOKEN_AT(seq, PROMPT - 1)) & 0xFFu;
+#endif
 
-    /* Only the generated ids: the prompt end of the block is what the host
-     * wrote, and spilling it back would put the host's own bytes in the golden
-     * output image. */
-    tpu_move(SP_TOKENS + PROMPT * 4, DR_TOKENS + PROMPT * 4, INFER_GEN * 4,
-             TPU_DMA_SPILL);
+#if INFER_DECODE
+    /* The prefill already produced the token at PROMPT, so this runs one time
+     * fewer than there are tokens to generate. */
+    for (unsigned pos = PROMPT; pos < PROMPT + DECODE_STEPS; pos++) {
+        for (seq = 0; seq < BATCH; seq++)
+            embed(seq, next_token[seq]);
+        infer_block(1, pos);
+        for (seq = 0; seq < BATCH; seq++)
+            next_token[seq] = head_argmax(seq, seq, pos);
+    }
+#else
+    (void)next_token;
+#endif
+
+    /* Only the ids this image actually generated: spilling a position it never
+     * wrote would put uninitialized scratchpad in the output image. */
+    for (seq = 0; seq < BATCH; seq++)
+        tpu_move(SP_TOKEN_AT(seq, TOK_FIRST),
+                 DR_TOKENS + (seq * T + TOK_FIRST) * 4u, TOK_COUNT * 4u,
+                 TPU_DMA_SPILL);
     tpu_wait(TPU_U_DMA);
 
     return 0;                       /* start.S raises `done` from here */

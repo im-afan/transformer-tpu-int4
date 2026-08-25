@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """adder_export.py — a real checkpoint through the firmware adder kernel.
 
-Takes `model/saved/*.pt` (an `adder_int4_vanilla` QAT checkpoint), turns it into
+Takes `model/saved/*.pt` (an `adder_int4_wide` QAT checkpoint), turns it into
 the integers `accel/tpu/fw/adder.c` expects, runs that kernel's command trace on
 `iss.py`, and scores the result on the addition task. Nothing here is an
 estimate: the ISS is bit-exact with the RTL (`make fw FWPROG=adder` checks the
@@ -25,7 +25,7 @@ Three things happen, in order:
 3. **Run.** Weights, the causal mask and the output head are staged into DRAM
    once — they are read-only, exactly as they would stay resident in the board's
    SRAM across forwards — and then each problem stages only its embedded `X0`
-   and re-runs the same 534 commands.
+   (16 KB at this shape) and re-runs the same command stream.
 
 The host owns the two ends, structurally: the token embedding (the ISA has no
 gather) and the argmax over 13 logits (nothing returns an index).
@@ -70,17 +70,20 @@ from iss import TPU, parse_trace  # noqa: E402
 FW_DIR = os.path.join(REPO, "accel", "tpu", "fw")
 
 # ---- geometry. Must agree with fw/adder.c, and is checked against the model. --
-T, D, DFF, NH, LAYERS = 32, 64, 256, 4, 4
+T, D, DFF, NH, LAYERS = 128, 128, 512, 4, 4
 DH = D // NH
 VOCAB, VPAD = 13, 16
 ROWS = COLS = 8
 
 # ---- DRAM map (fw/adder.c) ---------------------------------------------------
-DR_X, DR_MASK, DR_WFC, DR_LOG = 0x00000, 0x00800, 0x01400, 0x01800
-DR_LAYER, DR_LSTEP = 0x02000, 0x06000
+# 128 KB of activations and host inputs, then 96 KB of weights per layer, which
+# is the 512 KB chip exactly. The kernel's own tensors (Q, K, V, K^T, A) sit
+# between DR_MASK and DR_WFC and are never staged from here.
+DR_X, DR_MASK, DR_WFC, DR_LOG = 0x00000, 0x04000, 0x1C000, 0x1E000
+DR_LAYER, DR_LSTEP = 0x20000, 0x18000
 LOGITS_BYTES = T * VPAD * 4     # what the head writes at DR_LOG
-LW_Q, LW_K, LW_V, LW_O, LW_1, LW_2 = (0x0000, 0x0800, 0x1000, 0x1800,
-                                      0x2000, 0x4000)
+LW_Q, LW_K, LW_V, LW_O, LW_1, LW_2 = (0x00000, 0x02000, 0x04000, 0x06000,
+                                      0x08000, 0x10000)
 
 # ---- the 16 requant sites, in fw/adder.c's enum order ------------------------
 RQ_NAMES = ["Q", "K", "V", "KP", "VP", "S", "ID", "P", "A", "O", "XO", "X1",
@@ -288,8 +291,9 @@ def static_image(weights: dict) -> dict:
     """Everything that does not change per problem, as `{addr: byte}`.
 
     Weights, the causal mask and the output head — read-only for the whole run,
-    which is the point: on the board this is one ~9 s upload and then every
-    forward sends only the 2 KB `X0`. `accel/tpu/host/run_adder.py` stages the
+    which is the point: on the board this is one upload (385 KB at this shape,
+    against the d=64 model's 98 KB) and then every forward sends only the
+    16 KB `X0`. `accel/tpu/host/run_adder.py` stages the
     board from this same dict, so the two paths cannot drift apart.
     """
     img: dict = {}
@@ -358,8 +362,8 @@ def read_logits(tpu: TPU) -> torch.Tensor:
 # op for. Both are shared with `accel/tpu/host/run_adder.py`.
 # =============================================================================
 def load_model(path: str):
-    """An `adder_int4_vanilla` checkpoint, checked against the kernel's shape."""
-    model = transformer.adder_int4_vanilla()
+    """An `adder_int4_wide` checkpoint, checked against the kernel's shape."""
+    model = transformer.adder_int4_wide()
     state = torch.load(path if os.path.isabs(path) else os.path.join(REPO, path),
                        map_location="cpu")
     model.load_state_dict(state)
@@ -391,7 +395,7 @@ def embed_int4(model, tok):
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--model-path", default="model/saved/int4_d64_f256_l4.pt")
+    ap.add_argument("--model-path", default="model/saved/int4_d128_f512_l4.pt")
     ap.add_argument("-n", "--problems", type=int, default=64,
                     help="addition problems to score (each is one ~2 s ISS run)")
     ap.add_argument("--seed", type=int, default=0)

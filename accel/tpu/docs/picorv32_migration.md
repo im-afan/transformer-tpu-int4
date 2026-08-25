@@ -1,763 +1,89 @@
-# Migrating the scalar unit to PicoRV32 + macro-op dispatch
+# PicoRV32 + macro-op dispatch — design record and measurements
 
-**Status: phases 0-5 are done, including the model. The scalar unit,
-`assembler.py`, `gen_vectors.py`, `torch_ref.py`, `pytpu.py` and every
-`examples/*.tpu` have been deleted — the CPU is the only producer, and
-[`../fw/adder.c`](../fw/adder.c) is the whole four-layer int4 model in 534
-commands and 1992 bytes of RISC-V, composed out of
-[`../fw/tpulib.h`](../fw/tpulib.h)'s size-independent primitives (§9.10). `adder_export.py` came back as the firmware
-kernel's host: it derives the requant table from a checkpoint, compiles the
-kernel natively against it, and scores the trace on `iss.py`. Phase 6 (a second
-architecture as a new `.c` file) is the remaining one.**
+The design record for how the TPU got its current control plane. The **ISA reference** is
+[macro_ops.md](macro_ops.md); this file is the reasoning and the numbers.
+
+## Status
+
+**Done.** The scalar unit, `assembler.py`, `gen_vectors.py`, `torch_ref.py`, `pytpu.py` and
+every `examples/*.tpu` are deleted. PicoRV32 firmware is the only command producer, and
+[`../fw/`](../fw/README.md) carries the whole model.
 
 | Phase | State |
 | --- | --- |
-| 0 | **done** - counters reworked (§9.5); `swait` supplemented by `idlec`/`qfull`/`ovlap` |
-| 1 | **done** - `cmd_queue.sv` + `cmd_{mxu,vpu,dma}.sv`; `scalar_unit.sv` packs its config registers into commands and pushes them |
-| 2 | **done** - scratchpad grants, VPU stall, DMA skid buffer + `sram.sv` backpressure, queue depth 8 |
-| 3 | **done** - no interpreter (§8.1): `fw/tpu.h` gains `-DTPU_TRACE`, `fw/mock/` emits the trace from a native build, `iss.py` gains `exec_command`/`run_trace`, `fw_vectors.py` turns a trace into golden images + an expected command trace, and `fw_matmul_tb.sv` monitors `p_cmd_*` and diffs both |
-| 4 | **done (RTL)** - `cpu_subsys.sv`: PicoRV32 + AXI4-Lite + the MMIO command aperture, alongside the scalar unit. The C toolchain now exists too (`../fw/`, §8): `matmul.c` (hardware tile walk) and `matmul_loop.c` (the same product, tile grid walked in C) are the kernels and `host/run_fw_matmul.py` runs either. Both **build** (Homebrew `riscv64-elf-gcc` 16.2.0, 248 and 352 bytes of the 16 KB) and both **pass in simulation** through `tb/fw_matmul_tb.sv` (`make fw`) — see §9.6. Not yet run on the board. |
-| 4 (rest) | **done** - `tpu.h` has builders for all three units (VPU + transposing DMA), and the model is written against them: `ffn.c`, `mha.c`, then `adder.c` — four transformer layers and the output head, 534 commands, 453 778 clocks, byte-exact against the ISS through `make fw FWPROG=adder`. Row-major weights swapped which attention operand needs the transpose; see that file's header |
-| 4 (library) | **done** - `fw/tpulib.h`: matmul, elementwise, transpose and block moves at any size, over operands in either memory. `adder.c` is composed out of it and no longer depends on the model fitting in 64 KB of scratchpad; `tiled.c` exercises the paths it does not take. §9.10 |
-| 5 | **done** - `scalar_unit.sv` and the whole tpulang toolchain deleted; `tpu_top.sv` has one producer, one S-port requester and no imem/cfg path; `iss.py` kept for its op bodies with the instruction decoder stripped |
-| 6 | not started - a second architecture as a new `.c` file and no RTL change |
+| 0 | **done** — counters reworked; `swait` supplemented by `idlec`/`qfull`/`ovlap` |
+| 1 | **done** — `cmd_queue.sv` + `cmd_{mxu,vpu,dma}.sv`; the scalar unit packed its config registers into commands and pushed them |
+| 2 | **done** — scratchpad grants, VPU stall, DMA skid buffer + `sram.sv` backpressure, queue depth 8 |
+| 3 | **done** — `-DTPU_TRACE` mock `tpu.h`, `iss.py` re-fronted onto command traces, RTL command-trace monitor, `fw_vectors.py` |
+| 4 | **done** — `cpu_subsys.sv`, then `tpu.h`, `tpulib.h` and the model kernels |
+| 5 | **done** — scalar unit and the whole tpulang toolchain deleted |
+| 6 | **done** — a second architecture (`infer.c`, KV-cached decode) as a new `.c` file, no RTL change |
 
-What passes today, on the tree as it stands:
+### What passes today
 
 | Test | Result |
 | --- | --- |
 | `make TEST=mxu` / `vpu` / `scratchpad` / `sram` | 208 / 357 / 50 / 4872 checks, 0 errors |
+| `make TEST=dma` | 16 737 checks, 0 errors |
+| `make TEST=cmd_queue` | 123 checks, 0 errors |
+| `make TEST=cpu_smoke` | 68 checks, 0 errors |
 | `make cosim` (the real host driver against the RTL) | 11 of 11 |
-| `make TEST=dma` (incl. new contention tests) | 16 737 checks, 0 errors |
-| `make TEST=cmd_queue` (new) | 123 checks, 0 errors |
-| ~~`make examples`~~ | **gone with phase 5** - the ten `.tpu` kernels and the assembler that built them were deleted. `make fw FWPROG=...` over the four C kernels is what covers the dispatch plane now |
-| ~~`make uart`~~ | **gone with phase 5** - it drove two assembled `.tpu` programs through `tpu_top_uart_tb.sv`. `make fwuart FWPROG=<kernel> RERUN=1` is the successor and covers the same "two runs, one link, no reset between" case |
-| `make TEST=cpu_smoke` (new) | 68 checks, 0 errors - PicoRV32 boots, pushes two DMA commands, 64-byte round trip byte-exact |
-| `make fw` - the C firmware through `tpu_top`, image via `FW_INIT`, golden vectors + expected command trace from the kernel's own native trace (§8.1) | **539 / 574 checks, 0 errors** on `matmul` / `matmul_loop`; halts after 2 210 / 2 587 clocks. Checks the DRAM image *and* the command stream, 5 / 12 commands matched |
-| `make fw FWPROG=ffn` / `mha` | 0 errors - the feed-forward block and one attention head, the first VPU and transposing-DMA commands from firmware |
-| `make fw FWPROG=adder` - **the whole model** | **526 959 checks, 0 errors**, halts after 453 778 clocks; 534 of 534 commands matched |
-| `make fw FWPROG=tiled` - `tpulib.h` past the scratchpad | **525 474 checks, 0 errors**, 80 404 clocks, 237 of 237 commands matched, and the ISS's answer checked against an independent Python matmul |
-| ~~`make model [LAYERS=n]`~~ | **gone with phase 5** - `tpu_top_tb.sv` drove the scalar unit. `make fw FWPROG=adder` replaces it and checks strictly more (the command stream as well as the image) |
-| `make fwuart FWPROG=<kernel>` - the same kernels with **nothing backdoored**: image, operands and results all over the simulated UART (§9.11) | 0 errors on every kernel; **`adder`: 531 102 checks, 534/534 commands, and a counter block identical to `make fw`'s** (`run=453 777 mxu=206 361 vpu=84 352 dma=131 200 idlec=31 864`) |
-| `make fwsweep` - both kernels over 11 shapes, vectors regenerated per shape | 22 of 22, 0 failures (largest: 260 commands) |
+| `make fw` / `FWPROG=matmul_loop` | 539 / 574 checks, 0 errors; 2 210 / 2 587 clocks |
+| `make fw FWPROG=ffn` / `mha` | 0 errors — first VPU and transposing-DMA commands from firmware |
+| `make fw FWPROG=tiled` | 525 474 checks, 0 errors, 80 404 clocks, 237/237 commands, ISS checked against an independent Python matmul |
+| `make fw FWPROG=adder` | 526 959 checks, 0 errors, 453 778 clocks, 534/534 commands |
+| `make fwuart FWPROG=<kernel>` | 0 errors on every kernel; `adder` 531 102 checks, counter block identical to `make fw`'s |
+| `make fwsweep` | 22 of 22, 0 failures |
 | `make all` | 15 of 15 |
-| `make fw FWPROG=spadwin` / `FWPROG=infer` - the CPU's scratchpad window, and the model as prefill + KV-cached decode (§9.12) | **not run** - written where there was no RISC-V gcc and no Icarus new enough for this tree. Both pass on the ISS against independent references (4 and 4606 commands), and `infer_export.py` scores the second at 100.00% exact-sequence *generating* on a real checkpoint |
 
-`make examples` is the one that matters most: between them the ten kernels cover
-every path a dispatch can take through the new plane - single-tile `matmul`,
-software tiling, the hardware tile loop and its config strides, `vecmatmul` and
-its geometry command (both since removed), runtime `setcfgr`, the transposing
-DMA, and DRAM above 64 KB. All byte-identical to what `iss.py` produced, unmodified.
+`make fw FWPROG=spadwin` / `FWPROG=infer` were written on a machine with no RISC-V gcc and
+an Icarus too old for this tree, so the ISS and their independent references are what stands
+behind them.
 
-Two make targets were added for this, and they are the loop worth using:
-`make examples` (all ten kernels, a few minutes) and `make model [LAYERS=n]`
-(the whole adder kernel; `LAYERS=1` is ~182 k clocks and exercises every code
-path the shipped four-layer one does). A long run prints nothing until it halts,
-so `tpu_top_tb` also gained `+HEARTBEAT` — a frozen PC with a unit stuck busy is
-a hang, a moving one is just slow. That distinction is not academic: it is what
-localized the one real bug found during this work, a broken tile loop that
-looked exactly like a slow simulation for forty minutes.
+## Why
 
-### What the command plane actually cost
+Three limits, none of them hardware:
 
-The four-layer run is the like-for-like comparison against §0's baseline, same
-program, same vectors, same 8x8 geometry:
+- **No compiler.** The retired `adder_model.tpu` was 901 lines for one model, and `pytpu.py`
+  was 528 lines of staged emitter to make that writable.
+- **Global config registers.** Sizes came from `setcfg` state, so stale config was the most
+  common silent bug in a program, and the units read it at `start`.
+- **Issue-and-wait.** A dispatch parked the producer until the unit reported done, so
+  nothing ever overlapped.
+
+The fix for all three is the same: a self-contained 128-bit command in a per-unit queue,
+pushed by a CPU running C.
+
+## Measurements
+
+### The command plane cost +0.35%
+
+Like-for-like on the four-layer ternary model, same program, same vectors, same 8x8 geometry:
 
 | | baseline | with the command plane | delta |
-| --- | --- | --- | --- |
+| --- | ---: | ---: | ---: |
 | run | 690 705 | **693 107** | **+2 401 (+0.35%)** |
-| MXU | 405 433 | 404 409 | -1 024 |
-| VPU | 52 160 | 51 648 | -512 |
+| MXU | 405 433 | 404 409 | −1 024 |
+| VPU | 52 160 | 51 648 | −512 |
 | DMA | 226 198 | 227 820 | +1 622 |
-| residual = issue overhead | 6 914 (1.00%) | **9 229 (1.33%)** | +2 315 |
+| issue overhead | 6 914 (1.00%) | **9 229 (1.33%)** | +2 315 |
 
-Read that as three separate effects, because they pull in different directions:
+Three effects pulling in different directions:
 
-- **Issue overhead is +2 315 clocks**, from 1.00% of the run to 1.33%. That is
-  the real cost of the plane: a dispatch now spends a clock in `S_PUSH` per
-  command (two for a matmul, which pushes geometry as well), plus two more in
-  `S_RQRD`/`S_RQLATCH` when its `{m0,n}` operand is an address, plus a clock in
-  the unit's front end. It is smaller than §9's estimate for the *CPU* producer
-  (~2.7%) for the obvious reason: the scalar unit packs a command from registers
-  in one clock, where firmware pays four stores.
-- **The units got faster**, by 1 536 clocks between them, because the requant
-  literal deleted a scratchpad round trip from every requantizing dispatch.
-- **The DMA got slower**, by 1 622 clocks, because a fill now drains its skid
-  buffer before the range is declared finished. That is the price of being able
-  to overlap at all, and it is paid per range — which is why the transposing
-  transfers (one range per row) carry most of it.
+- **Issue overhead is +2 315 clocks.** A dispatch spends a clock pushing per command (two
+  for a matmul, which pushes geometry as well), plus a clock in the unit's front end.
+- **The units got faster** by 1 536 clocks, because the requant literal deleted a scratchpad
+  round trip from every requantizing dispatch.
+- **The DMA got slower** by 1 622 clocks, because a fill drains its skid buffer before the
+  range is declared finished. That is the price of being able to overlap at all, paid per
+  range — which is why the transposing transfers (one range per row) carry most of it.
 
-Net **+0.35%**, byte-identical output. That is the number to hold against the
-~1.45x that §9.3 says the overlap is worth, none of which is claimed yet: the
-scalar unit still waits after every dispatch, and `ovlap` reads 0.
+Byte-identical output. Hold that against the ~1.45x the overlap is worth, none of which was
+claimed at that point: `ovlap` read 0.
 
-**One measured side effect worth recording.** `tiled_matmul_hw` (two matmuls)
-spends 578 clocks in the MXU against the 582 in `macro_ops.md` §8's phase-0
-table. The 4 clocks are exactly the two states per requantizing matmul that the
-`{m0,n}` literal deleted - the array no longer stops to fetch its requant word
-over the C port before draining the result buffer.
+### The whole model on the C producer
 
-Two measurements worth recording from the UART run, because they are what says
-phase 1 preserved the old behaviour: `ovlap = 0` and `qfull = 0` on both
-programs. The scalar unit still waits after every dispatch, so no two units ever
-run at once and the queue never backs up - the command plane is in the path and
-is provably not yet being used for anything. `idlec` reads 92 of 526 clocks on
-`relu_layer`, which is exactly `run - (mxu + vpu + dma)`.
-
-**What is deliberately still true:** the tpulang ISA is unchanged. Same opcodes,
-same config registers, same programs, same golden vectors, same `iss.py`. The
-config file did not go away - it moved from being *read by the units* to being
-*packed into commands by the producer*, which is what removes the stale-config
-hazard while leaving every existing program running.
-
-Goal: write kernels for model architectures other than the adder in a real language, without
-writing a compiler. Replace `scalar_unit.sv` with a PicoRV32 core; replace the global config
-register file with self-contained 128-bit macro-ops the CPU pushes into per-unit command
-queues over AXI4-Lite.
-
-This supersedes [`macro_ops.md`](macro_ops.md) §1's rejection of PicoRV32 ("it costs LUTs we
-don't have at 92% utilization and replaces the working, bit-exact `iss.py` chain"). The first
-premise is stale — the design is **13 342 of 20 800 LUTs (64%)** today, not 92%
-([`synth.md`](synth.md) §5). The second is still live and §8 is the answer to it.
-
----
-
-## 0. The numbers, up front
-
-Measured baseline, four-layer adder model through `tpu_top_tb`
-(`../../tpulang/adder_kernel.md` §7.7):
-
-| | clocks | share |
-| --- | --- | --- |
-| whole run | 690 705 | 100% |
-| MXU | 405 433 | 58.7% |
-| DMA | 226 198 | 32.8% |
-| VPU | 52 160 | 7.6% |
-| **residual = scalar unit issuing instructions** | **6 914** | **1.0%** |
-
-The residual is the interesting one. The scalar unit's FSM is `FETCH → DECODE → EXEC`, three
-clocks per instruction, so 6 914 clocks is **≈2 300 dynamic instructions** — which
-independently matches a hand count of the kernel (≈563 per layer × 4, plus prologue). Of
-those, ≈540 are dispatches and ≈1 760 are `li`/`adds`/`cmps`/`blt`/`setcfg` overhead.
-
-Estimated after migration (§9 shows the arithmetic):
-
-| | clocks | share of run |
-| --- | --- | --- |
-| CPU issue, today | 6 914 | 1.0% |
-| CPU issue, PicoRV32 + 128-bit macro-ops | **≈19 000** | **2.7%** |
-| ...worst topology (fetch also over AXI4-Lite) | ≈29 000 | 4.0% |
-
-**So instruction overhead costs 1–3% of the run, and the queue that the overhead pays for is
-worth ≈1.5× (§9.3).** That asymmetry is the whole argument. It inverts at `T=1` decode, which
-is where the format width starts to matter (§9.4).
-
----
-
-## 1. What binds today
-
-Three limits, none of which are hardware:
-
-| Limit | Value | Where it bites |
-| --- | --- | --- |
-| Instruction memory | 1024 words | one pre-macro-op quantized layer was 861 of them |
-| Scalar registers | 31, no spilling | `gen_adder_model.py` peaks at **29 of 31** live in the head loop |
-| No compiler | — | `adder_model.tpu` is 901 lines for one model; `pytpu.py` is 528 lines of staged emitter to make that writable |
-
-The current kernel is 226 words, so IMEM is not binding *for this model*. It binds again for
-anything with more structure — MoE, GQA with `heads_per_q > 1`, a KV cache, more than one
-attention variant in one program.
-
-Global config registers are the other tax. 18 assigned indices, **62 static `setcfg` in
-`adder_model.tpu`**, and the failure mode is silent: `macro_ops.md` §4.0 records a real bug
-where one program's leftover `arow`/`crow`/`wcol` corrupted the next program's plain `matmul`.
-The fix there was a second opcode (`matmul_t`) that ignores the registers — a workaround for
-global mutable state, not a removal of it.
-
-What C buys, concretely: gcc does register allocation and the stack, so the 31-register
-ceiling goes away; 16 KB of firmware is ~4 000 RV32I instructions against 1024 words today;
-functions and structs make `linear()`, `attention_head()`, `dyt_residual()` reusable across
-kernels; and the "compiler" the project has to maintain is a ~200-line MMIO header.
-
----
-
-## 2. Scope
-
-**Removed.** The config-register inputs on `mxu.sv` / `vpu.sv` / `dma.sv`, and the
-scratchpad round trip for the requant `{m0,n}` word (`mxu.sv` lost two FSM states,
-`vpu.sv` lost two). `scalar_unit.sv` and its config file survive as a *producer* —
-phase 5 retires them, and until the firmware toolchain exists they are what keeps
-the `.tpu` suite running.
-
-**Added.** PicoRV32 + firmware BRAM, an AXI4-Lite fabric, one command decoder + queue per
-unit, a status/sync block, a scratchpad AXI window, and backpressure on the scratchpad's
-arbitrated ports (§5).
-
-**Unchanged.** The PE array, the VPU lane datapath, the requant fixed point, `sram.sv`,
-`dma.sv`'s range engine, the scratchpad's banking, the UART link, and **every numeric
-convention in `isa.md` §A.5** — ternary packing, `{m0,n}`, the int8/int32 stride contract.
-The units keep their existing `start`/`busy`/`done` handshakes; only where their operands come
-from changes.
-
-**Out of scope.** The inter-TPU LINK, changing the array geometry, and any change to what the
-model computes.
-
----
-
-## 3. The macro-op format
-
-One **128-bit command**, four RV32 stores, uniform across all three units. §9.2 prices the
-alternatives; uniform 128 costs about 1% of total runtime against a tightly packed
-variable-width encoding, and is worth it.
-
-A command is four 32-bit words, `word0` first: `cmd[31:0]`, `cmd[63:32]`, `cmd[95:64]`,
-`cmd[127:96]`. The header lives in the **low** bits of `word0`, not the high bits of the
-128 — so a producer builds it with an `ori` against a small constant rather than a shift,
-and the first store carries it:
-
-| `word0` bits | Field | Meaning |
-| --- | --- | --- |
-| 7..0 | `op` | command selector, per-unit namespace |
-| 15..8 | `flags` | `.acc` / `.rq` / `tiled` / `write` / `.t`, per op |
-| 31..16 | — | the first operand field (an address, in every command that has one) |
-
-As built (`cmd_mxu.sv`, `cmd_vpu.sv`, `cmd_dma.sv`):
-
-| Command | `op` | `word0[31:16]` | `word1` | `word2` | `word3` |
-| --- | --- | --- | --- | --- | --- |
-| `MXU_GEOM` | `0x01` | `arow` | `wcol:crow` | `tlen(6) : ntiles(8) : ktiles(8)` | — |
-| `MXU_MM` | `0x02` | `out` | `wgt:act` | `{n,m0}` | — |
-| `VPU_OP` | `0x01` | `dst` (`flags[4:0]` = the `VOP_*` code) | `src1:src0` | `{n,m0} : vlen(10)` | — |
-| ~~`VPU_GEOM`~~ | `0x02` | *retired with `vecmatmul` — `vrows`, `vrow0:vcols`, `vcrow:vrow1`* | | | |
-| `DMA_MOVE` | `0x01` | `spad` (`flags[0]`=write, `flags[1]`=`.t`) | `dram(19)` | `tcols:len` | `tdrow:tsrow` |
-
-An unknown `op` is discarded with a simulation message rather than executed, so a stale
-command stream fails loudly instead of running the wrong instruction — the same principle
-as the ISA's retired-opcode holes.
-
-Three things fall out of the current ISA:
-
-**The requant word travels in the command, not in the scratchpad.** `{m0,n}` is 12 + 4 = 16
-bits, exactly the width of the scratchpad address that currently points at it. Same command
-budget, one less indirection, one less scratchpad read per dispatch — and it deletes the `RQW`
-block, the 16 words the host stages per layer, and every `li rq_word` in the kernel.
-
-**MXU geometry does not fit alongside MXU addresses.** Full field count for a `matmul_t` is
-`op/flags` + three 16-bit addresses + `{m0,n}` + `tlen`/`ktiles`/`ntiles` +
-`arow`/`crow`/`wcol` = **146 bits**. Squeezing to 128 needs 12-bit strides and 6-bit tile
-counts and lands at exactly 128 with zero margin, which is not worth doing. Split it instead:
-
-| Command | Fields | Used |
-| --- | --- | --- |
-| `MXU.GEOM` | `tlen`(6), `ktiles`(8), `ntiles`(8), `arow`(16), `crow`(16), `wcol`(16) | 70 of 112 |
-| `MXU.MM` | `out`(16), `act`(16), `wgt`(16), `{m0,n}`(16), flags `.acc`/`.rq` | 64 of 112 |
-| `VPU.OP` | `dst`(16), `src0`(16), `src1`-or-`{m0,n}`(16), `vlen`(10) | 58 of 112 |
-| `DMA.MOVE` | `spad`(16), `dram`(19), `len`(16), `tcols`(16), `tsrow`(16), `tdrow`(16) | 99 of 112 |
-
-`VPU.OP` needed a second entry only for `vecmatmul` (`vrows`/`vcols`/`vrow0`/`vrow1`/`vcrow`
-= 80 more bits), carried by a `VPU.GEOM` companion on the same pattern as the MXU's rather
-than as a special case in the fast path. **That op has since been removed** (`vpu.md`
-§Removed ops), and `VPU.GEOM` with it, so every VPU command is now the short form and the
-unit has exactly one command type.
-
-**Sticky geometry is queue state, not global state — and that is the actual fix.** `MXU.GEOM`
-persists until the next one, but it flows through the MXU's own in-order queue, so its scope
-is a position in that unit's command stream rather than a register any other unit or any
-earlier program can have written. The C driver caches the last geometry it emitted and skips
-the `GEOM` command when nothing changed; in the current kernel that collapses 14 matmuls to
-**10 GEOM + 14 MM per layer** (the three QKV projections share one geometry, and `Wo`/`W1`/`W2`
-reuse it after the head loop).
-
-The staleness check therefore lives in ~10 lines of the driver header, where it is testable,
-instead of in the programmer's head — which is where `macro_ops.md` §4.0's bug lived.
-
-**Commit-on-last-word.** Each unit's command port is a 4-word aperture; the write to offset
-`0xC` enqueues. Four stores are atomic with respect to the queue with no separate trigger
-store, and a partial write is detectable.
-
----
-
-## 4. Queues and synchronization
-
-One FIFO per unit, depth 4–8 entries. **A full queue stalls the store** (native `mem_ready`
-low / AXI `BVALID` withheld), so flow control needs no software check — the CPU throttles
-itself naturally and only *data* dependencies need explicit waits.
-
-Sync is by sequence number, not by "is the unit idle":
-
-| Register | Meaning |
-| --- | --- |
-| `ISSUED[unit]` | commands accepted into the queue |
-| `RETIRED[unit]` | commands completed |
-| `SPACE[unit]` | free entries (advisory; the stall is the real mechanism) |
-
-Waiting is `while (RETIRED[u] < my_seq);` — poll cost is `lw` + `bltu` ≈ 8 clocks. Waiting on
-a *specific* command rather than on unit idleness is what makes double-buffering expressible:
-"start the DMA for layer L+1's weights, then wait only for the DMA that filled layer L's."
-
-**Every cross-unit dependency becomes software's responsibility.** Issue-and-wait made them
-automatic; queues do not. Two mitigations, both cheap:
-
-- The driver ships a **strict mode** where each dispatch is followed by its own wait. A kernel
-  in strict mode is cycle-for-cycle equivalent to today's model, so it is the bring-up
-  configuration and the correctness baseline; relaxing it is a separate, measurable step.
-- A **sim-only range tracker** in `tpu_top_tb`: record the scratchpad byte range each command
-  writes, and assert on a read that overlaps an in-flight write from another unit. This is the
-  same shape as the exclusivity assertion `scratchpad.sv` already carries, and it catches the
-  entire class of bug at the point of failure rather than as a wrong logit.
-
----
-
-## 5. The scratchpad exclusivity invariant is the real blocker
-
-`scratchpad.sv`'s header states it plainly: six readers are muxed onto one read port and four
-writers onto one write port by fixed priority, with **no stall handshake**, and this is exact
-only because
-
-> the scalar unit is issue-and-wait: a dispatch op parks it in `S_WAIT` until the unit reports
-> done, so MXU, VPU and DMA activity never overlaps.
-
-Queues delete that premise. There is a simulation assertion that will fire loudly, which is
-the good case; the bad case is silently dropped accesses on hardware.
-
-What overlap actually needs:
-
-- Reads and writes are separately arbitrated, and the case that matters most — a DMA **fill**
-  (writes) behind MXU **streaming** (`A_rd`/`W_rd` reads) — collides only on the MXU's `C`
-  writeback cycles. A DMA **spill** reads and collides directly.
-- `dma.sv` touches the scratchpad **once per byte** (`FILL` drains `sram_dout`, `SPILL_RD`
-  addresses one byte), so its port occupancy during a transfer is high, not sparse.
-- The DMA can absorb a stall — it is already gated on a 1 byte/clock SRAM handshake — but
-  `sram_dout_valid` has no `ready`, so absorbing one needs a small skid buffer.
-
-Recommendation: **give MXU and VPU un-stallable priority, add a grant handshake to the DMA and
-scalar/CPU ports only, and put a 2–4 entry skid buffer in `dma.sv`.** MXU and VPU FSMs are
-untouched. Estimated 150–300 LUTs. This is a prerequisite for the §9.3 win, and it is worth
-doing on its own merits even without the CPU change.
-
----
-
-## 6. PicoRV32 instantiation and bus topology
-
-Core config (`picorv32` parameters):
-
-| Parameter | Setting | Why |
-| --- | --- | --- |
-| `BARREL_SHIFTER` | 1 | shifts drop from 4–14 clocks to 3; address math uses them constantly |
-| `ENABLE_FAST_MUL` | 1 | DSP multiplier; the alternative is 40 clocks per `mul`, and tile-offset math multiplies |
-| `ENABLE_DIV` | 0 | no kernel needs it |
-| `ENABLE_COUNTERS` | 1 | `rdcycle` gives the firmware self-profiling for free |
-| `COMPRESSED_ISA` | 1 | ~30% smaller firmware; costs LUTs — make it the first thing dropped if area is tight |
-| `ENABLE_IRQ` | 0 | polling `RETIRED` is simpler and the latency does not matter |
-| `ENABLE_REGS_DUALPORT` | 1 | default; do not turn off |
-
-Two topologies. The difference is ~2% of total runtime (§9.2), so start with the simple one.
-
-**A — `picorv32_axi`, everything on one AXI4-Lite bus.** Firmware RAM, command ports, status
-block and the scratchpad window are all AXI4-Lite slaves. Simplest, matches the request, one
-interface to document. Cost: every instruction fetch pays the AR/R handshake, so CPI goes from
-~4 to ~6.
-
-**B — native `picorv32` + tightly coupled RAM + a native→AXI4-Lite bridge on the MMIO
-aperture.** Fetch and data at zero wait states; only the ~4 stores per dispatch see AXI. Costs
-one small bridge and one address decoder.
-
-Recommendation: **build A, keep B in the back pocket.** Switch when the starvation counter
-(§9.5) says CPU issue is over ~10% of the run — i.e. when decode or a faster datapath makes it
-matter, not before.
-
-Address map:
-
-| Base | Size | Contents |
-| --- | --- | --- |
-| `0x0000_0000` | 16 KB | firmware: code + data + stack, BRAM, host-loadable |
-| `0x8000_0000` | 16 B | MXU command port (commit on `+0xC`) |
-| `0x8000_0100` | 16 B | VPU command port |
-| `0x8000_0200` | 16 B | DMA command port |
-| `0x8000_0300` | 64 B | `ISSUED`/`RETIRED`/`SPACE` per unit, `DONE`, perf counters |
-| `0x9000_0000` | 64 KB | scratchpad, 32-bit word window onto the existing `S_rw` port |
-
-The scratchpad window replaces `loads`/`stores` and is worth more than the instruction it
-replaces: it lets a kernel compute requant words at run time, read back a reduction, and
-— with an argmax loop in C — end the program with a token id instead of 2 KB of int32 logits.
-Embedding lookup could follow, which would remove the host from the decode loop entirely.
-
-A DRAM window is deliberately **not** mapped. The SRAM is byte-wide at 1 clock/byte; CPU
-access to it would be a trap. DRAM stays the DMA's.
-
----
-
-## 7. Host protocol and boot
-
-The UART protocol survives almost intact ([`uart_host.md`](uart_host.md), `uart_interface.sv`):
-
-| Command | Today | After |
-| --- | --- | --- |
-| `'I'` | write instruction BRAM, 10-bit address | **13-bit** word address: 12 index bits + `boot_pc[12]` selecting IMEM or firmware RAM |
-| `'G'` | pulse `host_run` with `boot_pc` | same bit selects; set = release CPU reset. As built the reset vector is the fixed `PROGADDR_RESET = 0`, so the index bits are ignored for the CPU |
-| `'R'`/`'W'` | SRAM read/write while idle | unchanged |
-| `'T'` | perf counter block | unchanged shape, different counters (§9.5) |
-
-`done` comes from `ebreak` → PicoRV32's `trap` output, latched. The core is held in reset
-while `!busy`, which preserves the existing "host may only touch memory while idle"
-arbitration in `tpu_top.sv` unchanged.
-
-One regression to expect: 16 KB of firmware at 115 200 baud is ~1.4 s to load, against ~80 ms
-for 226 words today. Load only the used portion (the `.bin` length, not the whole aperture)
-and the edit loop stays interactive.
-
----
-
-## 8. Toolchain and verification
-
-This is the part `macro_ops.md` §1 was right to worry about. `iss.py` is bit-exact with the
-RTL and `gen_vectors.py` turns it into the golden vectors `tb/` replays; a RISC-V core cannot
-be modelled by `assembler.py` + `iss.py` as they stand.
-
-**Move the verification contract from the instruction stream to the command stream.** The
-macro-op trace — the ordered list of 128-bit commands per unit — becomes the ISA boundary.
-Three producers must agree on it:
-
-1. **The firmware kernel, compiled natively against a mock `tpu.h`.** Not an RV32IM
-   interpreter — see §8.1. `tpu.h` already funnels every MMIO access through two inline
-   functions, so `-DTPU_TRACE` swaps those for a trace emitter and the *actual* `.c` source
-   becomes the producer, with its real control flow, compiled by the host compiler.
-2. **`iss.py`, re-fronted.** Its `_matmul` / `_vpu` / `_dma` bodies are the golden numerics and
-   are kept **verbatim**; only the decode front end changes, from 32-bit words to 128-bit
-   commands. The scratchpad/DRAM images it produces are unchanged in meaning.
-3. **RTL.** A sim-only monitor on the arbitrated command write (`tpu_top.sv`'s `p_cmd_*`,
-   which is where both producers converge) dumps the trace from the testbench.
-
-`gen_vectors.py` becomes 1 → 2 → expected images, as before. `tpu_top_tb` then checks *two*
-things instead of one: the memory image, and 3 against 1. That second check is strictly new
-capability — a mismatch localizes immediately to either the CPU/firmware or the datapath,
-which is a better debug loop than the current one, not a worse one.
-
-`torch_ref.py` and `adder_export.py` are unaffected: they compare final tensors, not
-instructions.
-
-### 8.1 Why there is no RV32IM interpreter
-
-The original plan here was a ~400-line Python RV32IM interpreter that would run the firmware
-image and capture its MMIO stores. It was dropped, and the reasoning is worth keeping because
-it applies to anything else that wants to "model the CPU".
-
-**The interpreter solves a problem you only have if you insist the producer must be a
-binary.** The command stream is a pure function of the kernel's control flow, and that control
-flow is ordinary C — `matmul.c` is integer arithmetic and five builder calls. Every
-target-specific thing in the whole firmware lives in two inline functions:
-
-| `tpu.h` | native build does |
-| --- | --- |
-| `tpu_push` (four volatile stores) | append `(unit, w0, w1, w2, w3)` to a trace |
-| `tpu_wait` (two volatile loads + spin) | emit a barrier marker |
-| `TPU_DONE` | nothing |
-
-Everything else — `tpu_dma`, `tpu_mxu_geom`, `tpu_mxu_mm`, and every builder added later — is
-plain arithmetic over `uint32_t` and comes along for free. `uint32_t` wraps identically on
-x86-64 and RV32, and device addresses are `uint32_t` rather than pointers, so the arithmetic
-matches without an ABI argument.
-
-**A hand-written Python mirror of each kernel was considered and rejected** for the same
-reason the interpreter was: it puts a transcription between the source and the test. Two
-implementations maintained by one person drift, and if the mirror is written by reading the C
-then a misunderstanding of intent is duplicated into both — the two "independent" producers
-agree on the bug and the test passes. Compiling the real `.c` has the simplicity of the mirror
-with none of the drift, and it preserves phase 6's promise: a new architecture stays *one* new
-`.c` file, not a `.c` plus a `.py`.
-
-**What this gives up**, honestly: RV32-specific execution semantics. A `div` under
-`ENABLE_DIV(0)`, a stack overflow, a linker-script mistake — native compilation runs all of
-those happily where the core faults. Every one is loud in the RTL run (a trap halts the core,
-a bad image fails the compare), so they are *detected*; they are just localized less precisely
-than an interpreter would. That is the trade: sharp diagnosis of rare bugs, for deleting 400
-lines and a class of drift.
-
-**What must not be dropped with it** is producer 3. The interpreter's real payoff was never
-"run the firmware" — it was the command-by-command diff that localizes a failure to
-producer-vs-datapath. That benefit is orthogonal to how the reference trace is produced, so it
-survives here for free, but only if the RTL monitor is built and the reference emits a
-*trace*, not just final images. A reference that emits images only puts you back in the
-pre-phase-3 debug loop: image mismatch, no idea which command.
-
-What dies: `assembler.py` (618 lines), `pytpu.py` (528), the `.tpu` language, every
-`examples/*.tpu` and its golden vectors, and `isa.md` §§3–6 and A.2–A.4. That is the honest
-price and it should be paid deliberately — see the phase plan, which keeps the scalar unit
-alive alongside PicoRV32 through phase 4 precisely so the existing suite stays a live
-regression while the new path is proven.
-
-In the tree: `accel/tpu/fw/` — `start.S`, `link.ld`, `tpu.h` (the MMIO aperture and one
-builder per command), `bin2hex.py`, one `.c` per kernel, and a Makefile that autodetects
-the cross prefix. `riscv-none-elf-gcc` (xPack) works on Windows and macOS; Homebrew's
-`riscv64-elf-gcc` is the shorter path on macOS and is what the images in the tree were
-built with (16.2.0, binutils 2.47, `brew install riscv64-elf-gcc`, bottled — no source
-build). Nothing outside the compiler is needed: `-nostdlib` means the newlib the formula
-drags along is never linked, so the multilib set does not matter either.
-
-The `-march` is **`rv32ic_zmmul`**, not `rv32imc`: `cpu_subsys.sv` builds the core with
-`ENABLE_FAST_MUL(1)` but `ENABLE_DIV(0)`, so `mul` is real and `div`/`rem` decode as an
-illegal instruction and trap. `-mabi=ilp32 -nostdlib -ffreestanding`, no libc and no
-libgcc — a kernel that wants division needs the RTL parameter first. (A gcc older than 12
-has no `zmmul`; `rv32ic` works there if the kernel multiplies nothing at run time.)
-
-Two kernels so far, on the same `[8x32] @ [32x16]` problem and the same addresses, so
-`host/run_fw_matmul.py` checks either: `matmul.c` issues one `MXU_MM` with `tiled` and
-`ktiles/ntiles = 4/2`, and `matmul_loop.c` walks that grid in C as 8 single-tile
-dispatches, `.acc` across the contraction. The pair mirrors
-`examples/tiled_matmul_hw.tpu` vs `examples/tiled_matmul.tpu`, and is the cheapest way to
-measure what the hardware tile loop buys once the producer is a CPU — the software version
-pays 8 dispatch issues plus an int32 C round trip through the scratchpad per contraction
-tile, against one issue and one store per output tile. `matmul_loop.c` still sets the
-`tiled` flag: it selects the configured strides over the single-tile constants, and at
-counts of 1 the hardware loop runs one pass. Neither has been executed yet.
-
----
-
-## 9. Performance notes — instruction overhead
-
-### 9.1 Where the estimate comes from
-
-Per-layer dispatch inventory of `adder_model.tpu`, counted from the source:
-
-| Unit | dispatches / layer | clocks / layer | clocks per dispatch |
-| --- | --- | --- | --- |
-| MXU | 14 | ≈101 358 | ≈7 240 |
-| VPU | 112 | ≈13 040 | ≈116 |
-| DMA | 9 | ≈56 550 | ≈6 283 |
-| **total** | **135** | ≈170 950 | |
-
-PicoRV32's published cycle counts: ALU reg/imm and not-taken branch 3, taken branch 5, load 5,
-store 5, `jal` 3, `jalr` 6 — average CPI ≈ 4. *Verify these against the version you vendor
-in.*
-
-Cost of one 128-bit command = 4 stores (5 clocks each) plus operand setup. In a chunk loop
-three of the four words are loop-invariant and live in registers, so the body is 4 `sw` + one
-`addi` ≈ 23 clocks; straight-line sites that materialize constants are ≈32. Use ≈26.
-
-| Per layer | commands | clocks |
-| --- | --- | --- |
-| MXU (10 `GEOM` + 14 `MM`, after driver caching) | 24 | ≈770 |
-| VPU | 112 | ≈2 900 |
-| DMA | 9 | ≈290 |
-| loop counters, pointer math, branches (~250 instr @ 3.5) | — | ≈875 |
-| **total** | 145 | **≈4 650** |
-
-Four layers plus prologue/epilogue ≈ **19 000 clocks**, against 6 914 today. **2.7× more issue
-cycles; 1.0% → 2.7% of the run; +1.8% wall clock under strict mode.**
-
-### 9.2 What the format choices cost
-
-| Choice | Δ clocks | Δ run |
-| --- | --- | --- |
-| uniform 128-bit vs. a packed 64-bit VPU short form | +5 700 | +0.8% |
-| MXU without driver-side geometry caching (24 → 28 commands/layer) | +400 | +0.06% |
-| AXI4-Lite store handshake, +2 clocks per store (topology A vs B) | +4 600 | +0.7% |
-| AXI4-Lite instruction fetch, CPI 4 → 6 (topology A vs B) | +10 000 | +1.4% |
-
-Every row is under 1.5%. **The simplest version of every choice is affordable at this
-arithmetic intensity** — which is the useful conclusion, because it means the design can be
-built the obvious way and optimized later against a measurement rather than a guess.
-
-The one row worth taking anyway is geometry caching: it costs ~10 lines of driver and removes
-a whole class of "did I set `crow` for this dispatch?" bug.
-
-### 9.3 What the queue buys — the reason to do this
-
-DMA is **226 198 clocks, 32.8% of the run, entirely serialized behind compute** because
-issue-and-wait cannot express anything else. Per layer, DMA (56 550) is smaller than MXU
-(101 358), so with a command queue and a double-buffered weight window nearly all of it hides:
-
-| | clocks | |
-| --- | --- | --- |
-| today | 690 705 | |
-| DMA fully hidden behind MXU+VPU | ≈458 000 | **1.51×** |
-| ...minus the ≈19 000 of CPU issue | ≈477 000 | **1.45×** |
-
-Three preconditions, all real:
-
-- Scratchpad backpressure (§5). Without it, overlap is silent corruption.
-- A second weight window: `WBUF` is 12 288 bytes and the scratchpad map runs to `0xCC40`,
-  leaving ~13.2 KB free — just enough, with nothing to spare. Fetching `Wq`/`Wk`/`Wv`
-  separately instead of as one 12 KB block relaxes it.
-- The kernel has to actually issue the prefetch and wait on the right sequence number. This is
-  the part that is now expressible and was not before.
-
-**Instruction overhead costs 1–3%; the mechanism that adds it is worth ~45%.**
-
-### 9.4 Where the overhead stops being second-order
-
-Issue cost is per-dispatch and roughly constant; unit work scales with the tensor. So the
-ratio moves against the CPU whenever tensors shrink or the datapath speeds up:
-
-| Regime | CPU share of run |
-| --- | --- |
-| today, `T=32` prefill | ≈2.7% |
-| datapath 4× faster (bigger array, faster DMA) | ≈11% |
-| `T=1` incremental decode | ≈5–8%, and rising with kernel bookkeeping |
-
-Decode is the interesting one. VPU dispatches per layer fall 112 → ~14 (the chunk loops go
-from 8 iterations to 1) and MXU work collapses toward the weight-load bound — `macro_ops.md`
-§9.3 puts decode MXU utilization at ≈`1/(ROWS+COLS)` ≈ 6%. Issue cost falls much less than the
-work does. The tightest issue-rate case is already visible today: a VPU dispatch is ≈116
-clocks of work against ≈26 clocks of issue, only **4.5× headroom**, and that is the one place
-where a short command form or a deeper queue would earn its keep. MXU has 113× headroom and
-never will.
-
-### 9.5 What to measure
-
-`perf_counters.sv` keeps working — it watches unit `busy` signals, not the scalar unit. But
-`su_wait_cycles` becomes meaningless and should be replaced by the counter that actually
-answers this section's question:
-
-| Counter | Answers |
-| --- | --- |
-| `starved[unit]` — unit idle **and** its queue empty | is the CPU keeping up? this is *the* instruction-overhead metric |
-| `qfull[unit]` — CPU stalled on a full queue | is the queue deep enough? |
-| `overlap` — cycles with ≥2 units busy | is the §9.3 win being realized? |
-
-**`qfull` as built does not answer its question.** `tpu_top.sv` samples
-`p_cmd_we & p_cmd_full`, but *both* producers already gate their own write enable with
-`!cmd_full` — `scalar_unit.sv:522` and `cpu_subsys.sv:177` — so the term is unsatisfiable
-and the counter reads 0 by construction, not by observation. Every "`qfull = 0`" in this
-document is therefore evidence of nothing. The fix is to sample the stall rather than the
-accepted write (`state == S_PUSH && cmd_full`, and the equivalent commit-pending term in
-`cpu_subsys`); until then, use the queue level or `idlec` and treat `qfull` as unwired.
-
-Plus `rdcycle` in the firmware, which makes per-section timing a `printf`-free two-line
-measurement inside the kernel.
-
-### 9.6 What the C producer actually cost, measured
-
-First run of the CPU as a producer of *compute*, `tb/fw_matmul_tb.sv` on the
-`[8x32] @ [32x16]` problem. Both kernels produce byte-identical C, checked against a
-reference computed in the testbench:
-
-| clocks | `matmul.c` (one `matmul_t`) | `matmul_loop.c` (grid walked in C) |
-| --- | --- | --- |
-| run | **2 077** | **2 454** |
-| MXU | 289 | 392 |
-| ...of which weight load | 80 | 80 |
-| DMA | 1 420 | 1 420 |
-| `idlec` = CPU issue | **368 (17.7%)** | **642 (26.2%)** |
-| `ovlap` | 0 | 0 |
-
-Four things fall out, and only the last one is a surprise:
-
-- **`run - (mxu + dma) == idlec` exactly**, and `ovlap` is 0, which says the firmware's
-  `tpu_wait` fences are doing what they claim: no two units ever run at once, so this is
-  the strict-mode baseline §4 asks for, not an overlapped run.
-- **The hardware tile loop is worth 103 MXU clocks here** (289 vs 392), and the FSM state
-  histogram says exactly where, with nothing left over:
-
-  | `mxu.sv` state | `matmul` | `matmul_loop` | Δ |
-  | --- | --- | --- | --- |
-  | `S_LOAD` | 80 | 80 | 0 |
-  | `S_RUN` | 192 | 192 | 0 |
-  | `S_WB_ACC_RD` | 0 | 48 | **+48** |
-  | `S_WB_WRITE` | 16 | 64 | **+48** |
-  | `S_DONE` | 1 | 8 | +7 |
-  | **busy** | **289** | **392** | **+103** |
-
-  `LOAD` and `RUN` are *identical* — 8 weight tiles at 10 clocks and 8 contraction passes
-  at 24, whoever walks the grid. All 103 clocks are writeback. `S_WB_WRITE` is one clock
-  per token row: the hardware loop drains only when an **output** tile is finished
-  (`NTILES*M` = 16 rows), the software one drains at the end of every dispatch
-  (`NTILES*KTILES*M` = 64). The 48 extra rows are intermediate contraction partials. Worse,
-  six of the eight dispatches carry `.acc`, so each of their rows first spends a clock in
-  `S_WB_ACC_RD` reading the running int32 row back over the C port — `(KTILES-1)*NTILES*M`
-  = 48 more. The hardware loop never enters that state at all: `k_tile_first` selects
-  load-vs-add *inside* `result_buf`, so accumulating across the contraction costs zero
-  cycles and zero scratchpad accesses.
-
-  In closed form, software tiling costs **`2*KTILES - 1` times** the writeback of the
-  hardware loop (7x here), and it scales with the contraction depth while the hardware
-  loop does not. It is also 1 536 bytes read + 1 536 written on the arbitrated C port that
-  the hardware loop never issues — free today at `ovlap = 0`, contention once units
-  overlap. This is what `macro_ops.md` §4.2 meant by "the int32 C traffic disappears
-  rather than being made faster", now measured from both sides.
-- **289 MXU clocks matches the scalar unit's** `tiled_matmul_hw` at 578 for two matmuls.
-  Same array, same work — the producer does not touch it.
-- **Issue overhead is 18–26% of the run, not the ~2.7% §9.1 estimated.** That is not a
-  contradiction — §9.4 says issue cost is per-dispatch and roughly constant while unit
-  work scales with the tensor, and this problem is 2 000 clocks against the adder model's
-  690 000. The share is what a 2 000-clock kernel looks like, not a regression. §9.7
-  sweeps the shape and separates the two effects properly.
-
-The 368 clocks are not divisible by hand: they cover CPU boot, 20 MMIO stores, three
-poll-loop exits and the `DONE` write. The **marginal** number is clean, though, because
-the two kernels differ by exactly seven `MXU_MM` commands and a loop: **+274 clocks for
-+7 commands ≈ 39 clocks each** — and that is only the *exposed* part; §9.7 measures the
-whole ~85 and shows what hides the rest.
-
-### 9.7 How issue overhead scales with the problem
-
-§9.4 predicted that issue cost is per-dispatch and roughly constant while unit work scales
-with the tensor. `tb/run_fw_sweep.sh` (`make fwsweep`) measures it: both kernels rebuilt at
-each shape, both run through `fw_matmul_tb.sv`, `cmds` taken from the queues' own `issued`
-counters.
-
-| shape M x K x N | kernel | run | MXU | DMA | `idlec` | cmds | MXU/dispatch |
-| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| 8x8x8 | `matmul` | 1 039 | 43 | 604 | **392** | 5 | 43 |
-| | `matmul_loop` | 1 039 | 43 | 604 | **392** | 5 | 43 |
-| 8x16x16 | `matmul` | 1 755 | 153 | 1 228 | **374** | 5 | 153 |
-| | `matmul_loop` | 1 828 | 188 | 1 228 | **412** | 8 | 47 |
-| 8x32x32 | `matmul` | 3 520 | 577 | 2 572 | **371** | 5 | 577 |
-| | `matmul_loop` | 4 413 | 784 | 2 572 | **1 057** | 20 | 49 |
-| 8x64x64 | `matmul` | 8 294 | 2 241 | 5 644 | **409** | 5 | 2 241 |
-| | `matmul_loop` | 11 562 | 3 200 | 5 644 | **2 718** | 68 | 50 |
-| 8x128x128 | `matmul` | 22 537 | 8 833 | 13 324 | **380** | 5 | 8 833 |
-| | `matmul_loop` | 35 222 | 12 928 | 13 324 | **8 970** | 260 | 50 |
-| 16x32x32 | `matmul` | 5 994 | 737 | 4 876 | **381** | 5 | 737 |
-| | `matmul_loop` | 6 720 | 1 136 | 4 876 | **708** | 20 | 71 |
-| 32x32x32 | `matmul` | 10 911 | 1 057 | 9 484 | **370** | 5 | 1 057 |
-| | `matmul_loop` | 11 782 | 1 840 | 9 484 | **458** | 20 | 115 |
-
-**The hardware tile walk makes CPU cost O(1) in the problem.** `matmul.c` issues five
-commands whatever the shape, and its `idlec` is 370–409 clocks across a **205x** range of
-array work (43 → 8 833) and a 4x range of M. The spread is not a trend — it is gcc
-materializing different address constants. Two commands describe a 16x16 grid exactly as
-well as a 1x1 one, which is the whole argument for `MXU.GEOM` + `tiled`.
-
-**The C loop is O(KTILES*NTILES), and the CPU — not the array — is the bottleneck there.**
-Instrumenting the queue at 8x128x128: `mxu_level` **never exceeded 1**, and **not one push
-landed while the MXU was busy**. The two strictly alternate, so the CPU's own per-dispatch
-cost is recoverable as `(mxu + idlec - baseline) / dispatches`: **91** clocks at 8x32x32,
-**87** at 8x64x64, **84** at 8x128x128. Call it ~85 to build and push one 128-bit command —
-13 instructions, four AXI4-Lite stores, and every instruction fetch over that same bus
-(topology A, §6). Against §9.1's estimate of ~26 for a chunk-loop dispatch, the factor is
-the fetch path, not the command format.
-
-**What that costs the run is `max(0, cpu - array)` per dispatch**, which is why the M axis
-matters more than the tile axis:
-
-| M | MXU/dispatch | CPU/dispatch | exposed per dispatch |
-| ---: | ---: | ---: | ---: |
-| 8 | 50 | ~85 | 34  (`(8970-380)/255`) |
-| 16 | 71 | ~85 | 22  (`(708-381)/15`) |
-| 32 | 115 | ~85 | **6**  (`(458-370)/15`) |
-
-At M=32 the array's per-tile work passes the CPU's issue time and software tiling becomes
-**free in CPU terms** — the crossover is around M ~ 24 on this 8x8 array. It is not free
-overall: §9.6's writeback penalty is untouched by M, and is the whole of the remaining
-871 clocks at 32x32x32.
-
-Three consequences:
-
-- **A deeper queue would not help anything here.** Depth is 8 and the level never reached
-  2. The queue is not the constraint; ~85 clocks per command is.
-- **The 1.56x gap at 8x128x128** (22 537 vs 35 222) splits 68% CPU issue (+8 590) and 32%
-  array writeback (+4 095). At small M, issue cost — not the C traffic of §9.6 — is the
-  larger half of the argument for `matmul_t`.
-- **DMA is ~58% of the hardware-tiled run at every shape**, and none of it overlaps
-  (`ovlap = 0`). That is §9.3's 1.45x, still unclaimed and still the largest single item
-  on the table.
-
-### 9.8 The whole model on the C producer, measured
-
-`make fw FWPROG=adder` — four transformer layers plus the output head, 534
-commands, `tb/fw_matmul_tb.sv` checking every DRAM byte *and* every command word
-against `iss.py`:
+`make fw FWPROG=adder`, four layers plus the head, 534 commands:
 
 | | clocks | share |
 | --- | ---: | ---: |
@@ -765,214 +91,122 @@ against `iss.py`:
 | MXU | 206 361 | 45.5% |
 | DMA | 131 200 | 28.9% |
 | VPU | 84 352 | 18.6% |
-| **`idlec` = CPU issuing commands** | **31 864** | **7.0%** |
+| **`idlec` = the CPU issuing commands** | **31 864** | **7.0%** |
 
-(These are the `tpulib.h` numbers. The hand-written kernel this replaced was 518
-commands and 439 917 clocks with `idlec` 18 035 / 4.1%; the units did
-byte-identical work then too, so the whole 13 861-clock difference is the
-producer. §9.10.)
+Two things follow, and neither is the queue:
 
-**Do not read this against §0's 690 705.** That baseline is a *different model* —
-the ternary `d=128, f=128` kernel on the scalar unit — and this is the int4
-`d=64, f=256` one on the CPU. The only number that transfers is the last row.
+- **`qfull` and `ovlap` are both 0.** Every primitive fences after every cross-unit
+  dependency, and every one of those is a real dependency — removing them needs
+  double-buffering, not a looser barrier. That is what `tpulib.h`'s weight prefetch is.
+- **The VPU is 18.6% of the run**, and its cost tracks element count almost exactly:
+  196 608 elements over 84 352 clocks is 0.43 each. The FFN's `relu -> requant` pair is **a
+  third** of that traffic on its own — 32 commands and 16 384 elements per layer to compute a
+  ReLU — and it is that size only because `relu` writes int32 and nothing narrows on the
+  writeback path. **A fused `relu.rq` would delete half those commands and all of the int32
+  traffic, worth ~6% of the whole run** — the largest item here that is a design choice
+  rather than arithmetic.
 
-**Issue overhead is 7.0%**, against §9's estimate of ≈2.7% for the CPU producer.
-§9.9 decomposes it and the answer is not what the estimate was about: almost
-none of it is building commands.
+### 82% of the CPU's time is barriers, not building commands
 
-Two things follow for anyone trying to shrink it, and neither is the queue:
+`make fwtime FWPROG=<kernel>` dumps a per-command timeline (`+CMDLOG=`) and
+`tb/cmd_timeline.py` tables it. The two columns it uses are accumulated in the testbench
+rather than derived, because they have to reconstruct the perf counters exactly — they do,
+bit-identically, on every kernel, and the tool checks it.
 
-- **`qfull` and `ovlap` are both 0.** Nothing is overlapped, because every
-  primitive fences after every cross-unit dependency — `tpu_wait` before each
-  weight refill, around the K transpose, and between the array and the vector
-  unit at each attention step. Every one of those is a real dependency, so
-  removing them needs double-buffering (a second weight window, a second int32
-  temp), not a looser barrier.
-- **The VPU is 18.6% of the run**, against 7.6% on the retired ternary kernel,
-  and its cost tracks element count almost exactly: 196 608 elements over 84 352
-  clocks is 0.43 clocks each, i.e. ~7 clocks per 16-lane chunk with per-command
-  overhead a rounding error. The FFN's `relu → requant` pair is **a third** of
-  that traffic on its own — 32 commands and 16 384 elements per layer to compute
-  a ReLU — and it is that size only because `relu` writes int32 and nothing
-  narrows on the writeback path (vpu.md). A fused `relu.rq` would delete half
-  those commands and all of the int32 traffic, worth ~6% of the whole run: the
-  largest item on this table that is a *design* choice rather than arithmetic.
-
-### 9.9 Where the CPU's clocks actually go
-
-`idlec` says the CPU costs 7.0% of the adder run. It cannot say *where*, and 7%
-spread evenly is a different machine from 4% concentrated in one place. So
-`fw_matmul_tb.sv` gained an optional per-command timeline (`+CMDLOG=<path>`,
-driven by `make fwtime`) and `tb/cmd_timeline.py` turns it into the tables
-below. Two columns carry it — clocks the unit was busy on each command, and the
-no-unit-busy clocks before each push — and they are **accumulated in the
-testbench rather than derived**, because they have to reconstruct the perf
-counters exactly or the attribution is guesswork. They do: `mxu`/`vpu`/`dma`/
-`idlec` come back bit-identical on every kernel, and the tool prints the check.
-
-**The finding: 82% of the CPU's time is the barriers, not building commands.**
-
-| `make fwtime FWPROG=adder` | clocks | share of the CPU's 31 864 |
+| `adder` | clocks | share of the CPU's 31 864 |
 | --- | ---: | ---: |
 | 143 commands that follow a `tpu_wait`, 183.6 each | **26 256** | **82.4%** |
-| ...of which the barrier's marginal cost over a back-to-back push | *24 352* | *76.4%* |
+| ...of which the barrier's marginal cost | *24 352* | *76.4%* |
 | 390 commands pushed back-to-back, 13.3 each | 5 192 | 16.3% |
-| boot (reset to the first command) | 260 | 0.8% |
-| tail (last command to `done`) | 156 | 0.5% |
+| boot + tail | 416 | 1.3% |
 
-(The first row's sub-line is not additive with it — 143 × 13.3 of the 26 256 is
-the ordinary push cost those commands would have paid anyway.)
+- A command pushed on top of a busy unit is nearly free — 13.3 exposed clocks against the
+  ~85 it costs to build, because the rest hides under the unit still running. `vpu requant`
+  and `vpu dyt` cost **1.1** each: the queue absorbs them entirely.
+- `tpu_wait` costs 183.6 because it polls a counter over AXI4-Lite, and the CPU is mid-poll
+  when the unit goes idle.
+- **48 of the 143 barriers are the three-way fence in the per-head attention loop.**
 
-A command pushed on top of a busy unit is nearly free — 13.3 exposed clocks
-against the ~85 §9.7 measured, because the rest hides under the unit that is
-still running. `vpu requant` and `vpu dyt` cost **1.1** each: they are
-pushed while the VPU is still on the widening op they are paired with, so the
-queue absorbs them entirely. That is the queue doing exactly what §9.3 said it
-would, and it means **the command format is not the problem and a wider one
-would buy nothing.**
+Where the clocks go by phase is in [`../fw/README.md`](../fw/README.md). The headline:
+**moving weights costs more than either FFN matmul.**
 
-What costs is stopping. A barrier is 170.3 clocks on average, and it is two
-things: *polling granularity* — `tpu_wait` spins on the retired counter over
-AXI4-Lite with instruction fetch on the same bus, so when a unit goes idle the
-CPU is mid-poll and finishes that iteration before it can see it — and whatever
-the producer computes between the barrier and its next push, which is exposed
-clock for clock (§9.10). Nearly half the barriers sit in one place:
+### Issue overhead is O(1) in the problem, with the hardware tile walk
 
-| phase | barriers | CPU clocks | share of CPU |
-| --- | ---: | ---: | ---: |
-| attention S / mask / relu / A (4 per head, 4 heads, 4 layers) | 64 | 12 960 | **41%** |
-| weight fills (6 per layer) | 24 | 6 878 | 22% |
-| everything else | 55 | 11 610 | 36% |
+`make fwsweep` rebuilds both matmul kernels at each shape:
 
-The attention inner loop fences four times per head because the array and the
-vector unit hand `S → SM → P → A` back and forth through one set of buffers.
-Giving that loop a second `S`/`P` pair — head `h+1`'s scores computed into the
-other one while head `h`'s `P@V` is still on the array — is what would remove
-most of those 64 barriers, and it is a scratchpad-budget change (2 KB) rather
-than an ISA one. One of the four is cheaper to remove than the rest: `tpulib.h`
-drains the VPU at the end of *every* elementwise primitive, so the `+mask` and
-the `relu` that follows it fence twice where the hand-written kernel fenced
-once. That is the price of the library's self-fencing contract — a primitive
-returns only once its commands have retired, which is what makes composing two
-of them safe — and it is 16 barriers, ~0.6% of the run.
+| shape M x K x N | kernel | run | MXU | DMA | `idlec` | cmds |
+| --- | --- | ---: | ---: | ---: | ---: | ---: |
+| 8x8x8 | `matmul` | 1 039 | 43 | 604 | **392** | 5 |
+| 8x32x32 | `matmul` | 3 520 | 577 | 2 572 | **371** | 5 |
+| | `matmul_loop` | 4 413 | 784 | 2 572 | **1 057** | 20 |
+| 8x128x128 | `matmul` | 22 537 | 8 833 | 13 324 | **380** | 5 |
+| | `matmul_loop` | 35 222 | 12 928 | 13 324 | **8 970** | 260 |
+| 32x32x32 | `matmul` | 10 911 | 1 057 | 9 484 | **370** | 5 |
+| | `matmul_loop` | 11 782 | 1 840 | 9 484 | **458** | 20 |
 
-The same measurement across the smaller kernels, for scale:
+- **`matmul.c` issues five commands whatever the shape**, and `idlec` is 370–409 clocks
+  across a 205x range of array work and a 4x range of M. The spread is not a trend — it is
+  gcc materializing different address constants.
+- **The C loop costs ~85 clocks per dispatch.** At 8x128x128 the queue level never exceeded
+  1 and not one push landed while the MXU was busy, so the CPU's cost is recoverable
+  directly: 91 clocks at 8x32x32, 87 at 8x64x64, 84 at 8x128x128. Against an estimate of
+  ~26, the factor is the fetch path, not the command format.
+- **What it costs the run is `max(0, cpu - array)` per dispatch**, so the M axis matters more
+  than the tile axis:
 
-| kernel | run | MXU | VPU | DMA | CPU | barriers | per barrier |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| `matmul` | 2 209 | 13.1% | — | 70.1% | **16.8%** | 2 | 60.5 |
-| `matmul_loop` | 2 586 | 15.2% | — | 59.9% | **25.0%** | 2 | 48.9 |
-| `ffn` | 1 380 | 11.7% | 7.1% | 24.3% | **56.8%** | 4 | 70.3 |
-| `mha` | 2 228 | 9.6% | 4.5% | 24.1% | **61.8%** | 8 | 72.3 |
-| `tiled` | 80 404 | 4.8% | 1.2% | 16.1% | **77.9%** | 91 | 158.2 |
-| `adder` | 453 778 | 45.5% | 18.6% | 28.9% | **7.0%** | 143 | 170.3 |
+| M | MXU/dispatch | CPU/dispatch | exposed |
+| ---: | ---: | ---: | ---: |
+| 8 | 50 | ~85 | 34 |
+| 16 | 71 | ~85 | 22 |
+| 32 | 115 | ~85 | **6** |
 
-The four small kernels are 40–60% CPU, which says nothing about the machine:
-each is a handful of commands over a few hundred clocks of unit work, and boot
-alone (101–227 clocks) is a tenth of the run. `tiled` is 78% CPU for a related
-reason and a more interesting one — its arena is deliberately a few hundred
-bytes, so it does the *most* blocking the library can do over the *least* array
-work. Its barriers are ordinary (158.2 each); what is not is its **back-to-back**
-push cost, 210.2 clocks against `adder`'s 13.4, because 196 of its 237 commands
-are single-row DMAs from a strided block move and the engine finishes a 16-byte
-row long before the CPU has built the next one. That is the producer-bound
-regime, reached on purpose. **Only the last row is a workload.**
+The crossover is around **M ~ 24** on the 8x8 array. Above it, software tiling is free in
+CPU terms — though not overall, since the int32 writeback penalty is untouched by M.
 
-And the units, per phase, from the same run:
+**A deeper queue would not help.** Depth is 8 and the level never reached 2.
 
-| phase | MXU | VPU | DMA | CPU | share of run |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| weight fills | — | — | 98 400 | 6 878 | **23.2%** |
-| FFN `W1` | 63 492 | — | — | 1 084 | 14.2% |
-| FFN `W2` | 60 420 | — | — | 1 080 | 13.6% |
-| projections (`Wq`, `Wk`, `Wv`) | 47 628 | — | — | 3 056 | 11.2% |
-| FFN `relu → requant` | — | 24 704 | — | 732 | 5.6% |
-| K transpose (spill + fill) | — | — | 25 104 | 424 | 5.6% |
-| attention mask (`+mask`, `RQ_ID`) | — | 16 448 | — | 2 384 | 4.2% |
-| `Wo` | 15 876 | — | — | 1 024 | 3.7% |
-| attention `relu` | — | 12 352 | — | 2 768 | 3.3% |
-| attention `S` | 9 488 | — | — | 4 096 | 3.0% |
-| attention `A` | 8 464 | — | — | 3 712 | 2.7% |
-| residual, DyT norm1, DyT norm2 | — | 24 672 | — | 1 984 | 6.0% |
-| operands in, packs, head, logits out | 993 | 6 176 | 7 696 | 2 486 | 3.9% |
+### What `tpulib.h` costs, and why `always_inline` is load-bearing
 
-(The rows sum to 453 622; the missing 156 is the tail, which follows the last
-command and so belongs to none of them.)
-
-**Weight movement is the single largest item in the run — bigger than either FFN
-matmul.** 98 400 DMA clocks is 24 KB per layer through a 1 clock/byte engine,
-re-fetched every forward because one 8 KB arena cannot hold a layer. It is also
-the item most obviously fixable: the weights are read-only and a fill depends on
-nothing but the arena block it lands in, so double-buffering that block would
-let it run under the matmuls instead of between them. 22% is the ceiling, not the
-prize — the DMA is last in the scratchpad's arbitration (`A > W > C > V > s >
-DMA`), so an overlapped fill takes its cycles out of the matmul beside it. It is
-still the largest overlap opportunity in the run, and the one §9.3's ~1.45x was
-mostly about.
-
-### 9.10 What a primitive library costs a producer this slow
-
-`fw/tpulib.h` moved the block loops, the weight staging and the barriers out of
-`adder.c` and into primitives, so that nothing in the kernel depends on the
-model fitting in 64 KB of scratchpad. Measured on the same simulation, same
-checkpoint-free operands, same array:
+Same simulation, same operands, same array:
 
 | | commands | image | clocks | `idlec` |
 | --- | ---: | ---: | ---: | ---: |
 | hand-written against `tpu.h` | 518 | 1 544 B | 439 917 | 18 035 (4.1%) |
-| through `tpulib.h`, helper with runtime `m`/`k`/`n` | 534 | 2 784 B | **597 936** | 176 022 (29.4%) |
+| through `tpulib.h`, runtime `m`/`k`/`n` | 534 | 2 784 B | **597 936** | 176 022 (29.4%) |
 | through `tpulib.h`, shapes constant at the call site | 534 | 1 992 B | **453 778** | 31 864 (7.0%) |
 
-The MXU, VPU and DMA columns are byte-identical across all three: the array does
-exactly the same work, and the whole spread is the producer.
+The MXU, VPU and DMA columns are **byte-identical across all three**. The whole spread is
+the producer.
 
-**The middle row is the lesson.** A general matmul has to choose block sizes,
-resolve residency, compute a block's three base addresses and decide whether the
-store can narrow — about 200 instructions. On a PicoRV32 with no cache that is
-~1 400 clocks, and *all of it lands between a barrier and the next push*, where
-it is exposed clock for clock. Per-barrier cost went 140.3 → **1 143.8**. The
-library did not issue meaningfully more commands; it issued the same commands
+**The middle row is the lesson.** A general matmul has to choose block sizes, resolve
+residency, compute three base addresses and decide whether the store can narrow — about 200
+instructions. On a PicoRV32 with no cache that is ~1 400 clocks, and *all of it lands between
+a barrier and the next push*, where it is exposed clock for clock. Per-barrier cost went
+140.3 -> **1 143.8**. The library did not issue more commands; it issued the same commands
 1 000 clocks later each.
 
-The third row is the same library with the decisions made at compile time. A
-transformer's dimensions are `#define`s, so a call site that spells its shape out
-gives the compiler everything: `tpu_gemm_blocks` folds to a constant, the block
-loops fold to one iteration, every `space` test resolves, and the descriptor
-never reaches memory — what is left is the two stores of a `GEOM` and the two of
-a matmul. gcc will not do it unprompted at `-Os` (`tpu_matmul` is a kilobyte of
-object code *before* folding, and the inliner decides before it knows the
-folding is available), so the three entry points that see the shape are
-`always_inline`. That makes the image **smaller**, 1 992 B against 6 420 B
-without the fold, because the general paths become dead code at every site.
+The third row is the same library with the decisions made at compile time. A transformer's
+dimensions are `#define`s, so a call site that spells its shape out gives the compiler
+everything: the block chooser folds to a constant, the loops fold to one iteration, every
+space test resolves, and the descriptor never reaches memory. gcc will not do it unprompted
+at `-Os`, so the three entry points that see the shape are `always_inline`. That makes the
+image **smaller** — 1 992 B against 6 420 B without the fold — because the general paths
+become dead code at every site.
 
-What remains against the hand-written kernel is +3.2% of the run: 16 more
-commands — `Wq`/`Wk`/`Wv` are three dense DRAM blocks now rather than one fused
-`[D][3D]` one, because a column slice of a fused block is strided and
-`tpu_matmul` would fetch it a row at a time — and 36 more barriers, half of them
-the drain at the end of every elementwise primitive (§9.9). That is the price of
-the self-fencing contract, and it is what makes composing two primitives safe
-without the caller reasoning about queues.
+What remains against the hand-written kernel is **+3.2%**: 16 more commands (`Wq`/`Wk`/`Wv`
+are three dense blocks rather than one fused `[D][3D]` one, because a column slice of a
+fused block is strided) and 36 more barriers, half of them the drain at the end of every
+elementwise primitive. That is the price of the self-fencing contract.
 
-**The general rule this establishes:** on this machine the producer's cost is
-paid in *instructions between a barrier and a push*, not in commands issued. Any
-firmware abstraction is free if it folds and expensive if it does not — so the
-thing to check when adding one is the disassembly, not the command count.
+**The general rule:** on this machine the producer's cost is paid in *instructions between a
+barrier and a push*, not in commands issued. Any firmware abstraction is free if it folds and
+expensive if it does not — so check the disassembly, not the command count.
 
+### The serial path adds nothing and hides nothing
 
-### 9.11 The same kernels with nothing backdoored, and the restart bug it found
-
-`make fw` proves the datapath. It does not prove the *board* path: the image
-arrives through `cpu_subsys.sv`'s `FW_INIT` parameter, the operands are poked
-straight into the SRAM chip model, and the results are read out of it the same
-way. Everything the host actually has to do — `'I'`, `'W'`, `'G'`, `'T'`, `'R'`
-over one serial line — is untested by it.
-
-`tb/fw_uart_tb.sv` (`make fwuart FWPROG=<kernel>`) is that test, and it is the
-successor to the retired `tpu_top_uart_tb.sv` that did the same job for the
-scalar unit's `.tpu` programs. `host_run`, `imem_*` and `cfg_*` are tied off; the
-only stimulus is `uart_rx`. It runs any kernel in `fw/` against the same three
-ISS-generated vector files `fw_matmul_tb.sv` uses, so nothing about the golden
-data is duplicated — only how it gets in and out:
+`make fw` proves the datapath. It does not prove the *board* path: the image arrives through
+`FW_INIT`, operands are poked into the SRAM model, results read back the same way.
+`tb/fw_uart_tb.sv` (`make fwuart`) ties off everything but `uart_rx`.
 
 | | `make fw` | `make fwuart` |
 | --- | --- | --- |
@@ -981,201 +215,104 @@ data is duplicated — only how it gets in and out:
 | start | `host_run` pin | `'G'` |
 | results | read out of the chip model | `'R'` frames, compared as they arrive |
 | counters | hierarchical reference | `'T'` reply, decoded |
-| stray writes | every DRAM byte | every DRAM byte (backdoor — see below) |
 
-The one check that cannot go over the wire is the full-DRAM sweep: 512 KB at
-10·`UART_CPB` clocks a byte is more simulation than every kernel here put
-together. It stays a backdoor read of the same memory `'W'` just wrote, so it
-extends the `'R'` check to the addresses `'R'` cannot afford rather than
-replacing it.
+Both use the same ISS-generated vector files, so nothing about the golden data is duplicated.
+On `adder`: **531 102 checks, 0 errors, 534/534 commands, and a counter block bit-identical
+to `make fw`'s** (`run=453 777 mxu=206 361 vpu=84 352 dma=131 200 idlec=31 864`).
 
-**Measured, on the whole model.** `make fwuart FWPROG=adder` — 1 980 firmware
-bytes in one `'I'`, 101 888 operand bytes in 26 `'W'` frames, 4 096 result bytes
-back in 2 `'R'` frames:
+The one check that cannot go over the wire is the full-DRAM sweep — 512 KB at 10x`UART_CPB`
+clocks a byte is more simulation than every kernel put together. It stays a backdoor read of
+the same memory `'W'` just wrote, extending the `'R'` check rather than replacing it.
 
-```
-  'I' loaded 495 firmware words (1980 bytes)
-  'W' 101888 bytes in 26 frames
-  firmware signalled done, 454410 clocks after 'G'
-  counters: run=453777 mxu=206361 mload=33440 vpu=84352 (vmm=0) dma=131200
-            idlec=31864 qfull=0 ovlap=0
-  'R' 4096 bytes in 2 frames
-  backdoor sweep: 0 of 524288 DRAM bytes wrong
-  command trace: 534 commands issued, 534 expected
-==== done: 531102 checks, 0 errors ====
-```
+**Cost:** 17.8 M simulated clocks, ~21 minutes of Icarus against `make fw`'s ~3, of which
+16.3 M is serial traffic. `FWUART_CPB=8` halves it; below 8 the receiver's mid-bit sample
+stops being mid-bit.
 
-Every counter is **bit-identical to `make fw`'s** on the same kernel, and so is
-the 534-command trace. That is the result worth having: the run is the same run,
-so the serial path adds nothing and hides nothing — it only changes how the bytes
-arrive.
+### The restart bug `RERUN=1` found
 
-**Cost.** The link is the whole of it. At the default `FWUART_CPB=16` a byte is
-160 core clocks, so the small kernels are ~10–20 s and `adder` is **17.8 M
-simulated clocks, ~21 minutes of Icarus** — 16.3 M of those clocks are serial
-traffic and 454 k are the compute `make fw` does in ~3 minutes. `FWUART_CPB=8`
-halves it; below 8 the receiver's mid-bit sample (`CPB/2`, two flops after the
-pin) stops being mid-bit. Use `make fw` to iterate; this is the one that says the
-board path works.
-
-**What it found immediately: the core could not be started twice without a
-reset.** `RERUN=1` loads and runs the same kernel a second time over the same
-link, which is what two back-to-back `run_fw_matmul.py` invocations do on the
-board. It failed on the second `'G'`:
+`make fwuart RERUN=1` loads and runs the same kernel a second time with no reset — what two
+back-to-back host invocations do on the board. It failed on the second `'G'`:
 
 ```
----- pass 2 (no reset in between) ----
-  'I' loaded 162 firmware words (648 bytes)
-  'W' 160 bytes in 4 frames
-  FAIL core never started after 'G' (done=0)
-  FAIL command count: RTL issued 0, expected 19
+FAIL core never started after 'G' (done=0)
+FAIL command count: RTL issued 0, expected 19
 ```
 
-`cpu_done` is level-held after a run, and `cpu_subsys.sv` only re-arms it on the
-clock *after* it sees `cpu_run` rise. `tpu_top.sv`'s run latch cleared `cpu_run`
-on `cpu_run && cpu_done` — which is true on that very clock, against the previous
-run's stale `done_r`. Probed:
+`cpu_done` is level-held after a run, and `cpu_subsys.sv` only re-arms it on the clock
+*after* it sees `cpu_run` rise. `tpu_top.sv`'s run latch cleared `cpu_run` on
+`cpu_run && cpu_done` — true on that very clock, against the **previous** run's stale
+`done_r`. So the core was released for exactly one cycle and put straight back into reset,
+and the host saw ACK for `'I'`, `'W'` and `'G'` and then an idle board holding the *first*
+run's counters and results.
 
-```
-[probe] cyc=303186 run_start=1 cpu_run=0 done_r=1 busy=0   <- 'G'
-[probe] cyc=303186 run_start=0 cpu_run=1 done_r=1 busy=0   <- released...
-[probe] cyc=303188 run_start=0 cpu_run=0 done_r=0 busy=0   <- ...and re-reset
-```
+Fixed by gating the clear on the run having actually been taken up, one clock later.
 
-The core is released for exactly one cycle and put straight back into reset. The
-host sees ACK for its `'I'`, its `'W'` and its `'G'`, and then an idle board
-holding the *first* run's counters and results — the same failure signature the
-scalar unit's dropped second `'I'` load had, which is why the two-program
-sequence was worth keeping when the producer changed.
+**This is invisible to `make fw`, `make fwsweep` and `cpu_smoke_tb`** — every one of them
+runs exactly one program per reset.
 
-Fixed in `tpu_top.sv` by gating the clear on the run having actually been taken
-up (`cpu_busy` high, i.e. `done_r` re-armed), one clock later. `make fwuart
-FWPROG=mha RERUN=1` now runs both passes clean, and the second run's counters
-restart (`run=2227` against pass 1's `2228` — pass 1 begins one clock earlier
-because `done_r` is already clear out of reset).
+## Verification: why there is no RV32IM interpreter
 
-This is invisible to `make fw`, `make fwsweep` and `cpu_smoke_tb`: every one of
-them runs exactly one program per reset.
+`iss.py` is bit-exact with the RTL, and a RISC-V core cannot be modelled by an assembler plus
+`iss.py` as they stood. The answer was to **move the verification contract from the
+instruction stream to the command stream**. The macro-op trace is the ISA boundary, and three
+producers must agree on it:
 
-### 9.12 The producer can read the machine back (`fw/infer.c`)
+1. **The firmware kernel, compiled natively against a mock `tpu.h`.** `tpu.h` funnels every
+   MMIO access through two inline functions, so `-DTPU_TRACE` swaps those for a trace emitter
+   and the *actual* `.c` source becomes the producer, with its real control flow, compiled by
+   the host compiler.
+2. **`iss.py`, re-fronted.** Its `_matmul` / `_vpu` / `_dma` bodies are the golden numerics
+   and are kept verbatim; only the decode front end changed, from 32-bit words to 128-bit
+   commands.
+3. **The RTL**, via a sim-only monitor on the arbitrated command write (`p_cmd_*`, where both
+   producers converged).
 
-Everything above treats the CPU as a *write-only* producer: it pushes commands
-and polls a retired counter. That is what the command aperture is, and it is why
-`adder.c`'s header hands the token embedding and the argmax to the host as
-"structural" — the ISA has no gather and nothing returns an index.
+`fw_vectors.py` turns 1 into 2 into expected images, and `fw_matmul_tb.sv` checks *two*
+things: the memory image, and 3 against 1. A mismatch localizes immediately to either the
+firmware or the datapath.
 
-Both are properties of the command plane and neither is a property of the
-machine. `cpu_subsys.sv` has always decoded `0x9xxx_xxxx` onto the scratchpad's
-S port (§6), so the CPU can read a tensor a unit just wrote. `fw/infer.c` — the
-model as *inference*, a prefill plus 16 decode steps against a KV cache — is
-what uses it:
+### Co-execution, for kernels that branch on their own results
 
-- the output head writes its 13 int32 logits to the **scratchpad**, and the CPU
-  reads them back and argmaxes them (`tpu_spad_ld`);
-- the embedding "gather" is then a plain DMA at `DR_EMB + tok*D`, an address the
-  CPU computed from data it read.
+`infer.c` argmaxes its own logits over the scratchpad window and puts the token it chose in
+the *address* of the next DMA, so its command stream is not a function of the program alone.
+`fw_vectors.py -x` therefore **runs** the trace binary as a co-process, executing each command
+on the ISS as it arrives and answering the kernel's scratchpad reads out of the model's
+memory. A kernel that reads nothing sees no difference.
 
-So the autoregressive loop closes on the device: one `'G'`, and the host reads a
-finished sequence out of DRAM instead of round-tripping per token. Three
-consequences worth writing down.
+That also makes the golden command stream a real forward pass's: if the RTL picks a different
+token anywhere, the run fails at *that command* rather than merely producing a different
+answer.
 
-**The window is outside the queues.** `tpu_spad_ld` is a load, not a command, so
-it has no ordering relationship with anything in flight: a read of a tensor a
-queued command has not written yet is stale, and needs the same `tpu_wait` a
-dependent command would. It is also 32 bits wide and 4-byte aligned by
-necessity — the S port has no byte strobes (`scratchpad.sv` drives
-`{S_BYTES{1'b1}}` for it), so an `sb` writes its three neighbours. And it sits
-below the MXU and the VPU in the read arbiter, so a read taken while the array
-is running stalls the core inside the load rather than returning something
-wrong.
+### Independent references
 
-**A kernel that branches on its own results has no static trace.** §8.1's whole
-argument for the native trace producer is that the same C, compiled twice,
-cannot drift — but the token `infer.c` chooses ends up in the *address* of the
-next DMA, so its command stream is not a function of the program alone. The fix
-keeps the property: `fw_vectors.py -x` runs the `-DTPU_TRACE` binary as a
-co-process, executes each command on `iss.py` as it arrives, and answers the
-kernel's scratchpad reads (`SRD`) out of the model's own memory. The trace that
-comes out is a real forward pass's, and the RTL has to reproduce it command for
-command — so a hardware divergence that changes one token fails *at that
-command*, not merely in the answer.
+The golden DRAM image is whatever `iss.py` computed, which checks the RTL against the ISS and
+nothing else. That is the right check for a kernel whose job is to drive the datapath, and
+**not enough** for one whose job is to drive a loop or a cache — a mis-tiled matmul, a cache
+column at the wrong offset, or an argmax over the wrong words is something the ISS reproduces
+as faithfully as the hardware.
 
-**Status.** `infer.c` (4606 commands) and `spadwin.c` (4 commands, the window on
-its own) have **not been run against the RTL**: they were written on a machine
-with no RISC-V gcc and an Icarus too old to parse this tree's `signed'()` casts.
-What does stand behind them is the ISS, run through the real firmware binary,
-plus an independent cache-free recompute of the whole model in
-`fw_vectors.py::reference_infer` — and, on a real checkpoint,
-`accel/tpulang/infer_export.py`, which scores **100.00% exact-sequence over 256
-problems while generating** and picks the same sequence as the PyTorch model on
-256 of 256. `make fw FWPROG=spadwin` is the ~1 s check to run first: the window is
-the one path here that no firmware exercised before.
+So `fw_vectors.py` carries `reference_tiled` (a plain Python matmul) and `reference_infer`
+(the whole model recomputed in integer numpy at every step, with no cache at all), and checks
+the ISS against them before any vector file is written.
 
----
+## Area
 
-## 10. Area and timing
+Post-route on the Cmod A7, current tree: **17 606 LUTs of 20 800 (85%)**, 10 903 FFs, 68
+BRAM primitives, 46 DSPs, WNS +34.98 ns. The plane's own share:
 
-| | LUTs | FFs | BRAM | DSP |
-| --- | --- | --- | --- | --- |
-| today (post-route, `synth.md` §5) | 13 342 | 7 543 | 33 | 31 |
-| − `scalar_unit` | −1 076 | −257 | −1 | −3 |
-| + PicoRV32 (barrel shifter, fast mul, counters, compressed) | +1 300…2 000 | +600…900 | — | +2…4 |
-| + firmware BRAM, 16 KB | — | — | +4 | — |
-| + AXI4-Lite fabric + decode | +150…250 | +100 | — | — |
-| + 3 command decoders + queues (depth 8 × 128b, SRL FIFOs) | +400…700 | +200 | — | — |
-| + scratchpad grants + DMA skid buffer | +150…300 | +100 | — | — |
-| **estimate** | **14 300…15 500 (69–75%)** | ≈8 400 (20%) | **36 (72%)** | ≈33 (37%) |
+| Block | LUTs | FFs |
+| --- | ---: | ---: |
+| `cpu_subsys` (PicoRV32 + AXI4-Lite) | 1 573 | 793 |
+| `cmd_dma` + `cmd_vpu` + `cmd_mxu` | 815 | 2 642 |
+| `perf_counters` | 212 | 289 |
 
-Timing is not a risk: WNS is **+26.2 ns against an 83.3 ns period** at 12 MHz, and PicoRV32
-closes far above 100 MHz on this part. The board's only oscillator is 12 MHz, so the CPU
-inherits three times the slack it needs.
+Timing was never a risk: PicoRV32 closes far above 100 MHz on this part, and the board's only
+oscillator is 12 MHz.
 
-**Get real numbers with `mode=ooc module=picorv32` before committing to any of this.**
-`synth.md` §5's own estimates were wrong by 3× on `scratchpad`.
+## What is left
 
----
-
-## 11. Phases
-
-Each phase leaves the tree green, and the first two deliver value with **no CPU work at all**.
-
-| Phase | Work | Leaves green because |
-| --- | --- | --- |
-| 0 | Add `starved`/`qfull`/`overlap` counters; re-measure the baseline | pure addition, as `macro_ops.md` phase 0 was |
-| 1 | Command decoders + queues in front of MXU/VPU/DMA. `scalar_unit` **packs its config registers into commands** and pushes them, still waiting after each. | behavior identical; same golden vectors, same ISS, same `.tpu` programs. The command interface is validated before anything else moves. |
-| 2 | Scratchpad grant handshake + DMA skid buffer (§5); queue depth > 1; a `push`-without-wait instruction flag; double-buffer the weight window | **this is where the 1.45× lands**, still on the existing scalar unit and existing toolchain |
-| 3 | Mock `tpu.h` (`-DTPU_TRACE`) so the real `.c` compiles natively into a command trace (§8.1); `iss.py` re-fronted onto command traces; RTL command-trace monitor; `gen_vectors.py` rewired | the trace contract is proven against the *existing* scalar unit's commands before a CPU exists |
-| 4 | PicoRV32 + firmware BRAM + AXI4-Lite, arbitrated onto the same command ports **alongside** `scalar_unit`. Port `adder_model` to C; check its command trace against the `.tpu` version's, command for command. | both producers live; the `.tpu` suite is still a regression. Costs 1 076 LUTs of duplication, affordable at 64%. |
-| 5 | Retire `scalar_unit`, `assembler.py`, `pytpu.py`, `examples/*.tpu`; rewrite `isa.md` around the command format | only after 4 has been byte-identical for a while |
-| 6 | The point of the exercise: a second architecture (GQA with `heads_per_q > 1`, or KV-cache decode) as a new `.c` file and no RTL change | — |
-
-Phase 4 is the only irreversible one, and the trace-diff in it is what makes it verifiable
-rather than a rewrite you hope is equivalent.
-
----
-
-## 12. Decide before starting
-
-1. **Do phases 1–2 alone get you enough?** They deliver the 1.45× and the stale-config fix
-   without touching the toolchain. If the real complaint is "kernels are slow", stop there. If
-   it is "I cannot write a second kernel", carry on — that is a compiler problem, not a
-   hardware one, and only phase 4 fixes it.
-2. **Command width.** 128 uniform is the recommendation and costs ~0.8% against a packed
-   encoding. Locking it now matters because it is in the trace format, the RTL decoders and
-   the driver header simultaneously.
-3. **Sticky geometry.** Accept per-unit sticky state as queue-ordered (recommended), or make
-   every command fully self-contained at 256 bits and pay ~1.5% more. The second is genuinely
-   simpler to reason about; it is a taste call about whether "no state at all" is worth 4 extra
-   stores per matmul.
-4. **How much firmware RAM.** 16 KB is 4 RAMB36 and ~4 000 instructions. 32 KB doubles the
-   BRAM cost to 8 tiles (33 → 40 of 50) and the UART load to ~2.8 s.
-5. **`COMPRESSED_ISA`.** On, unless the phase-4 area measurement says otherwise. It is the
-   cheapest thing to give back.
-6. ~~**The Windows RISC-V toolchain.**~~ Settled: `fw/Makefile` takes any bare-metal
-   RISC-V gcc and autodetects the prefix (xPack `riscv-none-elf-`, Homebrew
-   `riscv64-elf-`, or a self-built one). It is still a new binary dependency in a repo
-   whose only dep is `torch`, which is why `tb/fw_smoke.hex` stays hand-encoded — the CPU
-   testbench must not be gated on an installed compiler.
-7. **Does the CPU get the scratchpad window?** Yes in this plan, and it is what opens on-chip
-   argmax and embedding lookup — but it is also a fourth requester on an arbitrated port, so
-   it depends on §5 landing first.
+- **Overlap.** `ovlap` is nonzero now only because of `tpulib.h`'s weight prefetch. Doing it
+  generally, in hardware, is [scheduler_plan.md](scheduler_plan.md).
+- **A fused `relu.rq`** — the largest single design-choice item on the measurement table.
+- **`fw/adder.c` has not been migrated to the wide model.** See
+  [`../fw/README.md`](../fw/README.md).

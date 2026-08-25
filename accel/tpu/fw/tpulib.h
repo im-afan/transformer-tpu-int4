@@ -24,6 +24,11 @@
  * queue is free (the queue is in-order); only cross-unit dependencies cost a
  * tpu_wait, and those are taken only when something was actually staged.
  *
+ * OVERLAP. There is exactly one place a primitive here runs two units at once:
+ * `tpu_gemm.prefetch` double-buffers the staged weight so block n+1's fill
+ * streams under block n's matmul. It is opt-in per call site and it is not
+ * free — see tpu_gemm_prefetch_depth. Everything else still fences.
+ *
  * INLINING. `tpu_matmul`, `tpu_gemm_blocks` and `tpu_gemm_arena_bytes` are
  * `always_inline` for speed, not style. Everything a primitive computes before
  * its first push runs with no unit busy (the caller just fenced), so it is
@@ -82,6 +87,14 @@
 #define TPU_CHUNK 512u
 #endif
 
+/* Double-buffer the staged weight and fill block n+1 while the array is still
+ * on block n (`tpu_matmul`, and the note above tpu_gemm_prefetch_depth). Set to
+ * 0 to get the single-buffered behaviour back, which is the A/B a kernel needs
+ * to know what the overlap is worth to it. */
+#ifndef TPU_WGT_PREFETCH
+#define TPU_WGT_PREFETCH 1
+#endif
+
 /* ---- where a tensor lives ------------------------------------------------ */
 #define TPU_SPAD 0u
 #define TPU_DRAM 1u
@@ -100,6 +113,16 @@ typedef struct {
 #define TPU_DRAM_AT(a)          ((tpu_buf){ (uint32_t)(a), 0u, TPU_DRAM })
 #define TPU_SPAD_ROWS(a, bytes) ((tpu_buf){ (uint32_t)(a), (uint32_t)(bytes), TPU_SPAD })
 #define TPU_DRAM_ROWS(a, bytes) ((tpu_buf){ (uint32_t)(a), (uint32_t)(bytes), TPU_DRAM })
+
+/* The same tensor `bytes` further in — a row offset, a column slice, a head's
+ * share of a fused projection. Keeps the residency and the row stride, which is
+ * the point: a caller that slices a buffer should not have to know which memory
+ * it landed in. */
+static inline tpu_buf tpu_buf_off(tpu_buf buf, uint32_t bytes)
+{
+    buf.addr += bytes;
+    return buf;
+}
 
 /* ---- the staging arena --------------------------------------------------- */
 /* A bump allocator over one scratchpad region. Every primitive allocates on the
@@ -198,6 +221,49 @@ static inline void tpu_transpose_int8(uint32_t dst_addr, uint32_t dst_row_bytes,
     tpu_move2d(dst_addr, dst_row_bytes, dram_scratch, rows, cols, rows,
                TPU_DMA_FILL);
     tpu_wait(TPU_U_DMA);
+}
+
+/* dst[col][row] = src[row][col], int8, with BOTH sides in DRAM.
+ *
+ * The same transposing spill as above, but the source is staged in through the
+ * arena `rows_per_pass` rows at a time rather than being resident — which is
+ * what a tensor larger than the scratchpad needs. It costs `rows_per_pass *
+ * cols` bytes of arena and one fill plus one spill per pass.
+ *
+ * No barrier inside the loop, including across passes that reuse the staging
+ * buffer: every transfer here is a DMA command and that unit's queue is
+ * in-order, so pass n's spill has read the buffer before pass n+1's fill
+ * writes it.
+ */
+static inline void tpu_transpose_dram_int8(uint32_t dst_addr,
+                                           uint32_t dst_row_bytes,
+                                           uint32_t src_addr,
+                                           uint32_t src_row_bytes,
+                                           uint32_t rows, uint32_t cols,
+                                           uint32_t rows_per_pass,
+                                           tpu_arena *arena)
+{
+    TPU_ASSERT(rows_per_pass * cols <= TPU_DMA_BYTES_MAX,
+               "transpose: a staged pass exceeds one DMA");
+    if (rows == 0u || cols == 0u || rows_per_pass == 0u)
+        return;
+
+    const uint32_t arena_mark = arena->next_free;
+    const uint32_t stage = tpu_arena_alloc(arena, rows_per_pass * cols);
+
+    for (uint32_t row0 = 0; row0 < rows; row0 += rows_per_pass) {
+        const uint32_t n = (rows - row0 < rows_per_pass) ? (rows - row0)
+                                                         : rows_per_pass;
+
+        tpu_move2d(stage, cols, src_addr + row0 * src_row_bytes, src_row_bytes,
+                   n, cols, TPU_DMA_FILL);
+        /* `dst_row_bytes` stays the FULL row count and the slice is placed by
+         * its row offset, exactly as in tpu_transpose_int8. */
+        tpu_dma_transpose(stage, dst_addr + row0, n * cols, TPU_DMA_SPILL,
+                          cols, cols, dst_row_bytes);
+    }
+    tpu_wait(TPU_U_DMA);
+    arena->next_free = arena_mark;
 }
 
 /* ---- elementwise --------------------------------------------------------- */
@@ -399,28 +465,105 @@ typedef struct {
     tpu_buf  wgt;
     tpu_buf  out;
     uint32_t rq_word;
+    /* Ask for a double-buffered weight (see tpu_gemm_prefetch_depth). It is a
+     * REQUEST, not a mode: a shape whose weight already fits the arena whole
+     * has no next block to fetch, and one whose two buffers do not fit falls
+     * back to the ordinary chooser. Leaving it 0 is exactly today's behaviour,
+     * which is why it is opt-in per call site rather than a library default. */
+    unsigned prefetch;
 } tpu_gemm;
 
-/* Arena bytes one block of this shape would need. The output term is the
- * interesting one: an UNSPLIT contraction needs no int32 buffer at all, because
- * the array holds its partials in result_buf across the whole depth loop and
- * narrows on the single store. Splitting the depth is what forces 4 bytes per
- * output element into the arena, which is why the block chooser gives it up
- * last. */
+/* Arena bytes one block of this shape would need, with `wgt_buffers` copies of
+ * the weight staged (1 normally, 2 with the prefetch below). The output term is
+ * the interesting one: an UNSPLIT contraction needs no int32 buffer at all,
+ * because the array holds its partials in result_buf across the whole depth
+ * loop and narrows on the single store. Splitting the depth is what forces 4
+ * bytes per output element into the arena, which is why the block chooser gives
+ * it up last — and what the prefetch below pays to get its overlap. */
 __attribute__((always_inline))
 static inline uint32_t tpu_gemm_arena_bytes(const tpu_gemm *gemm, uint32_t rows,
-                                            uint32_t depth, uint32_t cols)
+                                            uint32_t depth, uint32_t cols,
+                                            unsigned wgt_buffers)
 {
     const unsigned requantize = (gemm->rq_word != 0u);
     const unsigned split      = (depth < gemm->depth);
     uint32_t bytes = 0u;
 
     if (gemm->act.memory == TPU_DRAM) bytes += rows * depth;
-    if (gemm->wgt.memory == TPU_DRAM) bytes += (depth * cols) >> 1;
+    if (gemm->wgt.memory == TPU_DRAM)
+        bytes += wgt_buffers * ((depth * cols) >> 1);
     if (requantize && gemm->out.memory == TPU_DRAM) bytes += rows * cols;
     if ((!requantize && gemm->out.memory == TPU_DRAM) || (requantize && split))
         bytes += rows * cols * 4u;
     return bytes;
+}
+
+/* Stage one weight block into `buf`. No barrier: whoever wants the bytes takes
+ * the fence, which is what lets the prefetch below run a block ahead.
+ *
+ * One transfer or `depth` of them, and the difference is the whole reason the
+ * prefetch splits the CONTRACTION: tpu_move2d is dense only while the block
+ * spans the tensor's whole row, i.e. while `cols` is the full width. */
+__attribute__((always_inline))
+static inline void tpu_gemm_fill_wgt(const tpu_gemm *gemm, uint32_t buf,
+                                     uint32_t col_base, uint32_t cols,
+                                     uint32_t depth_base, uint32_t depth)
+{
+    tpu_move2d(buf, cols >> 1,
+               gemm->wgt.addr + depth_base * gemm->wgt.row_bytes
+                   + (col_base >> 1),
+               gemm->wgt.row_bytes, depth, cols >> 1, TPU_DMA_FILL);
+}
+
+/* ---- the weight prefetch -------------------------------------------------
+ *
+ * A staged weight costs `depth*cols/2` bytes of DMA and the array is idle for
+ * every one of them: the dispatch that reads the block cannot be pushed until
+ * the fill has retired. Two buffers fix that — fill block n+1 while the array
+ * is still on block n — so the exposed cost per block becomes max(DMA, MXU)
+ * instead of DMA + MXU.
+ *
+ * This function answers the only hard part: how deep a block can be and still
+ * leave room for two of them. It splits the CONTRACTION and nothing else, for
+ * two reasons.
+ *
+ *   dense staging   A column split makes the staged block narrower than a row
+ *                   of the tensor, and tpu_move2d then issues one DMA command
+ *                   per contraction row — 512 commands of 32 bytes for a
+ *                   [512][128] W2. The overlap does not begin to pay that back.
+ *   one row block   With the columns whole and `rows` capped at the hardware's
+ *                   TPU_TOKENS_MAX, the column and row loops each run once, so
+ *                   the depth loop is the only loop and the pipeline below is
+ *                   a straight line rather than a nest.
+ *
+ * The bill is the int32 partials a split contraction forces (`rows*cols*4`
+ * bytes of arena and one VPU pass over `rows*cols` elements), which is why this
+ * is opt-in: on a shape where the array work per block is much smaller than the
+ * fill, the overlap it buys is smaller than the requant pass it costs.
+ *
+ * Returns 0 when two buffers never fit, and may return the whole depth when
+ * they fit trivially — in both cases the caller falls back, because a single
+ * block has no successor to prefetch.
+ */
+__attribute__((always_inline))
+static inline uint32_t tpu_gemm_prefetch_depth(const tpu_gemm *gemm,
+                                               uint32_t arena_bytes,
+                                               uint32_t rows)
+{
+    uint32_t depth_tiles = gemm->depth / TPU_ROWS;
+
+    if (depth_tiles > TPU_TILES_MAX) depth_tiles = TPU_TILES_MAX;
+    if (depth_tiles == 0u) return 0u;
+
+    while (depth_tiles > 1u &&
+           tpu_gemm_arena_bytes(gemm, rows, depth_tiles * TPU_ROWS, gemm->cols,
+                                2u) > arena_bytes)
+        depth_tiles = (depth_tiles + 1u) >> 1;
+
+    if (tpu_gemm_arena_bytes(gemm, rows, depth_tiles * TPU_ROWS, gemm->cols,
+                             2u) > arena_bytes)
+        return 0u;
+    return depth_tiles * TPU_ROWS;
 }
 
 /* The largest block the arena holds, starting from the largest the hardware
@@ -444,7 +587,7 @@ static inline void tpu_gemm_blocks(const tpu_gemm *gemm, uint32_t arena_bytes,
 
     if (gemm->rows <= TPU_TOKENS_MAX && depth_tiles <= TPU_TILES_MAX &&
         col_tiles <= TPU_TILES_MAX &&
-        tpu_gemm_arena_bytes(gemm, gemm->rows, gemm->depth, gemm->cols)
+        tpu_gemm_arena_bytes(gemm, gemm->rows, gemm->depth, gemm->cols, 1u)
             <= arena_bytes) {
         *rows_out  = gemm->rows;
         *depth_out = gemm->depth;
@@ -461,7 +604,7 @@ static inline void tpu_gemm_blocks(const tpu_gemm *gemm, uint32_t arena_bytes,
     if (col_tiles   == 0u) col_tiles   = 1u;
 
     while (tpu_gemm_arena_bytes(gemm, rows, depth_tiles * TPU_ROWS,
-                                col_tiles * TPU_COLS) > arena_bytes) {
+                                col_tiles * TPU_COLS, 1u) > arena_bytes) {
         if (col_tiles > 1u && col_tiles * TPU_COLS >= rows)
             col_tiles = (col_tiles + 1u) >> 1;
         else if (rows > 1u)
@@ -474,7 +617,7 @@ static inline void tpu_gemm_blocks(const tpu_gemm *gemm, uint32_t arena_bytes,
     *rows_out  = rows;
     *depth_out = depth_tiles * TPU_ROWS;
     *cols_out  = col_tiles * TPU_COLS;
-    TPU_ASSERT(tpu_gemm_arena_bytes(gemm, *rows_out, *depth_out, *cols_out)
+    TPU_ASSERT(tpu_gemm_arena_bytes(gemm, *rows_out, *depth_out, *cols_out, 1u)
                    <= arena_bytes,
                "matmul: the arena cannot hold even a single-tile block");
 }
@@ -490,8 +633,32 @@ static inline void tpu_matmul(const tpu_gemm *gemm, tpu_arena *arena)
                "matmul: cols must be a multiple of TPU_COLS");
 
     uint32_t rows_per_block, depth_per_block, cols_per_block;
-    tpu_gemm_blocks(gemm, arena->limit - arena->next_free, &rows_per_block,
-                    &depth_per_block, &cols_per_block);
+    unsigned prefetch = 0;
+
+#if TPU_WGT_PREFETCH
+    /* The activation has to be resident. Its staging buffer is single, so
+     * refilling it every block forces exactly the MXU fence the prefetch exists
+     * to hide behind — and double-buffering that too would spend the arena
+     * twice over for a case no kernel here has. */
+    if (gemm->prefetch && gemm->wgt.memory == TPU_DRAM &&
+        gemm->act.memory == TPU_SPAD &&
+        gemm->cols / TPU_COLS <= TPU_TILES_MAX) {
+        const uint32_t pf_rows =
+            (gemm->rows < TPU_TOKENS_MAX) ? gemm->rows : TPU_TOKENS_MAX;
+        const uint32_t pf_depth = tpu_gemm_prefetch_depth(
+            gemm, arena->limit - arena->next_free, pf_rows);
+
+        if (pf_depth != 0u && pf_depth < gemm->depth) {
+            rows_per_block  = pf_rows;
+            depth_per_block = pf_depth;
+            cols_per_block  = gemm->cols;
+            prefetch = 1;
+        }
+    }
+#endif
+    if (!prefetch)
+        tpu_gemm_blocks(gemm, arena->limit - arena->next_free, &rows_per_block,
+                        &depth_per_block, &cols_per_block);
 
     const unsigned requantize = (gemm->rq_word != 0u);
     const unsigned split_depth = (depth_per_block < gemm->depth);
@@ -514,6 +681,9 @@ static inline void tpu_matmul(const tpu_gemm *gemm, tpu_arena *arena)
         ? tpu_arena_alloc(arena, rows_per_block * depth_per_block) : 0u;
     const uint32_t wgt_buf = stage_wgt
         ? tpu_arena_alloc(arena, (depth_per_block * cols_per_block) >> 1) : 0u;
+    /* Block n lives in wgt_buf when n is even and wgt_buf1 when it is odd. */
+    const uint32_t wgt_buf1 = prefetch
+        ? tpu_arena_alloc(arena, (depth_per_block * cols_per_block) >> 1) : 0u;
     const uint32_t out8_buf = stage_out_int8
         ? tpu_arena_alloc(arena, rows_per_block * cols_per_block) : 0u;
     const uint32_t out32_buf = stage_out_int32
@@ -532,9 +702,7 @@ static inline void tpu_matmul(const tpu_gemm *gemm, tpu_arena *arena)
                                   ? (gemm->cols - col_base) : cols_per_block;
 
         if (stage_wgt_once) {
-            tpu_move2d(wgt_buf, cols >> 1,
-                       gemm->wgt.addr + (col_base >> 1), gemm->wgt.row_bytes,
-                       gemm->depth, cols >> 1, TPU_DMA_FILL);
+            tpu_gemm_fill_wgt(gemm, wgt_buf, col_base, cols, 0u, gemm->depth);
             tpu_wait(TPU_U_DMA);
         }
 
@@ -544,8 +712,17 @@ static inline void tpu_matmul(const tpu_gemm *gemm, tpu_arena *arena)
                                       ? (gemm->rows - row_base)
                                       : rows_per_block;
 
+            uint32_t depth_index = 0;
+
+            /* The pipeline's prologue: block 0 into wgt_buf, with nothing yet
+             * to overlap it. Steady state starts one iteration later. */
+            if (prefetch)
+                tpu_gemm_fill_wgt(gemm, wgt_buf, col_base, cols, 0u,
+                                  (gemm->depth < depth_per_block)
+                                      ? gemm->depth : depth_per_block);
+
             for (uint32_t depth_base = 0; depth_base < gemm->depth;
-                 depth_base += depth_per_block) {
+                 depth_base += depth_per_block, depth_index++) {
                 const uint32_t depth =
                     (gemm->depth - depth_base < depth_per_block)
                         ? (gemm->depth - depth_base) : depth_per_block;
@@ -553,12 +730,30 @@ static inline void tpu_matmul(const tpu_gemm *gemm, tpu_arena *arena)
                 uint32_t act_row, wgt_row, out_row;
                 unsigned filled = 0;
 
-                if (stage_wgt && !stage_wgt_once) {
-                    tpu_move2d(wgt_buf, cols >> 1,
-                               gemm->wgt.addr + depth_base * gemm->wgt.row_bytes
-                                   + (col_base >> 1),
-                               gemm->wgt.row_bytes, depth, cols >> 1,
-                               TPU_DMA_FILL);
+                if (prefetch) {
+                    const uint32_t next_base = depth_base + depth_per_block;
+
+                    /* This block's weight. It was issued an iteration ago and
+                     * has been streaming under the previous dispatch. */
+                    tpu_wait(TPU_U_DMA);
+                    /* The buffer the next fill is about to overwrite is the one
+                     * block n-1 read, so that dispatch has to have retired.
+                     * This is the fence the overlap is measured against: it
+                     * drains a matmul that ran WITH a fill, not after one. */
+                    if (depth_index)
+                        tpu_wait(TPU_U_MXU);
+                    if (next_base < gemm->depth)
+                        tpu_gemm_fill_wgt(gemm,
+                                          (depth_index & 1u) ? wgt_buf
+                                                             : wgt_buf1,
+                                          col_base, cols, next_base,
+                                          (gemm->depth - next_base
+                                               < depth_per_block)
+                                              ? (gemm->depth - next_base)
+                                              : depth_per_block);
+                } else if (stage_wgt && !stage_wgt_once) {
+                    tpu_gemm_fill_wgt(gemm, wgt_buf, col_base, cols, depth_base,
+                                      depth);
                     filled = 1;
                 }
                 if (stage_act) {
@@ -581,7 +776,8 @@ static inline void tpu_matmul(const tpu_gemm *gemm, tpu_arena *arena)
                 }
 
                 if (stage_wgt) {
-                    wgt_addr = wgt_buf;
+                    wgt_addr = (prefetch && (depth_index & 1u)) ? wgt_buf1
+                                                                : wgt_buf;
                     wgt_row  = cols >> 1;
                 } else {
                     wgt_addr = gemm->wgt.addr
@@ -636,8 +832,11 @@ static inline void tpu_matmul(const tpu_gemm *gemm, tpu_arena *arena)
 
                 /* Only a reused staging buffer forces a barrier inside the
                  * depth loop; back-to-back dispatches out of resident operands
-                 * stay queued. */
-                if (stage_act || (stage_wgt && !stage_wgt_once))
+                 * stay queued. With the prefetch there IS no reused buffer this
+                 * iteration — the fence moved up to just before the next fill,
+                 * which is the whole point — so taking one here would serialize
+                 * the pipeline it just built. */
+                if (!prefetch && (stage_act || (stage_wgt && !stage_wgt_once)))
                     tpu_wait(TPU_U_MXU);
             }
             tpu_wait(TPU_U_MXU);

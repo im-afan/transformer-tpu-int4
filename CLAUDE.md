@@ -7,688 +7,421 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - Respond to me concisely, and don't tell me things I didn't ask for. After making edits, create a summary of every change you made, but keep it short: concise bullet points for everything, not full paragraphs.
 - Don't use unneccessary jargon that just creates further confusion. For example, you once told me that a test has "teeth" when referring to a modified testbench... what does that even mean? Just keep the responses straightforward and simple.
 - Keep code self-documenting. Instead of writing long comments explaining everything, make variable names clear. Feel free to make names as long as needed!
+- Chill out with the comments. You don't need a 2:1 comment:code ratio, nor do you need to narrate every single line of code with a 4-line paragraph. The comments only confuse me more. Don't justify design choices in code, either. Just describe what it does (if it's confusing) and move on; leave the justification to the docs.
 - Double-check before claiming something as fact. Don't state things confidently without a source - if you can't verify it, say so or go verify it first. Trust verified evidence over a single conflicting source.
 
 ## What this is
 
-A small decoder-style transformer trained to do multi-digit **addition** (a character-level
-sequence model), plus custom hardware/backend accelerators for its core attention/matmul ops.
-The PyTorch model in `model/` is the **golden reference**; every accelerator in `accel/` is
-validated numerically against it.
+A small decoder-only transformer trained to do multi-digit **addition** (character-level),
+plus a custom SystemVerilog TPU that runs it end to end on an FPGA.
 
-The current front line is the TPU, and it is **caught up with the model**.
-[`accel/tpu/fw/adder.c`](accel/tpu/fw/adder.c) runs the whole int4 adder model —
-four transformer layers plus the output head — as one firmware kernel, 534
-commands and 1992 bytes of RISC-V, verified against the ISS and the RTL and
-scored on the addition task:
+- Everything is **int4** — weights *and* activations, trained with QAT.
+- `model/` is the golden reference. Every accelerator in `accel/` is validated against it.
+- The TPU runs on a **Digilent Cmod A7-35T** and generates autoregressively: prefill, then
+  decode against a KV cache, with the argmax and embedding lookup on the device.
 
-| | |
-| --- | --- |
-| `cd accel/tpu/tb && make fw FWPROG=adder` | 526 959 checks, **0 errors**, 453 778 clocks, 534/534 commands matched |
-| `python accel/tpulang/adder_export.py -n 256` | **100.00% exact-sequence, 100.00% token** on `model/saved/int4_d64_f256_l4.pt`, identical to the PyTorch QAT model |
+### Live shape
 
-It is composed out of [`accel/tpu/fw/tpulib.h`](accel/tpu/fw/tpulib.h), a layer
-of **size-independent primitives** over `tpu.h`'s single macro-ops: a matmul
-that blocks in rows, columns and the contraction and stages whatever is in DRAM,
-the chunked elementwise pairs, a transpose and 2-D block moves. Nothing in the
-kernel depends on the model fitting in 64 KB of scratchpad any more; it fits, so
-every activation stays resident and only the weights stream, which is a
-*residency* choice the kernel makes rather than a constraint the code carries.
-`fw/tiled.c` (`make fw FWPROG=tiled`) is the regression for the paths `adder.c`
-does not take — DRAM to DRAM, undersized arena, all three block loops running —
-and is checked against an independent Python matmul, not only against the ISS.
+`model/transformer.py::adder_int4_wide` — `d=128, f=512, layers=4, q_heads=kv_heads=4`
+(so `head_dim=32`), int4 weights and activations, no bias. `numbers_data` supplies
+`EQUALS_POS = 64` and `MAX_TOKENS = 128`.
 
-[`accel/tpu/fw/infer.c`](accel/tpu/fw/infer.c) is the same model in the
-**generative** shape: a 15-token prefill, then 16 decode steps of M=1 against a
-statically allocated KV cache, 4606 commands, one run. Both halves are one
-`infer_block(rows, first_pos)` — the cache, the mask and `tpulib.h` do not care how many
-rows arrive at once, so **M is the only difference between the training shape and
-the generation shape**. It also closes the loop on the device: `cpu_subsys.sv`
-maps the scratchpad at `0x9xxx_xxxx`, so the CPU reads the head's logits back
-and argmaxes them itself, and the embedding "gather" is a DMA at an address it
-computed from the token it chose. The host tokenizes and nothing else.
-`python accel/tpulang/infer_export.py -n 256` scores **100.00% / 100.00%**
-*generating* — not teacher-forced — and picks the same sequence as the PyTorch
-model on 256 of 256 problems.
+`accel/tpu/fw/infer.c` is that model as inference at `T=64` (a 32-token prompt), and is the
+kernel everything else points at.
 
-Everything is int4 now, weights *and* activations, on both sides: the RTL and
-`iss.py` take **int4 weights in a row-major 4-bit packed layout** and every
-narrow clips to `[-8, 7]`. Row-major inverted the attention transpose relative
-to the retired ternary kernel — `P@V`'s weight operand is now the free one and
-`Q@K^T`'s is the one needing the transposing DMA. `model/quant.py` and
-`model/calibrate.py` are the last things still describing the ternary/int8
-model and are stale against `model/transformer.py`.
+### Things that are currently out of step — check before trusting them
 
-How the model got here — the model is not int8-quantizable *post-hoc*, and QAT
-is what fixed it — is [The int8
-finding](#the-int8-finding-and-why-the-model-keeps-changing).
+- **`fw/adder.c` has not been migrated.** It is still `T=32, D=64, DFF=256` with the old
+  DRAM map (`DR_LAYER0 = 0x02000`, stride `0x06000`), while `fw_vectors.py` and
+  `adder_export.py` stage `d=128 / f=512 / T=128` at `0x20000` / `0x18000`. So
+  `make fw FWPROG=adder` and `adder_export.py` do not line up.
+- **`fw/infer.c` is compiled with `LAYERS 2`**, not the config's 4. `fw_vectors.py`'s
+  `IN_LAYERS` is 4. Set it back before trusting an accuracy number.
+- **There is no trained checkpoint at the wide shape.** `python -m model.make_dummy_checkpoint`
+  writes an untrained one at `model/saved/int4_d128_f512_l4.pt` so the export, staging and
+  RTL paths can run. Any accuracy it scores is chance — `fw/perf_notes.md`'s 0.00% is that.
+- `model/quant.py` and `model/calibrate.py` still describe the retired ternary/int8 model.
+  They fail on the missing `adder_ternary_vanilla` factory rather than exporting something
+  wrong.
 
 ## Commands
 
-Python is a package rooted at the repo, so **run from the repo root** with `-m` so imports
-resolve (`import model.transformer`, etc.):
+Python is a package rooted at the repo, so **run from the repo root** with `-m`:
 
 ```bash
-python -m model.train --arch int4_vanilla       # train (arch: vanilla | gqa | int4_vanilla)
-python -m model.tests.test_inference --arch int4 --model-path model/saved/colab_ternary_mha_small.pt
-python -m model.calibrate --model-path model/saved/colab_ternary_mha_small.pt   # int8 act scales
-python -m model.quant --model-path model/saved/ternary_mha.pt  # int8 accuracy bench
-python accel/cuda/tests/test_cuda_mha.py        # CUDA kernel vs. its own reference — needs a GPU
+python -m model.train --arch int4_wide          # vanilla | gqa | int4_vanilla | int4_wide
+python -m model.tests.test_inference --arch int4_wide
+python -m model.make_dummy_checkpoint           # untrained .pt, for plumbing only
 ```
 
-`model/quant.py` is the **hardware-exact** int8 benchmark: integers end to end, one
-`clip_int8((acc*m0 + 2**(n-1)) >> n)` requant per site, so its accuracy number is what the TPU
-would score rather than an estimate. `model/calibrate.py` is the *fake-quant* path
-(`TernaryLinear.quantize_activations`, float32 throughout) and answers a different, weaker
-question. Useful flags: `--check` (instrumented forward vs `Model.forward`), `--fake-quant`
-(the same scheme in float — if it disagrees with the integer run, the fixed-point code is the
-suspect, not the model), `--words`, `--dynamic-range`, `--dyt-scale calibrated`.
-
-The numbers below are the **PTQ-era** ones and are still what that checkpoint scores; the
-last `model/saved/ternary_mha.pt` (QAT, `layers=2`) scored 100.00% / 100.00% instead — see
-[The int8 finding](#the-int8-finding-and-why-the-model-keeps-changing).
-
-**Measured on `colab_ternary_mha_small_dyt.pt` (256 problems): float 93.36% exact-sequence /
-99.59% token, int8 activations 0.00% / 51.56%.** The fake-quant cross-check lands on
-0.00% / 51.52%, so this is the scheme, not the arithmetic. Mechanism: DyT saturates
-*completely* — `x`/`x1`/`x2` all have median = max = 1.0, i.e. the residual stream is a sign
-vector — while `Wo(A)` grows unbounded with depth, so the two addends of the attention
-residual differ by 9.6x at L0 and **3630x at L3**. `vecadd` takes two int8 operands at one
-scale, so pinning to `s_x` clips 71% of `O` (92% at L3). This is `adder_kernel.md` §8.1's
-finding with a sharper mechanism: DyT bounds the residual stream but nothing bounds what is
-added to it.
-
-**`model/saved/int4_d64_f256_l4.pt` is the live checkpoint** — the `adder_int4_vanilla`
-retrain, QAT throughout, **100.00% exact-sequence / 100.00% token** over 256 problems both
-in PyTorch and through `accel/tpu/fw/adder.c` on the ISS. It is what
-`accel/tpulang/adder_export.py` defaults to. Untracked, like every checkpoint here.
-
-`model/saved/ternary_mha.pt` is the last *ternary* QAT checkpoint (2 layers) and
-**predates ternary K/V, the removal of the positional encoding, the ternary output head
-and `layers=4`**. It no longer loads at all: `fc.weight` is an unexpected key against a
-`TernaryLinear` head. There is also **no ternary arch to retrain it with** —
-`adder_ternary_vanilla` was replaced by `adder_int4_vanilla`, so restoring the
-ternary/int8 path means restoring that factory (git history) first.
-The three `colab_ternary_mha_small*.pt` are committed but **deleted in the working tree**, so
-any command naming one fails with `FileNotFoundError` until it is restored from git; the old
-`colab_vanilla_mha.pt` / `colab_gqa.pt` / `colab_ternary_mha.pt` were deleted. `test_inference.py`
-defaults to `saved/colab_ternary_mha_small.pt`, which is wrong relative to the repo root — pass
-`model/saved/...`.
-
-`test_cuda_mha.py` JIT-compiles the CUDA kernel via `torch.utils.cpp_extension.load`, so it
-needs a CUDA toolchain + GPU. It asserts max abs diff < 1e-2 against a **softmax** einsum
-reference it defines inline — see the CUDA note below; it no longer matches the model.
-
-The venv is checked in at `.venv/` (Python 3.12). There is no requirements.txt; deps are just
-`torch` (+ jupyter for `model/notebook.ipynb`), plus `pyserial` for the FPGA host driver.
-
-TPU stack. **There is no assembler and no `.tpu` language any more** — the TPU has
-one command producer, PicoRV32 firmware in `accel/tpu/fw/`:
+TPU stack — **one command producer, PicoRV32 firmware in `accel/tpu/fw/`**. There is no
+assembler and no `.tpu` language.
 
 ```bash
-make -C accel/tpu/fw                        # C firmware -> matmul.hex (RISC-V gcc)
-make -C accel/tpu/fw PROG=adder             # ...or infer / tiled / mha / ffn / spadwin
-make -C accel/tpu/fw trace PROG=adder       # the kernel's command trace, host cc only
-python accel/tpulang/fw_vectors.py -x accel/tpu/fw/adder.trace -o accel/tpu/tb/vectors_fw -k adder
-python accel/tpu/host/run_fw_matmul.py --dry-run   # operands + reference, no board
-cd accel/tpu/tb && make fw FWPROG=adder     # the kernel through the whole core (~3 min)
-cd accel/tpu/tb && make fw FWPROG=infer     # prefill + decode, KV cache, 4606 commands
-cd accel/tpu/tb && make fw FWPROG=infer GEN=3   # ...3 generated tokens instead of 17
-cd accel/tpu/tb && make fw FWPROG=tiled     # tpulib.h's block loops, ~20 s
-cd accel/tpu/tb && make fw FWPROG=spadwin   # the CPU's scratchpad window, ~1 s
-cd accel/tpu/tb && make fwuart FWPROG=ffn   # the same, but loaded over the simulated UART
-cd accel/tpu/tb && make list                # RTL testbenches (Icarus)
+make -C accel/tpu/fw PROG=infer             # build a kernel (needs RISC-V gcc)
+make -C accel/tpu/fw PROG=infer trace       # native command trace, host cc only
+make -C accel/tpu/fw PROG=infer dis|size
 
-python accel/tpulang/adder_export.py -n 256          # accuracy, teacher-forced
-python accel/tpulang/infer_export.py -n 256          # accuracy, generating
-python accel/tpulang/adder_export.py --dump-rq -n 0  # the 16 requant words per layer
+cd accel/tpu/tb && make fw FWPROG=infer GEN=3   # through the RTL, 3 tokens
+cd accel/tpu/tb && make fw FWPROG=spadwin       # the CPU's scratchpad window, ~1 s
+cd accel/tpu/tb && make fw FWPROG=tiled         # tpulib.h's block loops, ~20 s
+cd accel/tpu/tb && make fwtime FWPROG=infer     # ...plus a per-command timeline
+cd accel/tpu/tb && make fwuart FWPROG=ffn       # the same over the simulated UART
+cd accel/tpu/tb && make list                    # RTL testbenches
+
+python accel/tpulang/infer_export.py -n 256     # accuracy, generating, on the ISS
+python accel/tpulang/adder_export.py -n 256     # accuracy, teacher-forced
+python accel/tpulang/adder_export.py --dump-rq -n 0   # the 16 requant words per layer
+python accel/tpu/host/run_adder.py -p COM5 -n 64      # on the board
+python accel/tpu/host/run_fw_matmul.py --dry-run      # one kernel, no board
 ```
 
-`fw_vectors.py` now takes the trace *binary* (`-x`) rather than a captured trace
-file, and runs it as a co-process. That is not a convenience: `infer.c` argmaxes
-its own logits over the scratchpad window and the token it picks lands in the
-*address* of the next DMA, so its command stream is not a function of the program
-alone — the ISS has to be executing the commands and answering the kernel's
-reads as they happen. `-t <file>` still works for a trace someone else captured.
+Build knobs for `infer.c`: `GEN=n` (tokens), `BATCH=n` (sequences sharing one weight
+stream), `BLOCK=n` (prefill rows per pass), `PHASE=prefill|decode|both`, `RQ=<header>`,
+`TPU_WGT_PREFETCH=0`.
 
-`make` targets in `tb/`: `sim` (default TB), `cosim` (host driver vs RTL over a
-simulated UART), `fw` / `fwuart` / `fwsweep` (C firmware; all need a RISC-V gcc,
-and regenerate golden vectors from the kernel's own native trace first),
-`echo`/`mem`/`bram` (bring-up images), `wave`, `list`, `all`.
+`fw_vectors.py` takes the trace **binary** (`-x`) and runs it as a co-process, because
+`infer.c` argmaxes its own logits and the token it picks lands in the *address* of the next
+DMA — its command stream is not a function of the program alone. `-t <file>` still reads a
+captured trace.
 
-**`fw` and `fwuart` run the same kernel against the same ISS vectors and differ
-only in how the bytes get in.** `fw` backdoors the image through `FW_INIT` and
-pokes DRAM directly; `fwuart` (`tb/fw_uart_tb.sv`) drives the two serial pins and
-nothing else — `'I'` the firmware, `'W'` the operands *including the weights*,
-`'G'`, `'T'`, `'R'` — which is the sequence `host/run_fw_matmul.py` runs on the
-board. Use `fw` to iterate and `fwuart` to prove the host path. **`make fwuart
-FWPROG=adder` passes with a counter block bit-identical to `make fw`'s** (531 102
-checks, 534/534 commands, `run=453 777`), which is the point: the serial path
-changes only how the bytes arrive. It costs 17.8 M simulated clocks — **~21 min
-of Icarus against `make fw`'s ~3** — because at the default `FWUART_CPB=16` a
-byte is 160 core clocks and 102 KB of operands is 16.3 M of them (`FWUART_CPB=8`
-halves it; below 8 the receiver's mid-bit sample stops being mid-bit). `make fwuart FWPROG=<kernel> RERUN=1` loads and runs a second
-time with no reset in between — that is a regression, not a formality: it is what
-caught `tpu_top.sv` clearing `cpu_run` against the *previous* run's stale
-`cpu_done`, so the second `'G'` released the core for one cycle and re-reset it
-(`docs/picorv32_migration.md` §9.11).
+Deps are `torch` (+ jupyter for `model/notebook.ipynb`) and `pyserial` for the host driver.
+The venv is checked in at `.venv/` (Python 3.12); there is no requirements.txt.
 
 ## Architecture
 
-**`model/transformer.py`** — the whole model. It has changed a lot recently; the shape below is
-what is in the tree, not what `model/README.md` describes (that file is stale — see
-[Stale docs](#stale-docs)).
+### `model/transformer.py`
 
-- **5-D attention tensor layout.** Q/K/V are shaped `[batch, tokens, kv_heads, heads_per_q,
-  head_dim]` (K/V drop the `heads_per_q` axis) rather than the usual flat head layout. GQA is
-  expressed by broadcasting `kv_heads` over `heads_per_q`. The attention math is the einsum
-  pair `"btkgh,bskh->btskg"` (scores) and `"btskg,bskh->btkgh"` (weighted values). This layout
-  is the contract every accelerator implements.
-- **ReLU attention, not softmax.** `P = relu(S + causal_mask)`, with the mask built as
-  `triu(ones([T,T]) * -1e9, diagonal=1)`. There is no normalization over the source axis at
-  all. (The comment in the code says "revert to softmax if training bad".)
-- **Every activation is int4, K and V included.** The old `q_kt`/`q_vt` — a second narrow
-  rounding K and V onto `{-1,0,1}` on top of the int8 `q_k`/`q_v` — are **gone**, and so is
-  the `TernaryQuant` helper. They existed only because the MXU multiplies an int8 activation
-  by a ternary *weight* and cannot multiply int8 by int8, so the operand landing on the
-  weight side had to be a trit (`adder_kernel.md` §2.5). With weights and activations at the
-  same width the second rounding does nothing but lose precision.
-- **There is no positional encoding.** `Model.positional_encoding` is gone and
-  `Model.forward` embeds and nothing else. The only position signal left is the causal
-  mask; ReLU attention has no source-axis normalization, so the magnitude of `P @ V`
-  carries the count of visible keys. The same removal under softmax would leave the
-  model position-blind.
-- **Attention is inlined.** The old `mha_torch` / `slow_mha_cuda` helpers are **gone**; the math
-  now lives directly in `MultiHeadAttention.forward`. `use_custom_attention` still threads
-  `Model.forward → Transformer → MultiHeadAttention.forward` but is **accepted and ignored** —
-  there is no CUDA path from the model any more.
-- **No LayerNorm.** Removed in `2f6e32f`; `norm1`/`norm2` are now `DyT` (dynamic tanh,
-  arxiv 2503.10622) — `hardtanh(x * alpha)` with a single learned scalar and no gamma/beta.
-  The committed `colab_ternary_mha_small_nobias.pt` predates DyT (it has *no* normalization at
-  all); `colab_ternary_mha_small_dyt.pt` is the DyT run.
-- **Double residual.** `MultiHeadAttention.forward` ends in `return O + X`, and
-  `Transformer.forward` adds `X` again. Deliberate or not, the checkpoints were fitted to it,
-  so a reimplementation must reproduce it.
-- **The padding mask is threaded through and never applied.** `attn_mask` reaches
-  `MultiHeadAttention.forward` and is unused; only the causal mask is applied.
-- **int4 weights.** `Int4Linear` quantizes weights to `[-8, 7]` scaled by `absmax/7`, with
-  `RoundClip` (now taking explicit `qmin`/`qmax`) providing the straight-through-estimator
-  backward. The scale is **detached** — an absmax gradient lands entirely on one element —
-  unlike `TernaryLinear`, whose absmean averages over the tensor and can stay live. The
-  weight is `[in_dim, out_dim]` with `x @ w`, the *transpose* of `nn.Linear`, so int4 and
-  float checkpoints are not interchangeable. `make_linear(..., use_int4)` selects it —
-  **including `Model.fc`**. A float config (`adder_vanilla`, `adder_gqa`) still gets an
-  `nn.Linear` head, which is the only thing `quantize_head` / `dynamic_fake_quant` still
-  apply to. The head's output is never requantized — an argmax does not care about scale.
-  `TernaryLinear` is retained but **no config builds one**; it is what `model/quant.py` and
-  the `accel/` export path import.
-- **int4 activation quantization is QAT, not post-hoc.** Every requant site is an
-  `ActQuant` module holding one per-tensor scale, learned by LSQ (`FakeQuant` implements the
-  straight-through input gradient and the analytic scale gradient). Sites the hardware *pins*
-  to another tensor's scale share one `ActQuant` **instance** — `q_o`/`q_xo` are the residual
-  stream's `x_quant`, `q_p is q_s`, `q_hr is q_h` — so the sharing in `__init__` is load-bearing,
-  not a shorthand. The default grid is `INT4_QMIN, INT4_QMAX = -8, 7`. DyT outputs are pinned
-  to `fixed_scale=1/7` (`hardtanh` bounds them analytically) with `qmin=-7`, symmetric because
-  hardtanh is odd. `set_quant_enabled(model, False)` turns them all off — **necessary to get a
-  real float baseline**, since they are live by default. `TernaryLinear.act_scale` is the *old*
-  PTQ buffer and is vestigial; `model/calibrate.py` drives that dead path.
-- **MoE is gone** — the `use_moe` expert FFN was removed, along with the vanilla/GQA checkpoints.
-- **Named configs** at the bottom (`adder_vanilla`, `adder_gqa`, `adder_int4_vanilla`) are
-  the source of truth for hyperparameters and are wired to the `--arch` choices in `train.py`.
-  `adder_int4_vanilla` is `d=64, f=256, layers=4, q_heads=kv_heads=4` (so `head_dim=16`),
-  `use_int4=True, use_bias=False`. The biases are off because the TPU's VPU has no
-  row-broadcast operand (see the comment on that factory).
-  It replaced `adder_ternary_vanilla` (`d=128, f=128`, ternary weights, int8 activations),
-  and **the `accel/` stack has followed**: the MXU multiplies an int4 weight by an int4
-  activation, `accel/tpu/fw/adder.c` is this exact shape, and
-  `accel/tpulang/adder_export.py` scores it. `model/quant.py` and `model/calibrate.py`
-  are the leftovers — both still describe the ternary/int8 model and both fail on the
-  missing `adder_ternary_vanilla` rather than exporting something wrong.
+- **5-D attention layout.** Q/K/V are `[batch, tokens, kv_heads, heads_per_q, head_dim]`
+  (K/V drop `heads_per_q`). GQA is broadcasting `kv_heads` over `heads_per_q`. The math is
+  the einsum pair `"btkgh,bskh->btskg"` and `"btskg,bskh->btkgh"`. This is the contract every
+  accelerator implements.
+- **ReLU attention, not softmax.** `P = relu(S + causal_mask)`, mask built as
+  `triu(ones([T,T]) * -1e9, diagonal=1)`. No normalization over the source axis at all.
+  (The code still carries the comment "revert to softmax if training bad".)
+- **No positional encoding.** The only position signal is the causal mask; with no
+  source-axis normalization the *magnitude* of `P @ V` carries the count of visible keys.
+  The same removal under softmax would leave the model position-blind.
+- **No LayerNorm.** `norm1`/`norm2` are `DyT` — `hardtanh(x * alpha)`, one learned scalar,
+  no gamma/beta.
+- **Double residual.** `MultiHeadAttention.forward` ends in `return O + X` and
+  `Transformer.forward` adds `X` again, so the attention residual is `2X + O`. The
+  checkpoints were fitted to it.
+- **Attention is inlined** in `MultiHeadAttention.forward`. `use_custom_attention` still
+  threads down but is accepted and ignored — there is no CUDA path from the model.
+- **The padding mask is threaded through and never applied.** Only the causal mask is used.
+- **int4 weights (`Int4Linear`).** `[-8, 7]` scaled by `absmax/7`, `RoundClip` as the STE.
+  The scale is **detached**. The weight is `[in_dim, out_dim]` with `x @ w` — the transpose
+  of `nn.Linear`, so int4 and float checkpoints are not interchangeable. `make_linear(...,
+  use_int4)` selects it, **including `Model.fc`**; the head's output is never requantized,
+  since an argmax does not care about scale. `TernaryLinear` is retained but no config
+  builds one.
+- **int4 activations are QAT, not post-hoc.** Every requant site is an `ActQuant` with one
+  per-tensor LSQ-learned scale. Sites the hardware *pins* share one **instance** —
+  `q_o`/`q_xo` are the residual stream's `x_quant`, `q_p is q_s`, `q_hr is q_h` — so the
+  sharing in `__init__` is load-bearing. DyT outputs are pinned to `fixed_scale=1/7` with
+  `qmin=-7` (hardtanh bounds them analytically, symmetric because hardtanh is odd).
+  `set_quant_enabled(model, False)` turns them all off — **necessary for a real float
+  baseline**, since they are live by default.
+- **MoE is gone.**
+- Named configs at the bottom are the source of truth and are wired to `--arch`.
 
-**`model/numbers_data.py`** — synthetic dataset. Non-obvious invariants:
+### `model/numbers_data.py`
 
-- **Fixed answer position.** `EQUALS_POS = 15` is the index of the first **answer digit** (`=`
-  is at 14). Operands are padded so this holds regardless of operand length; `train.py` and
-  `test_inference.py` slice with the constant rather than searching for `=`. Implies
-  `max_digits ≤ 6` — at 7 digits the pad count goes negative and every slice silently shifts.
-- Padding token is `'N'` (`PAD_ID = 12`); `tokenize` builds an additive `-1e9` attention mask
-  from the pad positions (`mask + mask.T`) — which the model then ignores.
-- Operand lengths are sampled uniformly over digit-count (`_sample_number`), not uniformly over
-  value. Answer digits are most-significant-first (no reversed-digit trick).
+- **Digits are reversed** (`REVERSE_DIGITS = True`): `123+45=168` is emitted as
+  `321+54=861`. Carries propagate from the ones digit up, which is the direction an
+  autoregressive model can see, and it fixes place value to position.
+- **`EQUALS_POS = 64`** is the first *answer* position; `=` is at 63. Operands are padded so
+  this holds regardless of length. Implies `max_digits <= (EQUALS_POS - 2) // 2` = 31, and
+  the generator raises rather than silently shifting.
+- `equals_pos` is a per-call argument. `infer_export.py` pins it to 32 for the `T=64` kernel.
+- Padding token is `'N'` (`PAD_ID = 12`); `tokenize` builds an additive `-1e9` mask from the
+  pad positions, which the model ignores.
+- `_sample_number` samples uniformly over **digit count**, not value.
+- `MAX_INTEGER = 99999` is vestigial.
 
-**`model/train.py`** — `batch_size` vs `mini_batch_size` implements **gradient accumulation**
-(`steps_per_batch = batch_size // mini_batch_size`); `optim.step()` only fires every
-`steps_per_batch` micro-steps. **Gradient clipping** (`--grad_clip`, default 1.0) is applied to
-the *accumulated* gradient immediately before the step — clipping each micro-batch instead
-would bound the partial sums separately; the reported `grad_norm` mean/max/clipped counts are
-the pre-clip norms. The loss spans `EQUALS_POS-1 : -1` against `EQUALS_POS:`, so the trailing
-pad tokens are part of the objective on purpose. Checkpoints go to `model/saved/test_model_*.pt`,
-keeping only the last 3 (gitignored; the committed `colab_*.pt` are not produced by this path).
+### `model/train.py`
 
-## Accelerators (`accel/`)
+- `batch_size` vs `mini_batch_size` is **gradient accumulation**;
+  `optim.step()` fires every `batch_size // mini_batch_size` micro-steps.
+- **Gradient clipping** (`--grad_clip`, default 1.0) applies to the *accumulated* gradient
+  immediately before the step; reported `grad_norm` stats are pre-clip.
+- The loss spans `EQUALS_POS-1 : -1` against `EQUALS_POS:`, so the trailing pads are part of
+  the objective on purpose.
+- Checkpoints go to `model/saved/test_model_*.pt`, last 3 kept, gitignored.
 
-- **`cuda/`** (`kernels.cu` + `bindings.cpp`) — hand-written CUDA MHA/GQA kernel. **Now out of
-  sync with the model**: it implements *softmax* attention and the model does ReLU attention,
-  and nothing in `model/` loads it any more. It still passes its own self-contained test. Treat
-  it as legacy unless someone re-syncs it.
-- **The VPU implements six ops and nothing else.** `VOP_DOT`, `ADD`, `RELU`,
-  `REQUANT`, `DYT`, `QUANT4`. `QUANT4` (`0x22`, `VOP_QUANT4 = 17`, formerly `tquant`)
-  is the newest: `requant`'s fixed point clipped to `[-8, 7]`, written **4 bits wide**
-  in the MXU's weight encoding, two elements to a byte — int8 in, a packed int4 weight
-  row out. It is what lets an activation be a weight operand, and therefore what put
-  attention's `Q@K^T` and `P@V` on the array. Its `vlen` must be a multiple of 2 (the
-  write strobe is per byte) and its destination advances half as fast as its source.
-  **`VECMATMUL` was removed** once that left it with no caller: it sequenced one
-  `VOP_DOT` per (row, col) pair and was 36.4% of the whole run when attention still
-  ran on it (`docs/macro_ops.md` §7). Gone with it: the `mm_*` sequencer, `cfg` 10-14
-  (`vrows`/`vcols`/`vrow0`/`vrow1`/`vcrow`), the `VPU_GEOM` command (`cmd_vpu.sv`
-  `0x02`, so the VPU now has exactly one command type), `tpu_vpu_geom()` in `fw/tpu.h`,
-  and `vpu_mm_busy` — perf counter 6 (`vmm`) is tied low and kept only so the UART
-  `'T'` reply does not renumber. `VOP_DOT` stayed: it has no caller either, but it *is*
-  the reduction path (accumulator, fold, `S_WB` scalar store) and the only int8 x int8
-  reduction the ISA has. `GELU`, `EXP`, `SQUARE`, `ELEMENT_MUL`, `SCALAR_MUL/ADD/DIV`,
-  `REDUCEMAX`, `REDUCESUM` and the `SOFTMAX` macro op were **removed** — they served a
-  softmax/LayerNorm/GELU model and the current one is ReLU attention + DyT + ReLU FFN.
-  Gone with them: both 256-entry activation ROMs, `rtl/luts/`, `accel/tpulang/luts.py`,
-  the `GELU_INIT`/`EXP_INIT` parameters, the restoring divider, the softmax sequencer, the
-  reduction path's **max fold** (`DOT` is the only reduction, so `acc` always opens at 0),
-  `cfg vscalar`, and `examples/softmax_row.tpu` / `softmax_rows.tpu`. Measured by OOC
-  synthesis of `vpu` alone: **10012 → 5162 LUTs (−48%), 897 → 667 FFs (−26%), 90 → 32 DSPs
-  (−64%)**. Full table and what restoring softmax would cost: `accel/tpu/docs/vpu.md`
-  §Removed ops.
-  - **Retired opcodes are holes, not free space.** `0x02`, `0x05`, `0x0A`–`0x0F`, `0x1B`,
-    `0x1E`, `0x20` are not reallocated, so a stale binary decodes to an unknown op rather
-    than a different one — likewise VPU op selector 13 and VPU command `0x02`. `cfg`
-    indices 9 (`vscalar`) and 10–14 (`vecmatmul`'s geometry) are vacant for the same
-    reason: renumbering would silently repoint 15–17, the DMA transpose geometry. `0x22`
-    is `quant4`; new ops go at `0x23`+.
-  - **`vecdot` survives although no kernel issues it**: it is the reduction datapath
-    itself — accumulator, lane fold and scalar store — and the only int8 x int8
-    reduction the ISA has, so the opcode costs one decode arm over hardware that has to
-    be there anyway.
-- **`tpu/`** — a SystemVerilog TPU running on a **Digilent Cmod A7-35T** (see
-  `accel/tpu/README.md` and `accel/tpu/docs/`). The array, VPU, banked scratchpad, DMA +
-  external SRAM, scalar unit and UART link are all synthesizable, and the design **fits**:
-  `make bit` completes at 13342 LUTs of 20800 (64%), 7543 FFs, WNS +26.2 ns, timing met
-  (measured 2026-08-17). The long-standing "857 LUTs over" note stopped reproducing — the
-  MXU is 5930 LUTs post-route against the 14476 post-synth that note was written about, and
-  nothing in the memory-path work touched it. `accel/tpu/docs/synth.md` §5 carries the
-  current numbers beside the historical ones.
-  `host/run_program.py`
-  loads a program over UART, runs it, and checks the readback against both the ISS and PyTorch.
-  Recent RTL work: `perf_counters.sv` (replaces `cycle_timer.sv`) and the **macro-op ISA**
-  (`docs/macro_ops.md`) — phases 0–3 are *built and passing*: `setcfgr`, MXU config strides
-  and `matmul_t` (hardware tile loop). Phase 4's `vecmatmul` and phase 5's hardware
-  `softmax` were both built, validated, and then **removed** (see the VPU note above); `layernorm` + the `rsqrt` LUT
-  are not built and are now dropped — DyT replaced LayerNorm and needs no macro op. Still stubbed: the inter-TPU LINK (`wrneigh` is a completing no-op).
-- **Dispatch is a 128-bit macro-op pushed into a per-unit queue, not a wire bundle
-  plus a global config file.** `cmd_queue.sv` + `cmd_{mxu,vpu,dma}.sv` sit in front
-  of each unit; a command carries its own operands and geometry, so nothing an
-  earlier dispatch (or an earlier *program*) left in a register can reach it. Two
-  producers push: `scalar_unit.sv` still runs tpulang and still waits after every
-  dispatch — so **every `.tpu` program, `iss.py` and every golden vector is
-  unchanged** — and `cpu_subsys.sv` (PicoRV32 + AXI4-Lite, `rtl/vendor/picorv32.v`)
-  pushes the same commands from firmware. Firmware is `accel/tpu/fw/`: `tpu.h` is
-  the MMIO aperture plus one builder per command, and the Makefile wants a
-  bare-metal RISC-V gcc at **`-march=rv32ic_zmmul`** — *not* `rv32imc`, the core
-  is built with `ENABLE_DIV(0)` and a `div` traps. Two C kernels, same
-  `[8x32] @ [32x16]` problem and same addresses: `matmul.c` (one `matmul_t`, the
-  array walks the 4x2 tile grid) and `matmul_loop.c` (the grid walked in C as 8
-  single-tile dispatches, `.acc` across the contraction — the firmware analogue
-  of `tiled_matmul.tpu` vs `tiled_matmul_hw.tpu`). `host/run_fw_matmul.py` loads
-  either over `'I'` (word address bit 12 picks the CPU's RAM over IMEM) and
-  checks the result; `make -C accel/tpu/fw PROG=matmul_loop` builds the second. Two more kernels
-  exercise the rest of the machine: **`ffn.c`** (X@W1 -> relu -> requant -> @W2)
-  is the first firmware to issue a **VPU** command at all, and **`mha.c`** (one
-  head of ReLU attention) adds the **transposing DMA** and the `quant4` pack.
-  Both pass through `make fw FWPROG=ffn|mha` and are checked against an
-  independent Python reference as well as the ISS. **`tiled.c`** is the fifth and
-  is written against `tpulib.h` rather than `tpu.h`: three DRAM-to-DRAM problems
-  with an undersized arena, so the row, column and contraction loops all have to
-  run (`make fw FWPROG=tiled`, 80 404 clocks, 237 commands).
-  Both build with Homebrew `riscv64-elf-gcc` 16.2.0 and both **pass in
-  simulation** — `cd accel/tpu/tb && make fw [FWPROG=matmul_loop]` runs the image
-  out of `FW_INIT` through the whole core, 129 checks, 0 errors. **Not yet run on
-  hardware.** `make fwsweep` walks the shape (both kernels take `M=`/`KTILES=`/
-  `NTILES=` at build time) and measures the point of the exercise: the hardware
-  tile walk costs the CPU **~380 clocks at every shape** (5 commands, flat over a
-  205x range of array work), the C loop costs **~85 clocks per dispatch**, of
-  which only `max(0, 85 − MXU-clocks-per-tile)` is exposed — zero once M > ~24.
-  `docs/picorv32_migration.md` §9.6–9.7 carry the breakdown; §9.5 now also records
-  that the `qfull` counter is **structurally 0** (both producers gate `cmd_we`
-  with `!cmd_full`, so `p_cmd_we & p_cmd_full` never fires) and proves nothing.
-  `docs/picorv32_migration.md` is the
-  design record and carries the format table, the measured baseline and the phase
-  plan; §0's table is what actually passes today. **Measured cost of the plane on
-  the four-layer model: 690 705 → 693 107 clocks (+0.35%), byte-identical
-  output.** Issue overhead went 6 914 → 9 229 clocks (1.00% → 1.33% of the run);
-  the units gave back 1 536 of that (the requant literal), and the DMA's skid
-  drain cost 1 622. None of the ~1.45x overlap is claimed yet — the scalar unit
-  still waits after every dispatch, and `ovlap` reads 0.
-  - **The requant `{m0,n}` is now a literal in the command**, not a scratchpad
-    address. Same 16 bits either way, and it deleted a two-state fetch in both
-    `mxu.sv` and `vpu.sv`. The scalar unit, whose ISA still names an *address*,
-    reads the word over the S port before packing — a shim that exists only while
-    tpulang is a producer.
-  - **`scratchpad.sv`'s exclusivity invariant is gone.** It held only because
-    issue-and-wait serialized the units; queues break it on purpose. Arbitration
-    is now real, with grants (`V_rgnt`/`s_rgnt`/`dma_rgnt` and the write pair),
-    ordered so the requester that cannot stall wins: reads `A>W>C>V>s>DMA`,
-    writes `C>V>s>DMA`. The VPU freezes its FSM for a clock when denied; the DMA
-    parks fill bytes in a skid buffer and, past that, stops the SRAM read stream
-    through `sram.sv`'s new `dout_ready`. **If you make two units run at once,
-    check every path into the scratchpad takes its grant back** — a denied
-    requester that ignores it loses the access silently.
-  - **`swait` stopped meaning "control overhead"** once dispatch went through
-    queues. The counter block is 10 wide now: 0–6 unchanged (so the UART `'T'`
-    reply stays prefix-compatible), plus `idlec` (clocks with *no* unit busy —
-    this is what instruction overhead costs), `qfull` and `ovlap`. Under the
-    scalar unit `ovlap` and `qfull` are identically 0, which is the check that
-    the command plane is in the path and not yet changing behaviour.
-- **`sram.sv` moves ranges, not bytes.** One request is a start address, a byte count and an
-  address stride; `dma.sv` issues one range per source row (in linear mode, one for the whole
-  transfer) and streams it. **1 clock/byte on fills, 2 on spills**, against ~8 before, and the
-  full adder model through `tb/tpu_top_tb.sv` went **1 226 722 → 541 590 clocks (2.27x)** with
-  byte-identical output — DMA fell from 66% of the run to 24%. Two things to know before
-  touching it: writes are two clocks because **WE# is generated on the falling edge**, so its
-  rising edge lands half a clock clear of the address/data change (the chip's address hold is
-  0 ns, i.e. met by skew alone if you drive it from the rising edge — the failure mode is a
-  byte written to its *neighbour*, and both `sram_tb` and `dma_tb` now check for it); and the
-  `stride` exists for `wrmem.t`, whose destination is column-major and would otherwise be one
-  range per byte. `CLOCKS_PER_ACCESS` is now *extra* clocks per beat and is 0 on every board.
-  `accel/tpu/docs/dma.md` §7 and `rtl/sram.sv`'s header are the full story.
-- **19-bit DRAM addressing from programs.** `scalar_unit.sv` used to truncate a `rdmem`/`wrmem`
-  DRAM address to 16 bits, so a *program* could only reach the low 64 KB of the 512 KB SRAM even
-  though the host always could. Widening it to `MEM_ADDR_W = 19` is what let the 96 KB of model
-  weights stay resident. It broke three things that were invisible while both widths agreed
-  below 64 KB, all documented in `accel/tpulang/adder_kernel.md` §2: `li` had to stop
-  sign-extending, the testbenches' DRAM byte maps were sized off `ADDR_W` (so high expectations
-  were *silently dropped* by `$readmemh`), and `tpu_top_tb`'s backdoor pokes truncated too.
-  **When something addresses DRAM, check it is not using `ADDR_W`.**
-- **`tpulang/`** — four files, all that is left of the software stack after the
-  assembler and the `.tpu` language were deleted. `iss.py` (bit-exact with the RTL;
-  the instruction decoder is gone, `exec_command`/`run_trace` are the way in),
-  `fw_vectors.py` (a firmware kernel's command trace → golden DRAM images + the
-  expected command stream, plus the **one** definition of each kernel's synthetic
-  operands), `adder_export.py` (real checkpoint → requant table → trace →
-  accuracy, teacher-forced) and `infer_export.py` (the same checkpoint
-  *generating*, through `fw/infer.c`). The directory name is now a fossil.
-  - **`fw_vectors.py` runs the trace binary itself** (`-x`), as a co-process:
-    it executes each command on the ISS as it arrives and answers the kernel's
-    scratchpad reads out of the model's memory (`coexecute`). A kernel that
-    branches on its own results has no trace otherwise — `infer.c`'s argmax puts
-    the chosen token in the *address* of the next DMA. `-t` still reads a
-    captured file.
-- **`fw/tpulib.h` is the primitive layer, and it is written to be specialized.**
-  `tpu_matmul` blocks a GEMM in rows (`t_len <= 32`), columns and the contraction,
-  stages whichever operands are in DRAM through a caller-supplied `tpu_arena`,
-  and requants on store when the contraction was unsplit or through the VPU when
-  it was not; `tpu_add_narrow` / `tpu_relu_narrow` / `tpu_pack4` chunk the VPU
-  pairs at `vlen` and stream DRAM operands; `tpu_transpose_int8` and `tpu_move2d`
-  cover the rest. Every primitive is **self-fencing** — it returns only once its
-  commands have retired — so composing two is always safe.
-  - **`tpu_matmul`, `tpu_gemm_blocks` and `tpu_gemm_arena_bytes` are `always_inline`,
-    and that is load-bearing, not cosmetic.** Everything a primitive computes
-    before its first push is exposed clock for clock (the caller has just
-    fenced) and the PicoRV32 is ~5-9 clocks per instruction with no cache, so
-    ~200 instructions of block arithmetic per matmul costs more than the array
-    spends on the dispatch. With the shape constant at the call site gcc folds
-    the chooser, the loops and every staging branch away; without the fold the
-    same kernel runs **597 936 clocks instead of 453 778** and the image is
-    *larger*. Measured three ways in `docs/picorv32_migration.md` §9.10. If you
-    add a firmware abstraction, check the disassembly, not the command count.
-  - `fw/tiled.c` is the regression for the block loops themselves: DRAM to DRAM,
-    an arena of a few hundred bytes, and `fw_vectors.py::reference_tiled`
-    checking the ISS against a plain Python matmul — because a mis-tiled matmul
-    is something the ISS would reproduce as faithfully as the RTL.
-- **`fw/adder.c` is not an example — it is the whole shipped model** (four layers
-  + the output head) in **534 commands and 1992 bytes**, one program, one run,
-  composed out of `tpulib.h`. `LAYERS` is the only thing that moves when the
-  model's depth changes. Its byte-level contract — DRAM/scratchpad maps, the 16
-  requant `{m0,n}` words per layer, the row-major int4 packing, why K is
-  transposed and V is not — is that file's header and
-  `accel/tpu/fw/README.md`. Read those before touching the kernel or the host
-  staging. `Wq`/`Wk`/`Wv` are **three dense `[D][D]` DRAM blocks**, not one
-  fused `[D][3D]` one: fusing the fill was free when the kernel staged its own
-  weights, and under `tpu_matmul` a column slice of a fused block is strided and
-  would cost D transfers.
-  - **The requant table is a compile-time input**, because the `{m0,n}` word is a
-    literal in the macro-op and the CPU has no path to **DRAM**. (It does have
-    one to the scratchpad — see `infer.c` below — but a requant word arrives
-    with the command, not out of memory.) `fw/adder_rq.h` is the checked-in
-    default and is tuned for `fw_vectors.py`'s synthetic operands, so the RTL
-    regression needs no checkpoint; `adder_export.py` generates a real one and
-    compiles the kernel against it with `-DADDER_RQ_H`.
-- **`fw/infer.c` is the same model as inference**: a 15-token prefill and 16
-  decode steps of M=1 against a **statically allocated KV cache**, 4606 commands,
-  one run, the same `adder_rq.h` table. One `infer_block(rows, first_pos)` serves both, so
-  M is the only difference between the two shapes. Its contract is that file's
-  header and `fw/README.md`; the parts that are not obvious:
-  - **The cache is 3 KB per layer and each half is stored in the orientation its
-    matmul wants**, because the append is what a cache costs. V's is free (one
-    `quant4` row, exactly how V leaves its projection); K's is a *column* of a
-    column-major `[D][T]`, which is the transposing DMA (`fill.t`, `tdrow = T`) —
-    one command for any M. K stays int8 and is re-packed whole each layer-step:
-    the nibble for `(d, t)` is half a byte and no op writes half a byte.
-  - **Nothing is zeroed and nothing needs to be.** The mask that makes attention
-    causal (`-8` against an int4 score, then ReLU) is also what makes the
-    uninitialized tail of the cache exactly zero. So the scratchpad is not
-    cleared between problems, on the board or in `infer_export.py`.
-  - **The argmax and the embedding gather are on the device.** `cpu_subsys.sv`
-    maps the scratchpad at `0x9xxx_xxxx`, so the head writes its logits there and
-    the CPU reads them back (`tpu_spad_ld`) and gathers `DR_EMB + tok*D` with a
-    DMA. `adder.c`'s "the host owns these two, structurally" was true of the
-    command ISA and never of the machine. `fw/spadwin.c` is that window's own
-    ~1 s regression; the window is **unsynchronized** — a load is not a command,
-    so it needs the same `tpu_wait` a dependent command would, 32 bits wide and
-    4-byte aligned (the S port has no byte strobes).
+## The TPU (`accel/tpu/`)
 
-When touching attention numerics, keep the implementations in sync:
-`model/transformer.py` (reference), `fw/adder.c` + `fw/infer.c` + `iss.py`, and
-the RTL.
+Everything is int4 on both sides: the RTL and `iss.py` take **int4 weights in a row-major
+4-bit packed layout**, and every narrow clips to `[-8, 7]`. Row-major inverted the attention
+transpose relative to the retired ternary kernel — `P@V`'s weight operand is now the free
+one and `Q@K^T`'s is the one needing the transposing DMA.
 
-## The int8 finding, and why the model keeps changing
+### Dispatch
 
-> **The numbers in this section describe the architecture *before* ternary K/V.**
-> `model/saved/ternary_mha.pt` was fitted with int8 K and V, a positional encoding and
-> `vecmatmul` attention; it has no `q_kt`/`q_vt` and its weights never saw a ternary K,
-> so `adder_export.py` on it no longer measures the shipped kernel. **The model needs
-> retraining** before rows 8-10 of `adder_kernel.md` §7 can be repeated, and the ternary
-> config that would train it no longer exists — see the note at the top of this file.
-> `QATCalibration` now falls back to the
-> calibration set for any site whose `ActQuant.initialized` flag is clear, so a stale
-> checkpoint degrades rather than silently quantizing with a scale of 1.0. Everything
-> below about *why* PTQ fails here is unaffected by the change.
+- **A dispatch is a 128-bit macro-op pushed into a per-unit queue**, not a wire bundle plus a
+  global config file. `cmd_queue.sv` + `cmd_{mxu,vpu,dma}.sv` sit in front of each unit; a
+  command carries its own operands and geometry, so nothing an earlier dispatch — or an
+  earlier *program* — left in a register can reach it.
+- **The requant `{m0,n}` is a literal in the command**, not a scratchpad address. Same 16
+  bits, and it deleted a two-state fetch in both `mxu.sv` and `vpu.sv`. The consequence:
+  **the requant table has to be compiled into the firmware image.**
+- **`scratchpad.sv`'s exclusivity invariant is gone.** It held only because issue-and-wait
+  serialized the units. Arbitration is real, with grants ordered so the requester that cannot
+  stall wins: reads `A>W>C>V>s>DMA`, writes `C>V>s>DMA`. The VPU freezes for a clock when
+  denied; the DMA parks fill bytes in a skid buffer and, past that, stops the SRAM read
+  stream. **If you make two units run at once, check every path into the scratchpad takes
+  its grant back** — a denied requester that ignores it loses the access silently.
+- **Perf counters are 10 wide**: run, mxu, mload, vpu, dma, swait, vmm, idlec, qfull, ovlap.
+  `swait` and `vmm` are **retired slots tied low**, kept so the UART `'T'` reply does not
+  renumber. `idlec` (no unit busy) is what instruction overhead costs. `qfull` is
+  structurally 0 — both producers gate `cmd_we` with `!cmd_full`.
+- **Retired opcodes are holes, not free space.** `0x02`, `0x05`, `0x0A`–`0x0F`, `0x1B`,
+  `0x1E`, `0x20`; VPU op selector 13; VPU command `0x02`; `cfg` indices 9 and 10–14. A stale
+  binary decodes to an unknown op rather than a different one. `0x22` is `quant4`; new ops
+  go at `0x23`+.
 
-**Resolved on the `qat` branch: train through the quantizers and the same kernel scores
-100.00% exact-sequence / 100.00% token** (`adder_export.py -n 256 -c 128 --iss-check` on
-`model/saved/ternary_mha.pt`, ISS cross-check 0/416 logits differ; `adder_kernel.md` §7.6c).
-Nothing in the kernel changed *at that point* — it was byte-identical to the one that scored
-0.00% below; the ternary-K/V rewrite came after. What
-changed is that every requant site is an `ActQuant` present during training with an LSQ-learned
-scale, so the clipping is part of the fitted function rather than damage inflicted afterwards.
+### The VPU has six ops and nothing else
 
-Three consequences worth internalizing before reading the PTQ history below:
+`VOP_DOT`, `ADD`, `RELU`, `REQUANT`, `DYT`, `QUANT4`.
 
-- **The "float" row is no longer a ceiling.** Removing the quantizers from a QAT checkpoint
-  gives 0.00% — a network the weights were never trained for, not the model's true accuracy.
-  `quant.benchmark` disables the sites explicitly for that row; `--fake-quant` (same scheme in
-  float32) is the honest cross-check, and it also scores 100.00%.
-- **Saturation rates stopped being a health check.** L0's `RQ_O` word is `3838/2^3` = 479.75 and
-  clips **99.88%** of `O` — the layer learned to use the requant as a `sign()`. `report_clips`
-  localizes damage only for a PTQ checkpoint.
-- **Scales come from the checkpoint, not from calibration.** `quant.QATCalibration` reads the
-  learned `ActQuant.scale` (`--scales qat|calib|auto`). Re-deriving by absmax moves every
-  rounding grid the weights were fitted against, so it is not a neutral substitution — the
-  control is `--scales calib` on the *same* QAT checkpoint, which scores **0.00%**. It takes
-  `.abs()`: LSQ can drive a scale negative and `ActQuant.forward` uses the magnitude.
+- **`QUANT4`** (`0x22`) is `requant`'s fixed point clipped to `[-8, 7]` and written **4 bits
+  wide**, two elements per byte, in the MXU's weight encoding. It is what lets an activation
+  be a weight operand, and therefore what put `Q@K^T` and `P@V` on the array. `vlen` must be
+  a multiple of 2, and the destination advances half as fast as the source.
+- **`VECMATMUL` was removed** once that left it with no caller (it was 36.4% of the whole run
+  when attention ran on it). Gone with it: the `mm_*` sequencer, `cfg` 10–14, the `VPU_GEOM`
+  command, and `vpu_mm_busy`.
+- **`VOP_DOT` stayed** with no caller: it *is* the reduction path and the only int8 x int8
+  reduction the ISA has.
+- `GELU`, `EXP`, `SQUARE`, `ELEMENT_MUL`, `SCALAR_*`, `REDUCEMAX`, `REDUCESUM` and the
+  `SOFTMAX` macro op were removed with both activation ROMs, `rtl/luts/`, `accel/tpulang/luts.py`,
+  the restoring divider, the softmax sequencer and the reduction path's max fold.
+  Measured by OOC synthesis of `vpu` alone: **10012 -> 5162 LUTs (−48%), 897 -> 667 FFs,
+  90 -> 32 DSPs (−64%)**.
 
-The rest of this section is the **post-training** quantization history. It is still correct
-about those checkpoints, and its account of the `vecadd`-single-scale constraint is still what
-forces `RQ_O` to be pinned — but it is no longer the live problem.
+### Memory
 
-**The kernel is correct and the PTQ checkpoints are not int8-quantizable.** On
-`colab_ternary_mha_small_nobias.pt`, via `adder_export.py -n 256 -c 128 --iss-check`:
+- **`sram.sv` moves ranges, not bytes.** One request is a start address, a byte count and a
+  stride. **1 clock/byte on fills, 2 on spills**, against ~8 before; the full model went
+  1 226 722 -> 541 590 clocks (2.27x) with byte-identical output, and DMA fell from 66% of
+  the run to 24%.
+- Two things to know before touching it: **writes are two clocks because WE# is generated on
+  the falling edge**, so its rising edge lands half a clock clear of the address/data change
+  (the failure mode is a byte written to its *neighbour*, and `sram_tb` and `dma_tb` check
+  for it); and the `stride` exists for the transposing spill, whose destination is
+  column-major and would otherwise be one range per byte. `CLOCKS_PER_ACCESS` is now *extra*
+  clocks per beat and is 0 on every board.
+- **19-bit DRAM addressing.** It used to be 16, which silently confined a program to the low
+  64 KB of a 512 KB part. **When something addresses DRAM, check it is not using `ADDR_W`** —
+  the testbenches' DRAM byte maps were sized off it too, so high expectations were dropped by
+  `$readmemh` without a word.
 
-| | exact-sequence | token |
+### Synthesis
+
+Last `make bit`: **17 606 LUTs of 20 800 (85%)**, 10 903 FFs, 68 BRAM primitives, 46 DSPs,
+WNS **+34.98 ns**, all constraints met — but that bitstream predates the last edits to
+`tpu_top.sv` / `vpu.sv` / `cmd_vpu.sv`, so re-synthesize before quoting it. Board geometry is **8x8**, `VPU_BYTES=32`,
+`ADDR_W=16` (64 KB scratchpad), `MEM_ADDR_W=19`, 12 MHz.
+
+Per block: `mxu` 7588 LUTs, `vpu` 4021, `scratchpad` 2413, `cpu_subsys` 1573, the three
+command queues 815, `dma` 493.
+
+### `fw/tpulib.h` — the primitive layer, written to be specialized
+
+- `tpu_matmul` blocks a GEMM in rows (`t_len <= 32`), columns and the contraction, stages
+  whichever operands are in DRAM through a caller-supplied `tpu_arena`, and requants on store
+  when the contraction was unsplit or through the VPU when it was not.
+- `tpu_add_narrow` / `tpu_relu_narrow` / `tpu_pack4` chunk the VPU pairs at `vlen`;
+  `tpu_transpose_int8`, `tpu_transpose_dram_int8`, `tpu_move2d` cover the rest.
+- **Every primitive is self-fencing** — it returns only once its commands have retired — so
+  composing two is always safe.
+- **`tpu_matmul`, `tpu_gemm_blocks` and `tpu_gemm_arena_bytes` are `always_inline`, and that
+  is load-bearing.** Everything a primitive computes before its first push is exposed clock
+  for clock (the caller has just fenced) and the PicoRV32 is ~5–9 clocks per instruction with
+  no cache, so ~200 instructions of block arithmetic costs more than the array spends on the
+  dispatch. With the shape constant at the call site gcc folds the chooser, the loops and
+  every staging branch away; without the fold the same kernel runs **597 936 clocks instead
+  of 453 778** and the image is *larger*. **If you add a firmware abstraction, check the
+  disassembly, not the command count.**
+- **The one place two units run at once is `tpu_gemm.prefetch`**: double-buffer the staged
+  weight so block *n+1*'s fill streams under block *n*'s matmul. Opt-in per call site, and it
+  splits the **contraction, never the columns** — a column split makes `tpu_move2d` issue one
+  DMA per contraction row. It costs the int32 partials a split contraction forces.
+  `TPU_WGT_PREFETCH=0` compiles it out, which is the A/B.
+- `fw/tiled.c` is the regression for the block loops themselves: DRAM to DRAM, a tiny arena,
+  and `fw_vectors.py::reference_tiled` checking the ISS against a plain Python matmul —
+  because a mis-tiled matmul is something the ISS would reproduce as faithfully as the RTL.
+
+### `fw/infer.c` — the model generating
+
+A **32-token prefill**, then 31 decode steps of M=1 against a KV cache in DRAM. One
+`infer_block(rows, first_pos)` serves both, so **M is the only difference between the
+training shape and the generation shape**.
+
+- **Every tensor's home is DRAM.** The scratchpad holds a staging arena and a 320-byte
+  mailbox; scratchpad copies are a compile-time promotion cascade with a DRAM fallback.
+  Nothing asserts that an activation fits on chip.
+- **The cache is 12 KB per layer per sequence, and each half is stored in the orientation its
+  matmul wants**, because the append is what a cache costs. V's is free (one `quant4` row,
+  exactly how V leaves its projection); K's is a *column* of a column-major `[D][T]`, which
+  is the transposing DMA (`spill.t`, `tdrow = T`) — one command for any M. K stays int8 and
+  is re-packed whole each layer-step, because the nibble for `(d, t)` is half a byte and no
+  op writes half a byte.
+- **Nothing is zeroed and nothing needs to be.** The mask that makes attention causal (`-8`
+  against an int4 score, then ReLU) is also what makes the uninitialized tail of the cache
+  exactly zero. So the scratchpad is not cleared between problems, on the board or in
+  `infer_export.py` — that is the test, not a shortcut.
+- **The argmax and the embedding gather are on the device.** `cpu_subsys.sv` maps the
+  scratchpad at `0x9xxx_xxxx`, so the head writes its logits there, the CPU reads them back
+  (`tpu_spad_ld`) and argmaxes, and the gather is a DMA at `DR_EMB + tok*D`. The host
+  tokenizes and nothing else. `fw/spadwin.c` is that window's own ~1 s regression; the window
+  is **unsynchronized** — a load is not a command, so it needs the same `tpu_wait` a
+  dependent command would, 32 bits wide and 4-byte aligned (the S port has no byte strobes).
+- **`BATCH` sequences share every weight stream.** X is `[BATCH][rows][D]`, so the
+  projections, `Wo` and both FFN matmuls run once over `BATCH*rows` rows. Attention stays per
+  sequence. That is the point at decode, where a step is one row of arithmetic against
+  ~390 KB of weights.
+- **The image is 15 772 bytes of a 16 KB firmware RAM**, with the stack growing down from the
+  top of the same RAM. ~600 bytes of headroom. `-DTPU_WGT_PREFETCH=0` builds at 11 782.
+
+### `accel/tpulang/` — four files
+
+- `iss.py` — bit-exact with the RTL; the instruction decoder is gone, `exec_command` /
+  `run_trace` are the way in.
+- `fw_vectors.py` — a kernel's command trace -> golden DRAM images + the expected command
+  stream, plus the **one** definition of each kernel's synthetic operands. It runs the trace
+  binary itself as a co-process (`coexecute`), answering the kernel's scratchpad reads out of
+  the model's memory.
+- `adder_export.py` — checkpoint -> requant table -> trace -> accuracy, teacher-forced.
+- `infer_export.py` — the same checkpoint *generating*, through `fw/infer.c`.
+
+The directory name is a fossil.
+
+### `accel/cuda/`
+
+Legacy. It implements *softmax* attention and the model does ReLU attention; nothing in
+`model/` loads it. It still passes its own self-contained test.
+
+## When touching attention numerics
+
+Keep these in sync: `model/transformer.py` (reference), `fw/infer.c` + `fw/adder.c` +
+`iss.py`, and the RTL.
+
+## Long simulations
+
+- **The ISS is where you iterate.** `python accel/tpulang/infer_export.py -n 4` is a ~10 s
+  check that the kernel still computes the model. The RTL run is what proves the *hardware*
+  agrees.
+- `make fw FWPROG=ffn` (or `mha`) is the ~5 s smoke test that dispatch still works at all.
+- `make fw FWPROG=spadwin` is ~1 s and is the only thing exercising the CPU's scratchpad
+  window.
+- `make fw FWPROG=infer` is DMA-bound at ~830 k clocks per generated token — **use `GEN=3`
+  while iterating.** The tb Makefile sizes each kernel's watchdog per kernel.
+- `make fwuart` costs ~6x `make fw` on the same kernel, because at `FWUART_CPB=16` a byte is
+  160 core clocks. `FWUART_CPB=8` halves it; below 8 the receiver's mid-bit sample stops
+  being mid-bit. `RERUN=1` loads and runs twice with no reset in between — a real regression:
+  it is what caught `tpu_top.sv` clearing `cpu_run` against the previous run's stale
+  `cpu_done`.
+- **A long Icarus run prints nothing until it halts**, which makes "slow" and "deadlocked"
+  look identical from outside. Redirect the log to a file rather than piping through
+  `tail`/`head`, which buffer the whole stream.
+- `make fwtime FWPROG=<kernel>` adds a per-command timeline; `tb/cmd_timeline.py` reconstructs
+  the perf counters from it exactly and checks that on every run.
+
+## Measured performance
+
+From `accel/tpu/fw/perf_notes.md`, on the board at 12 MHz, `L=4, d=128, f=512`, 32 tokens:
+
+```
+per token   69.4 ms (832 837 core clocks)
+occupancy   mxu 45.5%  mload 16.0%  vpu 2.8%  dma 54.1%  idlec 17.5%  ovlap 19.9%
+
+                          clocks       ms     mxu   mload    vpu     dma   idlec   ovlap
+prefill (32 rows)        1768763  147.397   48.6%    7.5%  10.2%   30.9%   16.5%    6.2%
+one decode step (M=1)     802645   66.887   45.2%   16.6%   2.3%   55.8%   17.5%   20.9%
+```
+
+- A prompt token costs 55 274 clocks in the prefill against 802 645 in a decode step
+  (14.5x) — decode is DMA-bound on the weight stream.
+- Roofline for the prefill: 394 KB of weights at 1 byte/clock plus 32 KB of KV is ~426 000
+  clocks of memory against ~390 000 clocks of array work at 64 int4 ops/clock, so even with
+  no overlap it should be ~800 k. It is 1.77 M.
+- The accuracy in that file is against the untrained dummy checkpoint and is noise.
+
+Older, on the narrow `adder.c` (534 commands, 453 778 clocks): `mxu = 206 361`,
+`dma = 131 200`, `vpu = 84 352`, `idlec = 31 864` (7.0%, what the CPU costs as a producer).
+Two things the totals hid — **moving weights (23.2%) cost more than either FFN matmul**, and
+**82% of the CPU's time was the `tpu_wait` barriers, not building commands** (13.3 exposed
+clocks for a command pushed onto a busy unit, 183.6 for one after a barrier).
+
+## Why the model is QAT
+
+**It is not int8-quantizable post-hoc, and QAT is what fixed it.**
+
+- Quantization error is *absolute*, and a per-tensor scale is pinned by the maximum, so what
+  matters is `median/max`. With no normalization that collapses with depth: 1.3% of layer 0's
+  residual stream rounded to exactly zero, 91.6% of layer 3's `A` did.
+- The usual outlier check misses it — the *top* of the distribution is well behaved.
+- The model is not fragile to perturbation in general: it tolerates ±10% *multiplicative*
+  jitter everywhere at 100% exact-sequence, ~100x more error than int8 injects.
+- DyT fixed the diagnosed mechanism and still scored 0.00%, because what it exposed was the
+  residual *addend* — `vecadd` puts `X` and `O = Wo(A)` on one scale while they differed by
+  up to 7259x.
+- Per-channel scales would fix it and **this ISA cannot express them**: `requant` takes one
+  `{m0,n}` per dispatch.
+- QAT needs no hardware change: instead of finding scales the trained weights tolerate, it
+  trains weights that tolerate the scales.
+
+Three consequences worth internalizing:
+
+- **A "float" row is no longer a ceiling.** Removing the quantizers from a QAT checkpoint
+  gives a network the weights were never trained for.
+- **Saturation rates stopped being a health check.** A layer can learn to use the requant as
+  a `sign()` and clip 99.88% of a tensor deliberately.
+- **Scales come from the checkpoint, not from calibration.** Re-deriving by absmax moves
+  every rounding grid the weights were fitted against; on a QAT checkpoint that scores 0.00%.
+
+Related, from tuning the synthetic requant words: moving `RQ_A` by two shifts took `A` from
+45% saturated to 99.3% *exactly zero*. Each layer's requant multiplies the residual stream by
+a constant, so an error compounds geometrically with nothing renormalizing it.
+
+## Solved: intermittent UART corruption
+
+**The fault was on the host, not the FPGA.** Reading the serial port while the USB-serial
+bridge is still transmitting corrupts the byte in flight — the host's IN requests disturb the
+FT2232H's transmit bit timing by roughly half a bit, so the device decodes `sent[k]` **or**
+`sent[k-1]` for every bit `k`, usually `value << 1`.
+
+Fixed in `host/tpu_uart.py`: `TPUUart._send` waits for a frame to clear the wire before
+anything reads. The old code read immediately after `ser.write(frame)`, so the read landed on
+the *header of every command*, where a corrupted length does the most damage.
+
+The evidence, on the echo image, 64-byte bursts, 6400 bytes per arm:
+
+| host behaviour | corrupted | positions |
 | --- | --- | --- |
-| float model | **96.09%** | 99.76% |
-| int8 activations, this kernel | **0.00%** | 63.23% |
-
-The ISS cross-check passed (0 of 416 logits differ against the independent reference on those
-very weights), so this measures the kernel, not a model of it. **Do not go looking for a bug in
-the kernel, the calibration, or the requant words** (worst relative error 0.87%). The cause was
-established four ways in `adder_kernel.md` §7.6:
-
-1. Fake-quantizing in pure float reproduces it — nothing integer-specific is involved.
-2. Any single quantization site is fatal alone (`X1` → 0.00%, Q/K/V → 3.12%, `A` → 1.56%).
-3. The model tolerates ±10% *multiplicative* jitter everywhere at 100% exact-sequence, i.e.
-   100× more error than int8 injects. It is not fragile to perturbation in general.
-4. Quantization error is *absolute*, and a per-tensor scale is pinned by the maximum — so what
-   matters is `median/max`, and with no normalization that collapses with depth: 1.3% of layer
-   0's residual stream rounds to exactly zero, 91.6% of layer 3's `A` does. The usual outlier
-   check misses it because the *top* of the distribution is well behaved (`max/p99.9` ≈ 1.1–2.5).
-
-The remedy looked like per-channel/per-token activation scales, **which this ISA cannot
-express** (`requant` takes one `{m0,n}` per dispatch; `matmul_t.rq` reads one `cfg scalar`) — so
-the options were: retrain with normalization (`tpunn.md` §1 measured 98.4% with LayerNorm), or
-add a per-channel requant path to the VPU. The `no-layernorm` branch tried the first with DyT
-(one multiply + a clamp, which the VPU already does); that fixed the diagnosed mechanism and
-still scored 0.00%, because what it exposed was the residual *addend* — `vecadd` puts `X` and
-`O = Wo(A)` on one scale while they differ by up to 7259× (`adder_kernel.md` §7.6b).
-
-**QAT is the third option and it needs no VPU change at all**: rather than finding scales the
-trained weights tolerate, it trains weights that tolerate the scales. That is what the `qat`
-branch did, and it is why the header above supersedes this analysis.
-
-Related, from tuning the synthetic requant words: moving `RQ_A` by two shifts (`{1,6}`→`{1,8}`)
-took `A` from 45% saturated at ±127 to 99.3% *exactly zero*. Each layer's requant multiplies the
-residual stream by a constant, so an error compounds geometrically with nothing renormalizing it.
-
-## Stale docs
-
-Several docs describe an earlier model or ISA. When they disagree with the code, the code wins;
-fix the doc if you are in there anyway.
-
-- **`model/README.md`** — the most stale. Describes LayerNorm/post-LN, softmax attention, GELU
-  in the FFN, sinusoidal positional encoding, `mha_torch`/`slow_mha_cuda`, MoE, `f=512` for the
-  ternary config, and the deleted vanilla/GQA/`colab_ternary_mha` checkpoints. Its *invariants* sections (`EQUALS_POS`, the
-  sampling, the `TernaryLinear` weight orientation, the double residual) are still correct.
-- **`accel/tpulang/tpunn.md`** — superseded by `adder_kernel.md`; written against the older
-  model (LayerNorm, GELU, softmax, biases, `f=512`) and the pre-macro-op ISA. Still the only
-  record of the 98.4% ternary+int8 number quoted above.
-  It additionally describes the `gelu`/`exp` LUTs and `luts.py`, all now deleted.
-- **`accel/tpu/docs/README.md`** — fixed for the VPU trim, but its own §1/§4 still carry a
-  "the component doc wins" caveat; `docs/vpu.md` is authoritative on the op set.
-
-## Solved: intermittent UART corruption (root-caused 2026-08-07)
-
-**The fault was on the host, not the FPGA. Reading the serial port while the USB-serial
-bridge is still transmitting corrupts the byte in flight.** The host's IN requests disturb
-the FT2232H's transmit bit timing by roughly half a bit, so the device samples that byte on
-its bit boundaries and decodes `sent[k]` **or** `sent[k-1]` for every bit `k` — usually
-`value << 1`, sometimes `value | (value << 1)`. Fixed in `host/tpu_uart.py`: `TPUUart._send`
-now waits for a frame to clear the wire before anything reads (see that docstring and
-`TX_SETTLE_S` / `TX_RATE_SLACK`). All four commands and `test_uart_link.py`'s `raw_exchange`
-route through it.
-
-`tpu_uart.py` had always issued `ser.write(frame)` then read the reply immediately, so the
-read landed on the *first few bytes of every command* — i.e. the header, where a corrupted
-length or address does the most damage. A 16-bit length field arriving one bit left-shifted
-is the whole of the original symptom: the device really did read 0x0180 bytes when asked for
-0x0140, so "the device sent more bytes than the host asked for" was literal, not a desync
-artefact.
-
-**How it was pinned down**, on the echo image (`cmod_a7_echo` reports every byte it received,
-so no protocol can hide anything), 64-byte bursts, 6400 bytes per arm:
-
-| host behaviour | corrupted | positions in the burst |
-|---|---|---|
 | read immediately after write | 72/6400 | 1–6 |
 | sleep past the whole burst, then read | **0/6400** | — |
 | sleep over only the *first half*, then read | 77/6400 | **33–46** |
 
-The third row is the proof: delaying the read moves the damage to exactly where the read
-begins. It is not a probability spread over the burst — it is one mangled byte per burst,
-located wherever the host started reading.
+Delaying the read moves the damage to where the read begins.
 
-**Ruled out — do not re-litigate.** Each cost a real experiment:
+**Ruled out — do not re-litigate.** Anything in the RTL; `uart_interface`'s `SEND_STATUS`
+blind window; external SRAM and its pins (`cmod_a7_bram` reproduces identically); byte value
+and predecessor; position in the burst per se; baud mismatch and sampling phase (swept ±3%,
+flat); long low runs on the line; the activity LED's load step; `reset_input_buffer()`;
+metastability, crosstalk, timing closure.
 
-| Hypothesis | Killed by |
-|---|---|
-| Anything in the RTL | `uart_receiver` alone, and the whole `uart_memory` path, decode a bit-exact back-to-back stream perfectly at the real 104.1667 clocks/bit — all 256 byte values, 40 frames. See "the simulation blind spot" below |
-| `uart_interface`'s `SEND_STATUS` blind window | Co-simulation passes identically with and without the `rx_hold` fix; `rx_overrun`/`collision` never set on hardware either |
-| External SRAM, `sram_controller`, the 30 bank-14 pins, SSO | `cmod_a7_bram` (on-chip BRAM, no SRAM chip, no SRAM pins) reproduces at 23.8% vs 27.5% — indistinguishable |
-| Byte value, and the byte before it on the wire | 0x40 corrupts 15.8% in a header slot and 0/5184 in a payload slot; sweeping the predecessor over 0x00/0x01/0x03/0x0f/0x40/0xff changes nothing |
-| Position in the burst per se | The damage tracks the *read*, not the offset — see the table above |
-| Baud mismatch / sampling phase | Host baud swept 108k–122k: flat 12–30% across ±3%, so no phase minimum. Device sample points are within 1.5 clocks of centre by construction |
-| Long low runs on the line, DC/slew recovery | Corruption rate is flat as the predecessor's low run goes 9 → 4 bit times |
-| The `activity` LED's load step | Flat ~1.1% at every inter-burst idle from 0 ms to 200 ms, including idles shorter than the LED's 43.7 ms hold |
-| `reset_input_buffer()` (PurgeComm) perturbing the bridge | With it, without it, and with it 20 ms early: all ~1.1% |
-| Metastability, TX→RX crosstalk, timing closure | Previously ruled out; nothing since contradicts them |
-
-**The simulation blind spot, now fixed in understanding.** `tb/uart_memory_cosim_tb.sv`'s
-`drive_byte` clocks every bit for exactly `CPB` clocks, so its host is bit-exact with the
-device and has *zero* baud error — a real 115200 host against a 12 MHz CPB=104 device runs at
-104.1667. That is why `make cosim` could never see this, and it is worth remembering before
-trusting a green co-simulation run about anything analogue or timing-related. Driving the same
-RTL at a fractional bit period (accumulator carrying the remainder across bits and bytes) is
-still clean, which is what exonerated the RTL.
+**The simulation blind spot.** `tb/uart_memory_cosim_tb.sv`'s host clocks every bit for
+exactly `CPB` clocks, so it has *zero* baud error — a real 115200 host against a 12 MHz
+CPB=104 device runs at 104.1667. `make cosim` could never see this. Worth remembering before
+trusting a green co-simulation about anything analogue or timing-related.
 
 **Still worth doing.** `UART_RX_TIMEOUT = 0` is what turns one corrupted byte into a
-permanently wedged link: the FSM sits mid-frame forever and only a reflash clears it, which
-is why a single failure used to cascade into every later test in the suite. Setting it to
-`20 * UART_CPB` in `boards/*/board.tcl` makes a corrupted frame cost one legible timeout
-instead. That is hardening, not the fix — the fix is in the host — but the link should not
-depend on the host never glitching. Measured floor is one byte time; at `200` clocks (~2 bit
-times) the abort fires mid-frame during ordinary streaming and every command NAKs.
+permanently wedged link. `20 * UART_CPB` in `boards/*/board.tcl` makes it cost one legible
+timeout instead. That is hardening, not the fix.
 
-See `docs/uart_selftest.md` for the echo self-test (`make echo`, `board=cmod_a7_echo`,
-`host/uart_echo.py`). **Reflash `board=cmod_a7` before running `test_uart_link.py` or
-`run_program.py`** — they time out against the echo bitstream. Note that bitstreams under
-`synth/build/` are not rebuilt by `mode=program`; check their mtime against `rtl/` before
-concluding anything from a board run.
-
-## Long simulations
-
-A full-model run is `make fw FWPROG=adder` in `accel/tpu/tb`: **453 778 clocks**, about
-**3 minutes** of Icarus, 526 959 checks. It regenerates the golden vectors from the
-kernel's own native trace first, so a stale image cannot silently be compared against
-the wrong expectations. `fw_matmul_tb.sv` does not dump a VCD at all, and the tb
-Makefile already passes the kernel a 60 ms watchdog (the 2 ms default is sized for the
-small kernels and would trip on this one while it worked perfectly).
-
-The split is `mxu = 206 361`, `dma = 131 200`, `vpu = 84 352`, `idlec = 31 864` (7.0%,
-which is what the CPU costs as a command producer). `qfull` and `ovlap` are both 0:
-nothing overlaps yet, because every primitive fences after every cross-unit dependency.
-
-`make fw FWPROG=infer` is longer still — 4606 commands, and each of the 17 generated
-tokens re-streams the same 96 KB of weights, so it is DMA-bound at an *estimated*
-~150 k clocks per token (the tb Makefile gives it a 400 ms watchdog to sit behind
-that). **Use `GEN=3` while iterating**: same prefill, same cache, three tokens.
-`infer` and `spadwin` have **not been run against the RTL yet** — they were written
-and verified on a machine with no RISC-V gcc and an Icarus too old to parse the
-RTL's `signed'()` casts, so the ISS and the cache-free reference are what stands
-behind them. `make fw FWPROG=spadwin` is the ~1 s one to run first: it is the only
-thing that exercises the CPU's scratchpad window, which no firmware touched before
-`infer.c`.
-
-**`make fwtime FWPROG=<kernel>` is the same run plus a per-command timeline** —
-`fw_matmul_tb.sv` dumps one with `+CMDLOG=`, `tb/cmd_timeline.py` turns it into
-per-unit, per-phase and per-command-class tables, and the two columns it uses
-reconstruct the perf counters exactly (the tool checks that every run). Two things
-it found that the totals hide: **moving weights (98 400 DMA clocks, 23.2%) costs
-more than either FFN matmul**, and **82% of the CPU's time is the `tpu_wait`
-barriers, not building commands** — a command pushed onto a busy unit costs 13.3
-exposed clocks, one after a barrier costs 183.6, and 64 of the 143 barriers are the
-fence in the per-head attention loop. `docs/picorv32_migration.md` §9.9-§9.10.
-
-For an edit-run loop, use the **ISS** rather than the RTL — one four-layer forward is
-**1.9 s**, so `python accel/tpulang/adder_export.py -n 4` is a ~10 s check that the
-kernel still computes the model. The RTL run is what proves the *hardware* agrees; it
-is not where you iterate. `make fw FWPROG=ffn` (or `mha`) is the ~5 s smoke test that
-the dispatch plane still works at all.
-
-**A long Icarus run prints nothing until it halts, which makes "slow" and "deadlocked"
-look identical from outside.** Redirect the log to a file rather than piping it through
-`tail`/`head`, which buffer the whole stream.
+`docs/uart_selftest.md` has the echo self-test. **Reflash `board=cmod_a7` before running
+`test_uart_link.py` or `run_adder.py`** — they time out against the echo bitstream, and
+bitstreams under `synth/build/` are not rebuilt by `mode=program`.

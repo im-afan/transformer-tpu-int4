@@ -1,90 +1,71 @@
 # Custom TPU (FPGA)
 
-> **The scalar unit and tpulang are gone.** The TPU has **one** command
-> producer: PicoRV32 firmware in `accel/tpu/fw/`, pushing 128-bit macro-ops
-> through the MMIO aperture. `scalar_unit.sv`, `assembler.py`, `gen_vectors.py`,
-> `torch_ref.py`, `pytpu.py`, `adder_export.py`, every `examples/*.tpu`, the
-> `.tpu` testbenches and `isa.md` were deleted; `iss.py` survives as the golden
-> numerics behind `fw_vectors.py`'s command front end. Anything below that
-> describes a `.tpu` program, an assembler or the scalar unit is history.
-> See `docs/picorv32_migration.md` §11.
+A matrix/attention accelerator for the transformer in [`../../model`](../../model), written
+in **SystemVerilog** and running on a **Digilent Cmod A7-35T** (`xc7a35t-cpg236-1`) via a
+non-project Vivado batch flow.
 
+The PyTorch model is the golden reference. Every block is validated by simulating it
+against vectors produced from that reference.
 
+## Current state
 
-A custom matrix/attention accelerator for the transformer in `../../model`, written in
-**SystemVerilog** and running on a **Digilent Cmod A7-35T** (`xc7a35t-cpg236-1`) via a
-non-project Vivado batch flow. The tree is still organised so a second board is a copy of
-`synth/vivado/boards/cmod_a7/`; nothing outside those directories is vendor-specific.
+- **One command producer.** PicoRV32 firmware in [`fw/`](fw/README.md) pushes 128-bit
+  macro-ops through an MMIO aperture into per-unit queues. The scalar unit, the `.tpu`
+  language and the assembler are deleted.
+- **The whole model runs on it.** [`fw/infer.c`](fw/infer.c) is prefill + KV-cached decode
+  with the argmax and the embedding gather on the device; the host tokenizes and nothing
+  else.
+- **It fits.** Last `make bit`: **17 606 LUTs of 20 800 (85%)**, 10 903 FFs, 4 RAMB36 +
+  64 RAMB18, 46 DSPs, WNS **+34.98 ns**, all constraints met. That bitstream predates the
+  last few RTL edits — re-synthesize before quoting it. See [`docs/synth.md`](docs/synth.md).
+- Board geometry is an **8x8 array**, 64 KB scratchpad (`ADDR_W=16`), 512 KB external SRAM
+  (`MEM_ADDR_W=19`), 12 MHz core clock.
 
-The PyTorch model in `model/` is the **golden reference**. Every hardware block is validated
-by simulating it against vectors produced by that reference (the same role the CUDA kernel in
-`../cuda` already plays for the GPU path).
+### Known mismatch, as of this writing
 
-**Current state.** The design simulates and, at the last bitstream that was built, ran on
-the board. The **whole model runs on it**: `fw/adder.c` is four transformer layers plus the
-output head in 534 macro-ops, and `cd tb && make fw FWPROG=adder` puts the real PicoRV32
-image through the real core and checks every DRAM byte *and* every command word against the
-ISS — 526 959 checks, 0 errors, 453 778 clocks. Scored on the addition task through the ISS
-(`python ../tpulang/adder_export.py -n 256`) it lands at **100.00% exact-sequence**, the same
-as the PyTorch checkpoint it came from.
-
-**It fits.** `make bit` completes with timing met: **13342 LUTs of 20800 (64%)**, 7543 FFs,
-33 BRAM tiles, 31 DSPs, WNS +26.2 ns. An earlier note here said it was 857 LUTs over; that
-stopped reproducing (the MXU is less than half the size it was measured at) and it is not
-this section's doing. See [`docs/synth.md`](docs/synth.md) §5 for the current numbers next to
-the historical ones, and [`host/README.md`](host/README.md) for the link.
-
-The software side is now two directories: [`fw/`](fw) is the kernels (C, one file each) plus
-[`fw/tpulib.h`](fw/tpulib.h), a layer of **size-independent primitives** — a matmul that
-blocks in rows, columns and the contraction and stages whatever is in DRAM, the chunked
-elementwise pairs, a transpose and 2-D block moves — over `tpu.h`'s single macro-ops.
-`adder.c` is composed out of it, so nothing in the model kernel depends on the model fitting
-in 64 KB of scratchpad; `fw/tiled.c` (`make fw FWPROG=tiled`) is the regression for the
-paths it does not take. [`../tpulang`](../tpulang) is what survived the toolchain deletion —
-the bit-exact ISS, the golden-vector generator that drives it from a kernel's own command
-trace, and the checkpoint exporter.
+`fw/adder.c` is still compiled at the **old narrow shape** (`T=32, D=64, DFF=256`) with
+the old DRAM map, while `tpulang/fw_vectors.py` and `tpulang/adder_export.py` have both
+moved to `d=128 / f=512 / T=128` at a different map. Until `adder.c` is migrated, the
+teacher-forced path (`make fw FWPROG=adder`, `adder_export.py`) does not line up.
+`fw/infer.c` is the migrated one, and is currently built with `LAYERS 2` rather than the
+config's 4.
 
 ## Directory layout
 
-| Path           | Contents                                                                        |
-| -------------- | ------------------------------------------------------------------------------- |
-| `rtl/`         | Synthesizable SystemVerilog: systolic array (`mxu.sv`), vector unit (`vpu.sv`), banked scratchpad, DMA + external SRAM controller, scalar unit, UART interface, and `tpu_top.sv` tying them together. There is no `rtl/luts/` any more — the VPU's activation ROMs went with the `gelu`/`exp` instructions ([docs/vpu.md §Removed ops](docs/vpu.md#removed-ops)), so the design reads no `$readmemh` file by default. |
-| `tb/`          | Icarus testbenches, one per block, plus two that run any C kernel through the whole core: `fw_matmul_tb.sv` backdoors the image in through `FW_INIT` (`make fw FWPROG=<kernel>`), and `fw_uart_tb.sv` loads it — and the weights — over the simulated serial link exactly as the board host does (`make fwuart FWPROG=<kernel>`). `make` targets in `tb/Makefile`; `vectors_fw/` holds golden vectors generated per run by `../tpulang/fw_vectors.py` from the kernel's own native command trace. |
-| `sim/`         | Placeholder for simulator artifacts (waveforms, logs — gitignored). Testbenches currently build and run in place under `tb/`. |
-| `constraints/` | Pin assignment and timing constraints, one `.xdc` per target board. |
-| `synth/`       | Vivado non-project build (`synth/vivado/build.tcl`), with per-board definitions and top-level wrappers under `synth/vivado/boards/<board>/`. Build output goes to `synth/build/` (gitignored). |
-| `fw/`          | C firmware for the PicoRV32 command producer (`rtl/cpu_subsys.sv`): the MMIO driver header (`tpu.h`), the size-independent primitives over it (`tpulib.h`), one `.c` per kernel, `start.S`, linker script and Makefile. Needs a RISC-V cross gcc — see [`fw/README.md`](fw/README.md). |
-| `host/`        | Python host driver: the UART protocol (`tpu_uart.py`), the end-to-end runner (`run_fw_matmul.py`), and link self-tests. |
-| `docs/`        | Microarchitecture notes: ISA / command format, register + memory map, dataflow, numerics. Start at [`docs/README.md`](docs/README.md). |
+| Path | Contents |
+| --- | --- |
+| `rtl/` | Synthesizable SystemVerilog: `mxu.sv`, `vpu.sv`, `scratchpad.sv`, `dma.sv` + `sram.sv`, `cpu_subsys.sv` (PicoRV32 + AXI4-Lite), the `cmd_*.sv` queues, the UART blocks, and `tpu_top.sv`. No `rtl/luts/` — the activation ROMs went with the removed VPU ops, so the design reads no `$readmemh` file by default. |
+| `fw/` | C firmware: `tpu.h` (MMIO + one builder per command), `tpulib.h` (size-independent primitives), one `.c` per kernel, `start.S`, linker script, Makefile. Needs a RISC-V cross gcc. |
+| `tb/` | Icarus testbenches, one per block, plus two that run any C kernel through the whole core: `fw_matmul_tb.sv` (`make fw`) backdoors the image in; `fw_uart_tb.sv` (`make fwuart`) loads it over the simulated serial link exactly as the board host does. `vectors_fw/` holds golden vectors regenerated per run. |
+| `host/` | Python host: `tpu_uart.py` (the protocol), `run_adder.py` (the model generating on the board), `run_fw_matmul.py` (a kernel vs. the ISS), link self-tests. |
+| `synth/` | Vivado non-project build (`synth/vivado/build.tcl`), per-board definitions under `synth/vivado/boards/<board>/`. Output in `synth/build/` (gitignored). |
+| `constraints/` | One `.xdc` per target board. |
+| `docs/` | Per-block design notes. Start at [`docs/README.md`](docs/README.md). |
+| `sim/` | Placeholder for simulator artifacts (gitignored). |
 
-Four board targets are defined under `synth/vivado/boards/`: `cmod_a7` (the real design),
-`cmod_a7_mem` and `cmod_a7_bram` (memory-path bring-up variants), and `cmod_a7_echo` (the
-UART self-test image — see [`docs/uart_selftest.md`](docs/uart_selftest.md)). **Reflash
-`board=cmod_a7` before running `host/test_uart_link.py` or `host/run_program.py`**; they
-time out against the echo bitstream.
+Four board targets under `synth/vivado/boards/`: `cmod_a7` (the real design), `cmod_a7_mem`
+and `cmod_a7_bram` (memory-path bring-up), `cmod_a7_echo` (the UART self-test image).
+**Reflash `board=cmod_a7` before running `host/test_uart_link.py` or `host/run_adder.py`** —
+they time out against the echo bitstream.
 
-## Roadmap
+## The software layers
 
-1. ~~`docs/` — pin down datatype, tile size, and the systolic-array dataflow.~~ **done**
-2. ~~`rtl/` — the blocks, the array, control + memory map.~~ **done**
-3. ~~`tb/` — unit-test each block, then end-to-end over the UART link against golden
-   vectors from `tpulang/gen_vectors.py`.~~ **done**
-4. `constraints/` + `synth/` — Vivado flow and board wrapper: **done**; a design that
-   fits: **regressed**, currently 4.1% over on LUTs (`docs/synth.md` §5).
-   `scratchpad.sv` was the original blocker — a flat byte array with six read ports, which
-   Vivado could only implement as ~524k FFs. It is now byte-lane banked into genuine
-   dual-port BRAM. What pushed it back over is the macro-op work in the MXU.
-5. ~~Run a real program on the board and verify it.~~ **done.** `host/run_program.py`
-   assembles, loads, runs, and checks the result against the ISS *and* an independent
-   PyTorch reference.
-6. `host/` — **next.** Wire the FPGA in as a selectable model backend, mirroring the
-   `use_custom_attention` path. Today the host runs standalone `.tpu` kernels, not
-   `model/transformer.py` itself.
-7. Fit a second transformer layer. One quantized layer already measures 861 of 1024
-   instruction words, so the lever is hoisting the four inlined ternary matmuls into a
-   single parameter-driven copy.
+- [`fw/tpu.h`](fw/tpu.h) — the MMIO aperture and one builder per command. No abstraction:
+  fields are packed exactly as `cmd_mxu.sv` / `cmd_vpu.sv` / `cmd_dma.sv` decode them.
+- [`fw/tpulib.h`](fw/tpulib.h) — **size-independent primitives** over that: a matmul that
+  blocks in rows, columns and the contraction and stages whatever is in DRAM; chunked
+  elementwise pairs; transposes and 2-D block moves. Every primitive is self-fencing, so
+  composing two is always safe.
+- [`../tpulang`](../tpulang) — the bit-exact ISS, the golden-vector generator that drives
+  it from a kernel's own command trace, and the checkpoint exporters.
 
-Known gaps on hardware: the inter-TPU LINK (`wrneigh`) is stubbed in `tpu_top.sv` and
-completes as a no-op, and `UART_RX_TIMEOUT` is 0 in every board definition, so a corrupted
-frame wedges the receive FSM until reflash (see `CLAUDE.md` for why that is a hardening item
-rather than the fix).
+## Known gaps
+
+- The inter-TPU LINK (`wrneigh`) is stubbed in `tpu_top.sv` and completes as a no-op.
+- `UART_RX_TIMEOUT` is 0 in every board definition, so a corrupted frame wedges the
+  receive FSM until reflash. Setting it to `20 * UART_CPB` makes a corrupted frame cost
+  one legible timeout instead. That is hardening — the actual corruption bug was on the
+  host and is fixed (see [`host/README.md`](host/README.md)).
+- Nothing overlaps except the weight prefetch in `tpu_matmul`: every other primitive
+  fences after each cross-unit dependency. `docs/scheduler_plan.md` is the sketch for
+  doing better in hardware.

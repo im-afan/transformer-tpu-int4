@@ -6,10 +6,15 @@ power-off. No commands, no addresses, no modes — the block length is the whole
 protocol, fixed at synthesis (`BLOCK_LEN` in `boards/cmod_a7_echo/board.tcl`).
 The host sends a 64-byte block of random data, reads the reply, and compares.
 
-The point is to shrink the search space behind the intermittent corruption on the
-real link. A bad byte in `host/test_uart_link.py` could come from
-`uart_receiver`, `uart_transmitter`, `uart_interface`, the SRAM controller, the
-arbitration mux, the cable or the host. This image deletes four of those.
+The point is to shrink the search space when a byte goes wrong on the real link.
+A bad byte in `host/test_uart_link.py` could come from `uart_receiver`,
+`uart_transmitter`, `uart_interface`, the SRAM controller, the arbitration mux,
+the cable or the host. This image deletes four of those.
+
+> **The corruption this was built to chase is solved, and the fault was on the
+> host** — reading the serial port while the bridge was still transmitting. See
+> the post-mortem in [`../host/README.md`](../host/README.md). This image is kept
+> as a bring-up rung, and it is what produced the evidence that settled it.
 
 It instantiates the **same** `uart_receiver` and `uart_transmitter` the production
 image uses, unmodified. An instrument that alters the thing it measures is
@@ -55,7 +60,7 @@ python accel/tpu/host/uart_echo.py -p COM5 --baud 117000   # sampling-margin che
 
 `mode=bit` writes to `synth/build/cmod_a7_echo/`, so the self-test and production
 bitstreams can never be confused. **Reflash `board=cmod_a7` before running
-`test_uart_link.py` or `run_program.py`** — they will time out against this image.
+`test_uart_link.py` or `run_adder.py`** — they will time out against this image.
 
 **LEDs.** `led[0]` is a ~1.4 Hz heartbeat, so a dead clock or an unconfigured FPGA
 is distinguishable from a dead link without opening a terminal; it switches to a
@@ -83,8 +88,7 @@ startup rather than letting it surface as a byte diff.
 | `tb/uart_echo_tb.sv` | Testbench: drives a block into `uart_rx` and decodes the reply off `uart_tx` |
 | `host/uart_echo.py` | Host driver, soak loop and failure analysis |
 
-**Modified:** `synth/vivado/sources.tcl` (reads `uart_echo.sv`), `tb/Makefile`
-(`make echo`), `host/README.md`.
+**Modified:** `synth/vivado/sources.tcl` (reads `uart_echo.sv`), `tb/Makefile` (`make echo`), `host/README.md`.
 
 `rtl/uart_receiver.sv` and `rtl/uart_transmitter.sv` are **not touched**.
 

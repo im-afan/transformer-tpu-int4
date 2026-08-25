@@ -11,7 +11,13 @@ VOCAB.update({'+': 10, '=': 11, 'N': PAD_ID})
 INV_VOCAB = {v: k for k, v in VOCAB.items()}
 MAX_INTEGER = 99999
 MIN_TOKEN_LENGTH = 5  # e.g. "0+0=0"
-EQUALS_POS = 15
+# The first ANSWER position, i.e. the prompt length: '=' sits at EQUALS_POS-1
+# and every operand is padded so this holds whatever the operands' lengths are.
+# It bounds the operands at `max_digits <= (EQUALS_POS - 2) // 2` — 31 here,
+# since "left + right" has to fit in EQUALS_POS-1 characters — and the sequence
+# at EQUALS_POS + max_digits + 1 tokens.
+EQUALS_POS = 64
+MAX_TOKENS = 128
 
 # Every number in a generated expression is written least-significant digit
 # first: "123+45=168" is emitted as "321+54=861".
@@ -96,23 +102,33 @@ def _sample_number(max_digits: int) -> int:
     return random.randint(lo, hi)
 
 
-def generate_addition_expression(max_digits: int = 5, max_length: int = 32) -> str:
+def generate_addition_expression(max_digits: int = 31, max_length: int = MAX_TOKENS,
+                                 equals_pos: int = EQUALS_POS) -> str:
     """Generate a random addition expression where each operand length is equally likely.
 
     Digits are least-significant first (see REVERSE_DIGITS): 123+45=168 is
-    generated as ``321+54NNNNNNNN861NN...``. Lengths are unchanged, so
-    EQUALS_POS and the ``max_digits <= 6`` limit still hold.
+    generated as ``321+54NNNNNNNN861NN...``. Lengths are unchanged, so the
+    answer starts at `equals_pos` and the ``max_digits <= (equals_pos-2)//2``
+    limit holds.
+
+    `equals_pos` is the module's EQUALS_POS unless a caller pins it. The one
+    caller that does is `accel/tpulang/infer_export.py`, whose kernel is frozen
+    at the older 32-token / 15-token-prompt shape.
     """
     left = _sample_number(max_digits)
     right = _sample_number(max_digits)
     expr = f"{_digits(left)}+{_digits(right)}"
-    expr += PAD_TOKEN * (EQUALS_POS - len(expr) - 1)
+    if len(expr) > equals_pos - 1:
+        raise ValueError(f"max_digits={max_digits} does not fit before "
+                         f"equals_pos={equals_pos}")
+    expr += PAD_TOKEN * (equals_pos - len(expr) - 1)
     expr += f"={_digits(left + right)}"
     expr += PAD_TOKEN * (max_length - len(expr))
     return expr
 
 
-def create_addition_batch(batch_size: int, max_tokens: int, max_digits: int = 5) -> Tuple[List[str], List[List[int]]]:
+def create_addition_batch(batch_size: int, max_tokens: int, max_digits: int = 31,
+                          equals_pos: int = EQUALS_POS) -> Tuple[List[str], List[List[int]]]:
     """Create a batch of addition expressions and corresponding token id sequences."""
     if max_tokens < MIN_TOKEN_LENGTH:
         raise ValueError(f"max_tokens must be at least {MIN_TOKEN_LENGTH}")
@@ -123,7 +139,9 @@ def create_addition_batch(batch_size: int, max_tokens: int, max_digits: int = 5)
 
     for _ in range(batch_size):
         while True:
-            expr = generate_addition_expression(max_digits=max_digits, max_length=max_tokens)
+            expr = generate_addition_expression(max_digits=max_digits,
+                                                max_length=max_tokens,
+                                                equals_pos=equals_pos)
             if len(expr) <= max_tokens:
                 break
         expressions.append(expr)

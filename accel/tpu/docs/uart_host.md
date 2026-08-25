@@ -1,291 +1,196 @@
-# UART Host–Memory Interface
+# UART Host Interface
 
-A minimal serial link that lets a host PC **read and write the external SRAM**
-("DRAM", `sram.sv`) directly, with no involvement from the scalar unit or DMA
-engine. Its purpose is bring-up / debug / preload: push a program image and input
-tensors into DRAM before a run, and read back results afterward, over a single
-UART.
+A serial link that lets a host PC read and write the external SRAM ("DRAM"), load a firmware
+image, start the core and read its performance counters.
 
-This is the host-side counterpart to `comms.md` (which is *device-to-device*).
-Here the host is the master and the FPGA is a pure memory slave.
+Device side is [`rtl/uart_interface.sv`](../rtl/uart_interface.sv) plus `uart_receiver.sv` /
+`uart_transmitter.sv`. Host side is [`../host/README.md`](../host/README.md).
 
-## 1. Scope (v1)
-
-- **Two operations only: read and write a byte range of SRAM.** No register access,
-  no run/halt control, no scratchpad access. Those can layer on later as extra
-  command codes.
-- **Byte-serial**, because the link is: at 115200 baud a byte takes ~87 µs, which is
-  ~1000 core clocks, so the host protocol drives `sram.sv` at `len = 1` and the memory
-  is idle between every byte. (`sram.sv` takes whole ranges now and the DMA streams
-  them — see `dma.md` §7 — but nothing about that helps a wire this slow.)
 - **Host is the sole master.** The FPGA never initiates a frame; it only answers.
-- Reuses the existing `uart_receiver.sv` and `uart_transmitter.sv` unchanged
-  (8N1, 115200 baud, `CLK_PER_BIT = 868` @ 100 MHz).
+- **Byte-serial**, because the link is: at 115200 baud a byte is ~87 us, thousands of core
+  clocks, so the memory is idle between every byte.
+- No CRC, no flow control beyond the natural UART back-pressure, no multi-bank addressing.
 
-Out of scope for v1: CRC/checksums, flow control beyond the natural UART back-pressure,
-multi-bank addressing, and any access while the core is running (see §6).
+## Physical layer
 
-## 2. Physical layer
+| Property | Value |
+| --- | --- |
+| Encoding | UART 8N1 (1 start, 8 data LSB-first, 1 stop) |
+| Baud | 115200 |
+| `UART_CPB` | clocks per bit, **104** on the Cmod A7 (12 MHz core). Derived in `board.tcl` from `clk_mhz`, so the two cannot drift |
+| Throughput | ~11.5 KB/s — a full 512 KB SRAM preload is ~45 s |
 
-| Property   | Value                                             |
-| ---------- | ------------------------------------------------- |
-| Encoding   | UART 8N1 (1 start, 8 data LSB-first, 1 stop)      |
-| Baud       | 115200 (parameter `CLK_PER_BIT`, default 868)     |
-| Flow ctrl  | none at the wire; framing is command-length-based |
-| Throughput | ~11.5 KB/s → full 512 KB SRAM ≈ 45 s              |
+## Address and data sizes
 
-The device decodes one byte at a time as `uart_receiver` raises `valid`, and emits
-reply bytes through `uart_transmitter` (pulse `start` while `!busy`).
+The SRAM is 512K x 8 (ISSI IS61/64WV5128): a **19-bit** byte address, 8-bit data.
 
-## 3. Address / data sizes
+- **Address** is 3 bytes, big-endian; `addr[18:0]` is used.
+- **Length** is 2 bytes, big-endian, **in bytes**; `1 <= len <= 65535`.
 
-The SRAM is **512 K × 8** (ISSI IS61/64WV5128): a **19-bit** byte address and an
-**8-bit** data word.
+Big-endian so a frame reads left-to-right the way the address is written.
 
-- **Address** is carried as **3 bytes = 24 bits, big-endian (MSB first)**. Only
-  `addr[18:0]` are used; the top 5 bits must be 0. Any frame with non-zero top
-  5 bits, or whose `addr + len` would exceed `2^19`, is rejected (NAK).
-- **Length** is carried as **2 bytes = 16 bits, big-endian**, so a single command
-  moves 1..65535 bytes. `len == 0` is rejected. Larger transfers are issued as
-  back-to-back commands by the host.
-- **Data** is one byte per SRAM word, sent/received in ascending address order; the
-  interface auto-increments the address internally, so the host sends the base
-  address only once.
-
-Big-endian is chosen so a frame reads left-to-right the way the address is written
-(`0x01_23_45`), and to match the flit field ordering in `comms.md`.
-
-## 4. Frame formats
-
-### 4.1 Command frame (host → device)
+## Frame formats
 
 ```
-byte:   0      1     2     3      4     5      6 .. 6+len-1
-      +-----+-----+-----+-----+-----+-----+---------------------+
-write | CMD | A2  | A1  | A0  | L1  | L0  |  data[0 .. len-1]   |
-      +-----+-----+-----+-----+-----+-----+---------------------+
+byte:   0     1     2     3     4     5     6 .. 6+len-1
+      +-----+-----+-----+-----+-----+-----+-------------------+
+write | CMD | A2  | A1  | A0  | L1  | L0  | data[0 .. len-1]  |
+      +-----+-----+-----+-----+-----+-----+-------------------+
 
-byte:   0      1     2     3      4     5
+byte:   0     1     2     3     4     5
       +-----+-----+-----+-----+-----+-----+
 read  | CMD | A2  | A1  | A0  | L1  | L0  |
       +-----+-----+-----+-----+-----+-----+
 ```
 
-| Field    | Bytes | Meaning                                          |
-| -------- | ----- | ------------------------------------------------ |
-| `CMD`    | 1     | `'W'` = 0x57 write, `'R'` = 0x52 read            |
-| `A2..A0` | 3     | 24-bit address, MSB first; `addr[18:0]` used     |
-| `L1..L0` | 2     | 16-bit byte count, MSB first; `1 ≤ len ≤ 65535`  |
-| `data`   | len   | **write only**: payload bytes, ascending address |
+The 6-byte header is fixed-length, so the FSM always knows how many bytes to expect before
+the command byte matters — the only branch is whether a data phase follows.
 
-The 6-byte header is fixed-length, so the FSM always knows exactly how many bytes to
-expect before the command byte matters — the only branch is "does a data phase
-follow" (write) or not (read).
+| CMD | Value | Frame | Reply |
+| --- | --- | --- | --- |
+| `R` read SRAM | 0x52 | header | exactly `len` data bytes, **nothing else** |
+| `W` write SRAM | 0x57 | header + payload | `ACK` / `NAK` |
+| `I` load image | 0x49 | header + payload | `ACK` / `NAK` |
+| `G` go | 0x47 | `CMD A2 A1 A0` — no length, no payload | `ACK` / `NAK` |
+| `T` counters | 0x54 | `CMD` alone | `TIMER_WORDS` 32-bit words, no status byte |
 
-### 4.2 Response (device → host)
+| Status | Value | Meaning |
+| --- | --- | --- |
+| `ACK` | 0x06 | completed, all bytes committed |
+| `NAK` | 0x15 | rejected: bad `CMD`, `len == 0`, or a range error |
 
-- **Write:** after the last byte is committed to SRAM, the device sends **one status
-  byte**: `ACK` = 0x06 on success, `NAK` = 0x15 on a rejected command.
-- **Read:** the device streams **exactly `len` data bytes** in ascending address
-  order, and **nothing else** — no header, no trailing status. A rejected read (bad
-  address/len) returns a single `NAK` = 0x15 and *no* data; the host detects this by
-  the short reply plus its own timeout.
+Header-less read replies mean the host, which already knows `len`, can simply `read(len)`.
+A rejected read returns a single `NAK` and no data, which the host detects by the short
+reply plus its own timeout.
 
-Header-less read replies mean the host, which already knows `len`, can simply
-`read(len)` from its serial port. The write reply is a single byte the host waits on
-to serialize back-to-back commands.
+### `I` — loading a firmware image
 
-### 4.2b Zero-address commands ('G', 'T')
+`I` addresses instruction **word** indices, not bytes, and its length must be a multiple of
+4 (words packed MSB first). Bit 12 of the word address (`FW_BASE`) is what selects the
+PicoRV32's firmware RAM.
 
-Two commands added past the v1 memory-only scope do not use the layout above:
+### `G` — releasing the core
 
-```
-byte:   0      1     2     3                    byte:   0
-      +-----+-----+-----+-----+                       +-----+
-go    | 'G' | A2  | A1  | A0  |               timer   | 'T' |
-      +-----+-----+-----+-----+                       +-----+
-```
+`G` releases the CPU from reset. It always starts at firmware address 0 —
+`PROGADDR_RESET` is fixed in the RTL, so the rest of the address is ignored.
 
-- **`'G'` = 0x47** pulses the scalar unit's run trigger with `run_pc = addr`; no
-  length, no payload. Reply is `ACK`/`NAK`.
-- **`'T'` = 0x54** is the whole frame. Reply is **`TIMER_WORDS` 32-bit words, MSB
-  first both within and across words, no status byte**: the core's per-run
-  performance counters (`rtl/perf_counters.sv`) in core clocks. Every counter
-  shares one window — reset when `busy` rises, frozen when it falls — so they
-  describe the last run, or the current one so far. Each saturates at
-  `0xFFFFFFFF` rather than wrapping (358 s at 12 MHz).
+### `T` — the performance counters
 
-  **Word 0 is always the run length**, which is what keeps the reply
-  prefix-compatible with the single-word one this command used to give and keeps
-  images with different counter sets mutually intelligible. The length is
-  image-dependent: `uart_interface`'s `TIMER_WORDS` is 1 in the bring-up images
-  (`cmod_a7_mem`, `cmod_a7_bram`, which have no core to measure) and `NPERF` in
-  `tpu_top`, currently **10** — run, mxu, mload, vpu, dma, swait, vmm, idlec,
-  qfull, ovlap. The counters overlap rather than partitioning the run: `mload`
-  is a sub-state of `mxu`, and `ovlap` of the three unit counters. Two of the
-  ten are **retired slots that always read 0** — `swait` (the scalar unit's
-  issue-and-wait stall; there is no scalar unit) and `vmm` (the VPU's
-  `vecmatmul` macro op, removed from `vpu.sv`). They are kept rather than
-  deleted precisely because word order is the protocol: renumbering would
-  silently repoint every counter a host reads by index. `tpu_top.sv`'s `PERF_*`
-  indices define the wire order; `host/tpu_uart.py`'s `TIMER_COUNTERS` decodes
-  it.
+`TIMER_WORDS` 32-bit words, MSB first within and across words, **no status byte**. Every
+counter shares one window — reset when the core starts, frozen when it stops — so they
+describe the last run, or the current one so far. Each saturates at `0xFFFFFFFF` rather
+than wrapping (358 s at 12 MHz).
 
-`'T'` is the only command **not** subject to the arbitration rule in §6: it reads
-a counter, contends over nothing, and cannot corrupt a run, so it is answered
-whether or not the core is busy. That is also its point — a rising count is the
-only live evidence this link can give that a long program is still progressing.
-It is not a completion signal: the count also sits still if the run never
-started, so "has it halted" is still inferred from a command that stops NAK'ing.
+- **Word 0 is always the run length**, which keeps the reply prefix-compatible with the
+  single-word one this command used to give, and keeps images with different counter sets
+  mutually intelligible.
+- `TIMER_WORDS` is 1 in the bring-up images (`cmod_a7_mem`, `cmod_a7_bram`, which have no
+  core) and `NPERF` in `tpu_top`, currently **10**: run, mxu, mload, vpu, dma, swait, vmm,
+  idlec, qfull, ovlap.
+- The counters **overlap rather than partition** the run: `mload` is a sub-state of `mxu`,
+  and `ovlap` of the three unit counters.
+- Two are **retired slots that always read 0** — `swait` (the deleted scalar unit's
+  issue-and-wait stall) and `vmm` (the removed `vecmatmul` op). They are kept because word
+  order *is* the protocol: renumbering would silently repoint every counter a host reads by
+  index. `tpu_top.sv`'s `PERF_*` indices define the wire order; `host/tpu_uart.py`'s
+  `TIMER_COUNTERS` decodes it.
 
-### 4.3 Status byte values
+`T` is the only command **not** subject to the arbitration rule below: it reads a counter,
+contends over nothing, and cannot corrupt a run. That is its point — a rising count is the
+only live evidence this link can give that a long program is still progressing. It is not a
+completion signal: the count also sits still if the run never started.
 
-| Name  | Value | Meaning                                         |
-| ----- | ----- | ----------------------------------------------- |
-| `ACK` | 0x06  | write completed, all bytes committed            |
-| `NAK` | 0x15  | rejected: bad `CMD`, `len == 0`, or range error |
+## Device FSM
 
-## 5. Device FSM (behavioral plan)
-
-Single command channel, one op in flight.
+One command channel, one op in flight.
 
 ```
 IDLE
-  └─ on valid byte → latch CMD
-       CMD == 'R' or 'W' → RX_ADDR
-       CMD == 'T'        → sample the counter → TMR_TX (4 bytes) → IDLE
-       else              → send NAK, back to IDLE   (resync, see §7)
+  on a valid byte -> latch CMD
+    'R' / 'W' / 'I' -> RX_ADDR -> RX_LEN -> validate
+    'G'             -> RX_ADDR -> release the core -> ACK
+    'T'             -> sample the counters -> TMR_TX -> IDLE
+    else            -> NAK, back to IDLE
 
-RX_ADDR   collect 3 bytes → addr[23:0]
-RX_LEN    collect 2 bytes → len[15:0]
-  └─ validate: addr[23:19] == 0, addr + len ≤ 2^19, len != 0
-       fail → send NAK, IDLE
+RX_ADDR   3 bytes -> addr[23:0]
+RX_LEN    2 bytes -> len[15:0]
+          validate: addr[23:19] == 0, addr + len <= 2^19, len != 0
+          fail -> NAK, IDLE
 
-CMD == 'W':  WR_RX  →  WR_MEM  (loop len times)  →  send ACK  →  IDLE
-CMD == 'R':  RD_MEM →  RD_TX   (loop len times)  →  IDLE
+'W': WR_RX -> WR_MEM  (loop len times) -> ACK -> IDLE
+'R': RD_MEM -> RD_TX  (loop len times) -> IDLE
 ```
 
-- **WR_RX** waits for a data byte (`valid`); **WR_MEM** issues one SRAM write
-  (`start`, `we=1`, `addr`, `din`), waits `done`, increments `addr`, decrements `len`.
-- **RD_MEM** issues one SRAM read (`start`, `we=0`, `addr`), waits `done`, latches
-  `dout`; **RD_TX** pulses the transmitter `start` with that byte and waits for
-  `!busy`, then increments `addr`, decrements `len`.
-- Loop exits when `len` reaches 0.
+No pipelining: a UART byte takes ~1040 core clocks while a one-byte SRAM range takes 1–2,
+so the UART is hundreds of times slower and the SRAM is never the bottleneck. One holding
+byte in each direction suffices.
 
-No pipelining in v1: at 868 clocks/bit a UART byte takes ~8680 clocks while a one-byte
-SRAM range takes 3, so the UART is thousands of times slower and the SRAM is never the
-bottleneck.
-A single holding byte in each direction suffices — no elastic buffering, no FIFO.
+## SRAM arbitration
 
-## 6. Integration & SRAM arbitration
+The `sram_controller` user port is shared between the DMA and the UART host, so exactly one
+may drive it at a time.
 
-In `tpu_top.sv` the `sram_controller` user port is currently owned by the DMA engine
-(`u_dma` → `u_sram`). The UART interface needs that same port, so exactly one of
-{DMA, UART host} may drive it at a time.
+**The UART host only touches SRAM while the core is idle.** A command arriving mid-run is
+NAK'd and touches nothing. `T` is exempt.
 
-**v1 policy: the UART host only touches SRAM while the core is idle** (`busy == 0`,
-no program running). `'T'` is exempt — it touches no memory at all (§4.2b).
-Recommended wiring:
+This keeps the link a pure bring-up/debug path and avoids needing a coherency story between
+host writes and in-flight compute.
 
-- A 2:1 mux on the `sram_controller` user side, selected by "core idle". When idle the
-  UART FSM drives `start`/`we`/`addr`/`din` and observes `dout`/`busy`/`done`; while a
-  program runs, the DMA engine drives it as today.
-- A command arriving mid-run is answered with `NAK` (see open questions).
+## Framing, errors, resync
 
-This keeps the host link a pure bring-up/debug path and avoids needing a coherency
-story between host writes and in-flight compute.
+There is **no delimiter byte** — framing is the fixed 6-byte header plus the known `len`.
 
-## 7. Framing, errors, resync
+- **Unknown `CMD`** -> `NAK` and back to `IDLE`, so a stray byte costs one bad command
+  rather than permanent desync.
+- **Inter-byte timeout.** `UART_RX_TIMEOUT` clocks; if the FSM is mid-frame and no byte
+  arrives for that long, it aborts and returns to `IDLE`. The host resynchronizes by
+  pausing longer than that before a fresh command.
+- **`UART_RX_TIMEOUT` is 0 (disabled) on every board today.** That is what turns one
+  corrupted byte into a permanently wedged link — the FSM sits mid-frame forever and only a
+  reflash clears it. `20 * UART_CPB` makes a corrupted frame cost one legible timeout
+  instead. The measured floor is one byte time; at ~2 bit times the abort fires mid-frame
+  during ordinary streaming and every command NAKs.
 
-There is **no delimiter byte** — framing is purely the fixed 6-byte header plus the
-known `len`. If host and device desynchronize (host aborts mid-frame, line glitch),
-they must be able to realign:
+**Client-side validation is load-bearing.** The FSM validates right after the header and,
+on failure, NAKs and returns to `IDLE` *without* consuming the data phase — so payload
+bytes already in flight get re-decoded as command bytes. `tpu_uart.py` applies the RTL's
+exact rules before sending, so an invalid frame never goes out.
 
-- **Inter-byte timeout.** If the FSM is mid-frame and no byte arrives for a
-  programmable window (a few character times), it aborts the command and returns to
-  `IDLE`. Parameter `RX_TIMEOUT` in clocks; `0` disables.
-- **Unknown `CMD`** → `NAK` and return to `IDLE`, so a stray byte costs one bad
-  command rather than permanent desync.
-- The host resynchronizes by pausing longer than `RX_TIMEOUT` before issuing a fresh
-  command.
-
-Data integrity relies on the UART itself (short, direct link). A per-frame CRC and an
-explicit `SYNC` preamble are the natural v2 additions if the link proves noisy.
-
-## 8. Proposed module
-
-`rtl/uart_host.sv` — instantiates `uart_receiver` + `uart_transmitter` plus the command
-FSM; exposes the raw serial pins and an `sram_controller` **user-side** port (to be
-muxed in `tpu_top`).
-
-| Signal          | Dir | Width        | Meaning                                |
-| --------------- | --- | ------------ | -------------------------------------- |
-| `clk`, `rst_n`  | in  | 1            | 100 MHz core clock, active-low reset   |
-| `uart_rx`       | in  | 1            | serial in from host                    |
-| `uart_tx`       | out | 1            | serial out to host                     |
-| `sram_start`    | out | 1            | SRAM controller `start`                |
-| `sram_we`       | out | 1            | 1 = write                              |
-| `sram_addr`     | out | `MEM_ADDR_W` | 19-bit SRAM byte address               |
-| `sram_din`      | out | `MEM_DATA_W` | write data byte                        |
-| `sram_dout`     | in  | `MEM_DATA_W` | read data byte                         |
-| `sram_busy`     | in  | 1            | SRAM controller busy                   |
-| `sram_done`     | in  | 1            | SRAM access complete strobe            |
-| `host_busy`     | out | 1            | a command is in progress (for the mux) |
-
-Parameters: `CLK_PER_BIT` (passed to the UART blocks), `MEM_ADDR_W = 19`,
-`MEM_DATA_W = 8`, `RX_TIMEOUT`.
-
-## 9. Example exchanges
-
-Write 3 bytes `AA BB CC` to address `0x00100`:
+## Example exchanges
 
 ```
-host → dev:  57  00 01 00  00 03  AA BB CC
-dev  → host: 06                              (ACK)
+write 3 bytes AA BB CC to 0x00100
+  host -> dev:  57  00 01 00  00 03  AA BB CC
+  dev  -> host: 06                                (ACK)
+
+read 4 bytes from 0x00100
+  host -> dev:  52  00 01 00  00 04
+  dev  -> host: AA BB CC DD                       (4 data bytes, no framing)
+
+bad command byte
+  host -> dev:  99 ...
+  dev  -> host: 15                                (NAK, FSM back to IDLE)
 ```
 
-Read 4 bytes from address `0x00100`:
+## Testing
 
-```
-host → dev:  52  00 01 00  00 04
-dev  → host: AA BB CC DD                     (4 data bytes, no framing)
-```
+- `tb/uart_receiver_tb.sv`, `tb/uart_transmitter_tb.sv` — the blocks alone.
+- `tb/uart_interface_tb.sv` — the command FSM: round-trip, `len == 1`, a burst crossing a
+  256-byte boundary, `len == 0` and out-of-range NAKs, unknown command, mid-frame abort,
+  back-to-back commands.
+- `tb/uart_memory_cosim_tb.sv` (`make cosim`) — the real host driver against the RTL.
+- `tb/fw_uart_tb.sv` (`make fwuart`) — a whole kernel over the simulated link.
 
-Bad command byte `0x99`:
+**A co-simulation blind spot worth knowing:** `uart_memory_cosim_tb.sv`'s host clocks every
+bit for exactly `CPB` clocks, so it has *zero* baud error, where a real 115200 host against
+a 12 MHz CPB=104 device runs at 104.1667. `make cosim` cannot see anything analogue or
+fractional. See the corruption post-mortem in [`../host/README.md`](../host/README.md).
 
-```
-host → dev:  99 ...
-dev  → host: 15                              (NAK, FSM back to IDLE)
-```
+## Open questions
 
-## 10. Test plan (`tb/uart_host_tb.sv`)
-
-Drive `uart_rx` with the same bit-banging task style as `uart_receiver_tb.sv`, and
-decode `uart_tx` with a matching sampler task. Instantiate `uart_host` against a
-behavioral SRAM model (or the real `sram_controller` plus a simple array model) and
-check:
-
-1. Write N bytes, read them back, compare — the round-trip is the core test.
-2. Single-byte write/read (`len == 1`) and a multi-byte burst crossing a 256-byte
-   boundary (address carry).
-3. `len == 0`, top-5-bits-set address, and `addr + len` overflow each return `NAK`
-   and leave memory untouched.
-4. Unknown command byte returns `NAK` and the FSM accepts a valid command next.
-5. Mid-frame abort plus `RX_TIMEOUT` elapse, then a fresh command decodes correctly.
-6. Back-to-back commands with no idle gap between them.
-
-## 11. Open questions
-
-- **Mid-run commands:** NAK immediately, or block the host until the core is idle?
-  NAK is simpler and keeps the host in control; blocking is friendlier but needs a
-  host-side timeout story.
-- **Read error signalling:** a header-less read reply gives the host no in-band error
-  channel (it infers failure from a short/absent reply). If that proves fragile,
-  prefix read replies with a 1-byte status and make replies framed.
-- **Verify-on-write:** optionally read back each byte after writing and fold a mismatch
-  into `NAK`, trading throughput for a self-checking preload.
-- **Cross-command auto-increment:** keep every command self-contained (current plan)
-  vs. a "continue from last address" mode to shave header bytes on large sequential
-  transfers.
-- **Baud:** 115200 makes a full-SRAM preload ~45 s. Worth raising (921600 → ~6 s) once
-  the link is proven, since `CLK_PER_BIT` is already a parameter.
+- **Read error signalling.** A header-less read reply gives no in-band error channel. If
+  that proves fragile, prefix read replies with a status byte and make them framed.
+- **Baud.** 115200 makes a full-SRAM preload ~45 s. `UART_CPB` is a parameter, so 921600
+  (~6 s) is a one-line change once the link is proven.
+- **Cross-command auto-increment** to shave header bytes on large sequential transfers,
+  versus keeping every command self-contained (the current choice).

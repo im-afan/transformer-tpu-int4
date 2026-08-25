@@ -1,543 +1,185 @@
-# Macro-op ISA (CISC) — design note
+# The macro-op ISA
 
-> ## ⚠️ `softmax` and `layernorm` are out of scope as of the VPU trim
->
-> This document was written when the model was softmax attention + LayerNorm. It is not.
-> `model/transformer.py` is **ReLU attention, DyT normalization, ReLU feed-forward**, and
-> the VPU was cut down to the ops that model actually issues.
->
-> - **`softmax` (phase 5) was built, validated, and has now been removed** — with `EXP`,
->   `REDUCEMAX`, `REDUCESUM`, `SCALAR_DIV`, `SM_EXP`, both activation ROMs and `cfg
->   vscalar`. §5.1 and everything about it below is history, not the current ISA.
-> - **`layernorm` (phase 6) is not merely unbuilt, it is not planned**, and §5.2's `rsqrt`
->   LUT with it. DyT replaced LayerNorm in the model, and DyT needs no macro op at all: it
->   is `requant` with a symmetric clip (opcode `0x21`, `dyt`), fused into the narrow the
->   residual add already required.
-> - **`vecmatmul` (phase 4) was built, validated, measured — and has now been removed
->   too.** §7's measurement is why: it was 88.3% of all VPU time, so packing K and V to
->   int4 moved both attention matmuls onto the array, and once `Model.fc` went int4 as
->   well the op had no caller. §5.3 and the five `v*` config registers in §3 are history.
->   `VOP_DOT`, the datapath it wrapped, is untouched.
->
-> Everything else here — `setcfgr`, the MXU config strides, `matmul_t`, the
-> config-register model, the phase/measurement tables — is current and load-bearing.
-> See [vpu.md §Removed ops](vpu.md#removed-ops) for the removal table and measured area.
+The TPU has one instruction format: a **128-bit command**, four RV32 stores, uniform across
+all three units. A command carries its own operands and geometry, so nothing an earlier
+dispatch — or an earlier *program* — left in a register can reach it.
 
-**Status: phases 0–4 built and validated; 5 built then removed; 6 dropped; 7 not started.**
-See §8 for the phase table.
+There is one producer: PicoRV32 firmware in [`../fw/`](../fw/README.md). `fw/tpu.h` has one
+builder per command and is the authoritative encoding; `cmd_mxu.sv` / `cmd_vpu.sv` /
+`cmd_dma.sv` are the decoders.
 
-Built and passing (`tb/` 13/13, `make cosim` 11/11, `torch_ref.py` all kernels):
+## Format
+
+Four 32-bit words, `word0` first. The header lives in the **low** bits of `word0`, not the
+high bits of the 128 — so a producer builds it with an `ori` against a small constant rather
+than a shift, and the first store carries it.
+
+| `word0` bits | Field | Meaning |
+| --- | --- | --- |
+| 7..0 | `op` | command selector, per-unit namespace |
+| 15..8 | `flags` | `.acc` / `.rq` / `tiled` / `write` / `.t`, per op |
+| 31..16 | — | the first operand field (an address, in every command that has one) |
+
+| Command | `op` | `word0[31:16]` | `word1` | `word2` | `word3` |
+| --- | --- | --- | --- | --- | --- |
+| `MXU_GEOM` | `0x01` | `arow` | `wcol:crow` | `tlen(6) : ntiles(8) : ktiles(8)` | — |
+| `MXU_MM` | `0x02` | `out` | `wgt:act` | `{n,m0}` | — |
+| `VPU_OP` | `0x01` | `dst` (`flags[4:0]` = the `VOP_*` code) | `src1:src0` | `{n,m0} : vlen(10)` | — |
+| `DMA_MOVE` | `0x01` | `spad` (`flags[0]`=write, `flags[1]`=`.t`) | `dram(19)` | `tcols:len` | `tdrow:tsrow` |
+
+- **Commit on the last word.** Each unit's command port is a 4-word aperture; the write to
+  offset `0xC` enqueues. Four stores are atomic with respect to the queue, with no separate
+  trigger store, and a partial write is detectable.
+- **An unknown `op` is discarded with a simulation message rather than executed**, so a
+  stale command stream fails loudly instead of running the wrong instruction.
+- `VPU_GEOM` (`0x02`) is retired, so the VPU has exactly one command type.
+
+### Why the MXU needs two commands
+
+A full `matmul_t` is `op/flags` + three 16-bit addresses + `{m0,n}` + `tlen`/`ktiles`/
+`ntiles` + `arow`/`crow`/`wcol` = **146 bits**. Squeezing to 128 needs 12-bit strides and
+6-bit tile counts and lands at exactly 128 with zero margin. Splitting is cheaper:
+
+| Command | Fields | Used of 112 |
+| --- | --- | --- |
+| `MXU_GEOM` | `tlen`(6), `ktiles`(8), `ntiles`(8), `arow`(16), `crow`(16), `wcol`(16) | 70 |
+| `MXU_MM` | `out`(16), `act`(16), `wgt`(16), `{m0,n}`(16), flags | 64 |
+| `VPU_OP` | `dst`(16), `src0`(16), `src1`-or-`{m0,n}`(16), `vlen`(10) | 58 |
+| `DMA_MOVE` | `spad`(16), `dram`(19), `len`(16), `tcols`(16), `tsrow`(16), `tdrow`(16) | 99 |
+
+**Sticky geometry is queue state, not global state, and that is the actual fix.**
+`MXU_GEOM` persists until the next one, but it flows through the MXU's own in-order queue,
+so its scope is a position in that unit's command stream rather than a register any other
+unit or any earlier program can have written. The driver caches the last geometry it emitted
+and skips the command when nothing changed.
+
+### The requant word is a literal
+
+`{m0,n}` is 12 + 4 = 16 bits, exactly the width of the scratchpad address that used to point
+at it. Same command budget, one less indirection, one less scratchpad read per dispatch — and
+it deleted the block of 16 words the host used to stage per layer, plus a two-state fetch in
+both `mxu.sv` and `vpu.sv`.
+
+The consequence for a kernel: **the requant table has to be in the firmware image**, because
+the device has no path by which it could fetch it from memory. See
+[`../fw/README.md`](../fw/README.md).
+
+### Uniform 128 bits, not a packed encoding
+
+Measured at about 1% of total runtime against a tightly packed variable-width encoding, and
+worth it: four unconditional stores per dispatch with no shifting or field assembly.
+
+## Queues and synchronization
+
+One FIFO per unit, depth 8. **A full queue stalls the store** (AXI `BVALID` withheld), so
+flow control needs no software check — the CPU throttles itself and only *data* dependencies
+need explicit waits.
+
+Sync is by sequence number, not by "is the unit idle":
+
+| Register | Meaning |
+| --- | --- |
+| `ISSUED[unit]` | commands accepted into the queue |
+| `RETIRED[unit]` | commands completed |
+| `SPACE[unit]` | free entries (advisory; the stall is the real mechanism) |
+
+Waiting is `while (RETIRED[u] < my_seq)` — `tpu_wait(unit)` in `tpu.h`. Waiting on a
+*specific* command rather than on unit idleness is what makes double-buffering expressible:
+start the fill for block *n+1*, then wait only for the fill that staged block *n*.
+
+**Every cross-unit dependency is software's responsibility.** Issue-and-wait made them
+automatic; queues do not. `tpulib.h`'s primitives are all self-fencing for that reason, and
+the one place two units deliberately run at once is its weight prefetch.
+
+## Address map
+
+| Base | Size | Contents |
+| --- | --- | --- |
+| `0x0000_0000` | 16 KB | firmware: code, data and stack. BRAM, host-loadable over `'I'` |
+| `0x8000_0000` | 16 B | MXU command port (commit on `+0xC`) |
+| `0x8000_0100` | 16 B | VPU command port |
+| `0x8000_0200` | 16 B | DMA command port |
+| `0x8000_0300` | 64 B | `ISSUED` / `RETIRED` / `SPACE` per unit, `DONE`, perf counters |
+| `0x9000_0000` | 64 KB | scratchpad, a 32-bit word window onto the `S_rw` port |
+
+- **The scratchpad window is worth more than the instruction it replaced.** It lets a kernel
+  compute requant words at run time, read back a reduction, and — with an argmax loop in C —
+  end with a token id instead of 2 KB of int32 logits. `fw/infer.c` does exactly that, and
+  the embedding lookup follows from it, so the host is out of the decode loop entirely.
+- **A DRAM window is deliberately not mapped.** The SRAM is byte-wide at 1 clock/byte; CPU
+  access to it would be a trap. DRAM stays the DMA's.
+
+## PicoRV32 configuration
+
+| Parameter | Setting | Why |
+| --- | --- | --- |
+| `BARREL_SHIFTER` | 1 | shifts drop from 4–14 clocks to 3; address math uses them constantly |
+| `ENABLE_FAST_MUL` | 1 | the alternative is 40 clocks per `mul`, and tile-offset math multiplies |
+| `ENABLE_DIV` | **0** | no kernel needs it — **a `div` or `rem` traps**, so build `-march=rv32ic_zmmul`, not `rv32imc` |
+| `ENABLE_COUNTERS` | 1 | `rdcycle` gives firmware self-profiling for free |
+| `COMPRESSED_ISA` | 1 | ~30% smaller firmware; the first thing to drop if area gets tight |
+| `ENABLE_IRQ` | 0 | polling `RETIRED` is simpler and the latency does not matter |
+
+Bus topology is `picorv32_axi` — firmware RAM, command ports, status block and the
+scratchpad window are all AXI4-Lite slaves. Every instruction fetch pays the AR/R handshake,
+so CPI is ~6 rather than ~4. The alternative (native core, tightly coupled RAM, a bridge on
+the MMIO aperture only) is worth ~2% of runtime and is not built. Switch when `idlec` says
+CPU issue is over ~10% of a run; it is 7% today.
+
+## Retired opcodes are holes, not free space
+
+Nothing is reallocated, so a stale binary decodes to an unknown op rather than a *different*
+one.
+
+| Namespace | Holes |
+| --- | --- |
+| Scalar opcodes | `0x02`, `0x05`, `0x0A`–`0x0F`, `0x1B`, `0x1E`, `0x20` |
+| VPU op selector | 2, 4–9, 11–15 (13 was `vecmatmul`) |
+| VPU command | `0x02` (`VPU_GEOM`) |
+| `cfg` indices | 9 (`vscalar`), 10–14 (`vecmatmul` geometry) |
+
+`cfg` 9–14 stay vacant because renumbering would silently repoint 15–17, the DMA transpose
+geometry. `0x22` is `quant4`; **new ops go at `0x23`+**.
+
+## What is built
 
 | Piece | Where | Test |
 | --- | --- | --- |
-| Per-run performance counters | `rtl/perf_counters.sv` (replaces `cycle_timer.sv`) | `fw_uart_tb` structural + per-kernel checks, decoded from the `'T'` reply (`make fwuart`) |
-| `setcfgr` (register → config) | `scalar_unit.sv` `0x1C` | `examples/setcfgr.tpu` |
-| MXU config strides | `mxu.sv` `a_row`/`c_row`/`w_row` | `examples/strided_matmul.tpu` |
-| `matmul_t` hardware tile loop | `mxu.sv` `0x1D` | `examples/tiled_matmul_hw.tpu` |
-| ~~`vecmatmul`~~ | *removed* — was `vpu.sv` `VOP_VECMATMUL`, opcode `0x1E` | *(was `examples/vecmatmul.tpu`; deleted)* |
-| ~~`softmax`~~ | *removed* — was `vpu.sv` `VOP_SOFTMAX`/`VOP_SM_EXP`, opcode `0x20` | *(was `vpu_tb` + `examples/softmax_rows.tpu`; both deleted)* |
+| Per-run performance counters | `rtl/perf_counters.sv` | decoded from the `'T'` reply, checked per kernel |
+| MXU config strides | `mxu.sv` `a_row` / `c_row` / `w_row` | `make fw FWPROG=tiled` |
+| `matmul_t` hardware tile loop | `mxu.sv` | `make fw`, `make fwsweep` |
+| 128-bit commands + per-unit queues | `cmd_queue.sv`, `cmd_{mxu,vpu,dma}.sv` | `make TEST=cmd_queue` |
+| PicoRV32 producer | `cpu_subsys.sv` + `rtl/vendor/picorv32.v` | `make TEST=cpu_smoke`, every `make fw` |
+| CPU scratchpad window | `cpu_subsys.sv` | `make fw FWPROG=spadwin` |
 
-Measured instruction counts, same problem in each case:
+Not built, and not planned:
 
-| Kernel | Software | Macro-op |
+- **`softmax`** was built, validated and then **removed** with `EXP`, `REDUCEMAX`,
+  `REDUCESUM`, `SCALAR_DIV`, both activation ROMs and `cfg vscalar`. The model is ReLU
+  attention.
+- **`layernorm`** and its `rsqrt` LUT are dropped. DyT replaced LayerNorm and needs no macro
+  op at all — it is `requant` with a symmetric clip, fused into a narrow the residual add
+  already required.
+- **`vecmatmul`** was built, validated, measured and **removed**. It was 88.3% of all VPU
+  time, so packing K and V to int4 moved both attention matmuls onto the array; once
+  `Model.fc` went int4 the op had no caller. `VOP_DOT`, the datapath it wrapped, is untouched.
+- **The inter-TPU LINK.** `wrneigh` is a completing no-op. See [comms.md](comms.md).
+
+## What the tile loop bought
+
+Measured instruction counts, same problem:
+
+| Kernel | Software loop | Macro-op |
 | --- | --- | --- |
-| 8×32 @ 32×16 tiled matmul | 70 words | **25** words — and that does it *twice* (int32 and requantized) |
-| ~~Attention score block~~ | *44 words (`vpu_matmul.tpu`)* | *17 words (`vecmatmul.tpu`)* — measured before the op was removed; attention is now `matmul_t` on the array |
-| ~~Softmax over a row block~~ | *8 words per row + a scalar bridge* | *18 words for 5 rows* — measured before the op was removed; kept as the record of what a fused macro op bought |
+| 8x32 @ 32x16 tiled matmul | 70 words | **25** — and that does it *twice* (int32 and requantized) |
 
-Not built: the full-layer rewrite (§8 phase 7) and weight double-buffering (§4.5).
-`layernorm` + the `rsqrt` LUT (§5.2) are **dropped**, not pending — see the banner.
+And measured on the firmware producer (`make fwsweep`, 11 shapes):
 
-## 1. Why
+- **The hardware tile walk makes CPU cost O(1) in the problem.** `matmul.c` issues five
+  commands whatever the shape, and its `idlec` is 370–409 clocks across a **205x** range of
+  array work.
+- **The C loop costs ~85 clocks per dispatch** — 13 instructions, four AXI4-Lite stores, and
+  every instruction fetch over the same bus. What that costs the run is
+  `max(0, cpu - array)`, so it is **zero once M > ~24** on the 8x8 array.
 
-The ISA today is RISC-shaped: one instruction is one array pass or one vector pass, and
-everything above that — tile loops, and at the time softmax and LayerNorm — is expanded in
-the program. That choice has three measured costs:
-
-| Symptom | Evidence |
-| --- | --- |
-| Instruction memory is the binding constraint | One quantized layer = **861 of 1024** words (`README.md` roadmap §7); `tiled_matmul.tpu` alone is 191 lines |
-| Programs are not hand-writable at layer scale | the since-deleted `softmax_row.tpu` was 72 lines for **one row**; `vpu_matmul.tpu` is 129 lines for one score block |
-| The datatype contract is hand-enforced and silently breakable | `softmax_row.tpu:64-65` — `sadd` wrote int32 (4-byte stride), `exp` read int8 (1-byte stride), with nothing checking it. Still true of any int8/int32 pairing; that example is gone |
-
-The fix is not a different control processor (see the PicoRV32 discussion — it costs LUTs
-we don't have at 92% utilization and replaces the working, bit-exact `iss.py` chain). The
-fix is to **raise the work-per-instruction**, which is what TPU v1 did: ~12 instructions,
-CISC, >10 cycles each on average, with `MatrixMultiply` taking a variable-size operand and
-sequencing the tiling in hardware.
-
-Goal: a transformer layer that is **40–60 instructions and hand-writable**, with
-`assembler.py` staying a table lookup rather than growing into a compiler.
-
-## 2. Scope — what changes and what does not
-
-**Unchanged.** The scalar unit stays (issue-and-wait, same FSM, same 32-bit encoding). The
-PE array, the VPU lane datapath, the scratchpad, DMA, the UART link, and every numeric
-convention in `isa.md` §A.5 (ternary packing, requant, Q15 `sdiv`) are untouched. The
-existing primitive opcodes all stay valid.
-
-**Changed.** Three things gain internal sequencers:
-
-- **MXU** — an outer tile loop over the contraction (`k`) and output (`n`) axes, with
-  configurable row strides. New opcode; the existing single-tile `matmul` is retained.
-- **VPU** — three macro ops (`softmax`, `layernorm`, `vecmatmul`) implemented as a wrapper
-  FSM that issues the existing `VOP_*` passes internally. *(None survive — see the
-  banner. The VPU has no macro op today.)*
-- **Config file** — five new registers for the matmul geometry, two for the VPU.
-
-**Explicitly out of scope.** Removing branches (`beq`/`jmp` still drive the layer loop),
-the inter-TPU LINK, and any change to the host protocol.
-
-## 3. Opcode and config budget
-
-Both have room; check this before adding anything else.
-
-- **Opcode field is 6 bits = 64 slots.** Used: `0x00–0x1B` and `0x1F`. Free: `0x1C–0x1E`
-  and the whole of `0x20–0x3E`. No pressure.
-- **`flags` is only 2 bits and `matmul` already uses both** (`acc`, `rq`). A "tiled" bit
-  does not fit — hence a new opcode rather than a flag.
-- **`cfg` was `CFG_AW=4` = 16 registers**, of which `0..3` are assigned (`tlen`, `vlen`,
-  `len`, `scalar`). Twelve free; this proposal takes eleven (ten below, plus `vcrow`).
-  *Since built:* the DMA's transpose geometry (`dma.md` §5) needed three more, so `CFG_AW`
-  is now **5** — 32 registers, `0..17` assigned. Widening cost only the register file; the
-  `dst` field was already 8 bits.
-- **`setcfg` is immediate-only** (`CFG` form: `cfg[dst] = zero_extend(imm16)`). There is no
-  register→config path, so no config value can vary at runtime. §9.2 needs one; see
-  `setcfgr` below.
-- **`vpu_op` is 4 bits and codes `0..12` are used** — only 3 free, which the three macro
-  ops exactly consume. **Widen `vpu_op` to 5 bits now** (a port-width change in `vpu.sv`,
-  `scalar_unit.sv`, `tpu_top.sv` — three lines) rather than landing at exactly full.
-
-### New config registers
-
-| Idx | Name | Width | Meaning |
-| --- | --- | --- | --- |
-| 4 | `ktiles` | 8 | contraction tiles = `K / ROWS` |
-| 5 | `ntiles` | 8 | output tiles = `N / COLS` |
-| 6 | `arow` | 16 | activation row stride in bytes (`= K`) |
-| 7 | `crow` | 16 | result row stride in bytes (`= N*4`, or `N` when requantizing) |
-| 8 | `wrow` | 16 | weight **row** stride in bytes (`= N*4/8`) |
-| 9 | ~~`vscalar`~~ | — | **retired** with `softmax`, the only op that read it. Index left vacant so 10–17 keep their meaning |
-| 10–14 | ~~`vrows`, `vcols`, `vrow0`, `vrow1`, `vcrow`~~ | — | **retired** with `vecmatmul`, their only reader: query rows, key rows, the two source row strides and the int32 dst row stride. Indices left vacant so 15–17 keep their meaning |
-
-15..17 went to the DMA transpose geometry (`dma.md` §5); 18..31 are free. `vscalar` was
-deliberately *not* `cfg3 scalar` — that one is the MXU's requant word, and the two were
-live simultaneously inside a layer.
-
-`vrows` and `vcols` were separate because `vecmatmul` was **not square** in general:
-decode attends one query row against `t+1` key rows (§9.2). The same asymmetry is now the
-MXU's, and `matmul_t` already takes an `M` per dispatch.
-
-### New scalar opcode: `setcfgr`
-
-```
-setcfgr  name, rN      cfg[name] = rN        ; opcode 0x1C, new CFGR form
-```
-
-The only genuinely new instruction outside the macro ops, and the only new assembler
-*form* (`dst` = cfg index, `src0` = register). The config file already has a write port
-from `setcfg`; this muxes its data source from the register file instead of the sign-
-extended immediate — on the order of 20 LUTs.
-
-Without it, nothing computed at runtime can reach a config register, which makes every
-macro op's geometry a compile-time constant. That is fine for prefill and fatal for
-decode.
-
-## 4. MXU: hardware-tiled matmul
-
-### 4.0 Why tiling is a separate opcode, not a flag
-
-`matmul`'s `flags` field is 2 bits and `.acc`/`.rq` use both, so a "tiled" bit does not
-fit. But there is a stronger reason than encoding pressure, found while building this:
-
-**Config registers are not cleared between runs.** An earlier plan had the MXU key tiling
-off "the stride registers are nonzero", with zero meaning the single-tile default. That
-works for one program and breaks for two — running `strided_matmul.tpu` (which sets
-`arow=16`, `crow=64`, `wcol=4`) and then `relu_layer.tpu` made the second program's plain
-`matmul` read its operands at the first program's strides, corrupting every output byte.
-The two-program `tpu_top_uart_tb` sequence caught this. That testbench went with the
-scalar unit; `make fwuart FWPROG=<kernel> RERUN=1` (`tb/fw_uart_tb.sv`) is the
-two-runs-one-link case now, and it found a restart bug of its own the moment it existed
-— [`picorv32_migration.md`](picorv32_migration.md) §9.11. A single-program test never
-would have seen either.
-
-So `matmul_t` (opcode `0x1D`) reads the strides and `matmul` (`0x00`) ignores them
-outright. The mode is a property of the instruction, not of leftover machine state. Within
-`matmul_t` an unset (zero) stride still falls back to the single-tile value, so a missing
-`setcfg` degrades to something sane rather than addressing everything at offset zero.
-
-A related latent bug surfaced at the same time: the `cfg` array had **no reset**, so an
-unread config register was X in simulation and undefined on hardware. Harmless while every
-program set each register it used; not harmless once the MXU began reading `a_row`/`c_row`/
-`w_col` on every dispatch. `scalar_unit.sv` now resets the whole config file.
-
-### 4.1 The problem with the current address generation
-
-Three strides are hardcoded and all three assume the operand *is* one tile:
-
-| `mxu.sv` | Current | Needs to be |
-| --- | --- | --- |
-| `A_raddr = act_a + arq*ROWS` (L240) | row stride `ROWS` | `cfg arow` (`= K`) |
-| `RES_STRIDE = COLS*4` (L125) | row stride `COLS*4` | `cfg crow` (`= N*4`) |
-| `W_raddr = wgt_a + wreq*WCOL_BYTES` (L236) | column stride `ROWS*2/8` | `cfg wcol` (`= K*2/8`) |
-
-`WCOL_BYTES` remains correct as the *intra-column k-tile offset* — a k-tile advances
-`ROWS*2/8` bytes down within a column. So the weight address for tile `(k,n)`, column `c`
-is:
-
-```
-W_raddr = wgt_a + (n*COLS + c) * cfg.wcol + k * WCOL_BYTES
-```
-
-### 4.2 Loop order — and the win that falls out of it
-
-Order the tiles **`n` outer, `k` inner**:
-
-```
-for n in 0 .. ntiles-1:
-    clear resbuf
-    for k in 0 .. ktiles-1:
-        LOAD  weight tile (k,n)
-        RUN   stream A[:, k*ROWS : (k+1)*ROWS], accumulate into resbuf
-    WB    write resbuf once, requantized if cfg.rq
-```
-
-Because `resbuf` already holds `MAXT × COLS` int32 partials, **the partial sums never leave
-the chip across the `k` loop.** That deletes the `.acc` readback path for intermediate
-tiles entirely, which is worth more than the instruction-count saving:
-
-- No int32 `C` staging buffer in the scratchpad — at `COLS=8`, a `T×K` contraction
-  currently needs `T*COLS*4` bytes of int32 partials round-tripping per tile.
-- The `C_rw` port is idle during the whole `k` loop, so it stops contending on the
-  scratchpad's arbitrated read port.
-- The three-way `matmul` / `matmul.acc` / `matmul.acc.rq` choreography that the programmer
-  hand-manages today (`isa.md` §6) becomes internal and unmissable.
-
-Keep the `accumulate` flag for its *other* use — adding into a pre-existing `C` buffer
-(cross-`M` accumulation, or a second call into the same output).
-
-### 4.3 The `MAXT` limit — decide this explicitly
-
-`TOK_W = 6`, so `MAXT = 64` and `t_len` is 6 bits: **at most 63 token rows per dispatch.**
-For the adder model that is fine (`EQUALS_POS = 15`, sequences ~20–24 tokens), so the
-initial implementation can leave `M` untiled and simply document the ceiling.
-
-If you want generality, the `M` loop is a third counter and costs nothing extra in the
-datapath — but it does *not* need `resbuf` to grow, since each `M`-tile drains before the
-next begins. Recommend: implement `M` tiling in the ISS from the start (free), leave it out
-of RTL v1, and make the assembler reject `tlen > 63`.
-
-### 4.4 Cost estimate
-
-Three counters (`k`, `n`, and the existing token counter), three stride multipliers folded
-into the address adders, and a `resbuf`-clear state. No change to the PE array, the skew
-buffers, or `requant8`. Rough guess **200–400 LUTs**; `mxu` is already 10,845 of the
-design's 19,227, and you are at 92%. **Get a real number with
-`mode=ooc module=mxu` before and after** — the `synth.md` §5 estimates were wrong by 3×
-on `scratchpad`, in the good direction, but do not assume that twice.
-
-### 4.5 Optional phase 2: weight double-buffering
-
-With hardware tiling, the `k` loop alternates LOAD (COLS cycles) and RUN (~`T + ROWS`
-cycles) with no overlap. Double-buffering the PE weight registers lets tile `k+1` load
-while tile `k` streams — this is TPU v1's weight FIFO, and it is the single largest
-throughput lever the tiled matmul unlocks. Cost is `ROWS*COLS*2` bits of extra weight
-register: **128 FFs at the board's 8×8 geometry**, which is nothing. FFs are at 48%.
-
-Do this *after* the tiled matmul is correct, and measure it — it is a clean before/after
-roofline result.
-
-## 5. VPU macro ops
-
-> **None of these exist any more.** All three were wrapper FSMs issuing the existing
-> `VOP_*` passes internally; `softmax` was built and removed, `layernorm` was never
-> built, and `vecmatmul` was built, measured (§7) and then removed once int4 K/V put
-> attention on the array. The VPU now has no macro op and no geometry at all — one
-> command, one vector pass. What follows is the design record.
-
-All were a **wrapper FSM** that issued the existing `VOP_*` passes internally and held the
-scalar intermediates in registers. The lane datapath and `V_rw` were unchanged. Reduction
-results stayed in internal registers instead of round-tripping through the scratchpad,
-which is what killed the `loads`/`subs`/`stores` bridge idiom (`isa.md` §4.5) from
-programs.
-
-### 5.1 `softmax dst, src, tmp` — REMOVED
-
-> Built, validated, and then removed along with the VPU ops it was made of. The model uses
-> ReLU attention. Retained below as the design record; **this is not the current ISA.**
-
-Four passes over a row of `cfg vlen` elements, repeated `cfg vrows` times:
-
-| Pass | Reads | Computes | Writes |
-| --- | --- | --- | --- |
-| 1 | `src` int8 | `m = max_i x[i]` | internal register |
-| 2 | `src` int8 | `exp_lut[requant(x[i] - m, cfg.vscalar)]` | `tmp` **int8** |
-| 3 | `tmp` int8 | `D = Σ e[i]` | internal register |
-| 4 | `tmp` int8 | `round(e[i] * 2^15 / D)` (Q15) | `dst` int32 |
-
-Pass 2 is the important one: it **fuses `sadd` + `requant` + `exp` into one pass that
-writes narrow.** That is what makes pass 3's int8 read correct by construction, and it is
-precisely the mismatch `softmax_row.tpu:64-65` got wrong. The `{m0,n}` word lands
-the operand in the exp LUT's canonical 1/16 input scale (`vpu.sv` header, §Activation
-LUTs) — an obligation currently on the programmer, with nothing checking it.
-
-`tmp` is an explicit third operand because the int8→int32 width expansion in pass 4 would
-otherwise clobber unread data. *Optimization worth noting, not doing first:* walking pass 4
-**backwards** makes it safe in place (the int32 write at byte `4i` is above every unread
-int8 at `j < i`), removing the `tmp` operand at the cost of a reverse-order streaming mode.
-
-### 5.2 `layernorm dst, src, tmp` — DROPPED
-
-> Never built, and no longer planned. `model/transformer.py` replaced LayerNorm with DyT
-> (`hardtanh(alpha*x, -1, 1)`), which needs no macro op, no `rsqrt`, no square and no
-> divide: it is `requant` with a symmetric clip (`dyt`, `0x21`), fused into the narrow the
-> residual add already performed. The proposal below is kept for the reasoning about
-> `rsqrt` and about keeping γ/β out of an instruction, which would apply again if a
-> variance-based norm ever came back.
-
-The model *used to use* `nn.LayerNorm`, which needs
-`1/sqrt(var)` — and **the VPU has no square root.** `sdiv` gives `1/d`, not `1/sqrt(d)`.
-
-Recommendation: **add an `rsqrt` LUT** as a third 256-entry int8 ROM, generated by
-a `tpulang/luts.py` exactly like the since-deleted `gelu`/`exp` tables, loaded via a new `RSQRT_INIT` parameter. Same
-pattern, same canonical-input-scale caveat, negligible area (`gelu_rom` and `exp_rom` are
-already there and `vpu` uses 0 BRAM — they infer as LUTROM).
-
-Passes: `Σx` → mean (multiply by the compile-time `1/L` as a `{m0,n}`), then `x - mean`
-into `tmp`, then `Σ(x-mean)²` → var, then `rsqrt_lut[var]`, then scale.
-
-**Keep γ and β out of the macro-op.** They are per-channel *vectors*, and folding them in
-pushes the operand count past what the encoding holds. Emit them as a following
-`vecemul` + `vecadd` pair — two extra instructions per norm, four per layer. Not worth
-distorting the instruction format for.
-
-### 5.3 `vecmatmul dst, src0, src1` — REMOVED
-
-> **Built, validated, measured, and then removed.** `vecmatmul` existed because the MXU
-> multiplies a *weight* by an *activation* and attention's `Q@K^T` and `P@V` are
-> activation × activation, so they could not touch the array at all. `QUANT4` ended that:
-> an activation packed to int4 **is** a legal weight operand, so both became `matmul_t`
-> dispatches (`accel/tpulang/adder_kernel.md` §2.5), and the output head followed when
-> `Model.fc` became an `Int4Linear` (§2.6). With no caller left, the op, its two-level
-> pair counter, the five `v*` config registers and the `VPU_GEOM` command that carried
-> them are gone; `VOP_DOT`, the datapath it wrapped, is not. Retained below as the design
-> record; **this is not the current ISA.**
-
-The MXU is **ternary-weight × int8-activation** (`mxu.sv` header). Attention's `Q@K^T` and
-`P@V` were activation × activation, so they could not touch the MXU at all — which is why
-`vpu_matmul.tpu` exists and is 129 lines. This was the single biggest instruction-count
-item in a layer and the CISC matmul of §4 does nothing for it.
-
-`vecmatmul` wraps the existing `VOP_DOT` datapath in a two-level counter:
-
-```
-S[t][s] = Σ_d src0[t][d] * src1[s][d]      for t in cfg.vrows, s in cfg.vcols
-```
-
-contracting over `cfg vlen`, with `src0`/`src1` row strides from `cfg vrow0`/`cfg vrow1`
-(these are **not** equal to `vlen` when a head is a slice of a wider `[T][heads*head_dim]`
-tensor). K is read row-major, so **`K^T` is never materialized** — the transpose is
-implicit in the loop order, exactly as `vpu_matmul.tpu` already documents. Output is int32
-at `cfg crow` stride.
-
-That implicit transpose covers `Q@K^T` and **not** `P@V`, which contracts over keys — V's
-*row* axis — and so needs a real `V^T` whichever way round you write it. That is the DMA's
-job rather than this op's: `wrmem.t`/`rdmem.t` ([dma.md](dma.md) §5) do it in one dispatch.
-
-`vrows` and `vcols` are independent so decode (`vrows=1`, `vcols=t+1`) and prefill
-(`vrows=vcols=T`) are the same instruction. Both come from `setcfgr` when they vary.
-
-This is `vrows² ` dot products of length `vlen`, at `LANES = 8` on the board geometry
-(`vpu_bytes=32`). It is slow — but it is *already* slow, one instruction at a time, and
-collapsing it removes ~120 instruction words.
-
-## 6. Toolchain changes
-
-### `assembler.py`
-
-Purely additive — new `SPECS` entries and new `CFG_NAMES`. No new *form* is needed:
-`matmul_t` is `RRR` (dst/act/weight, geometry from cfg), and all three VPU macro ops are
-`RRR`. This is the point: the assembler stays a table.
-
-Add one validation that does not exist today: **reject `tlen > 63`** (`TOK_W` limit, §4.3).
-
-### `iss.py`
-
-The tiled matmul makes the ISS **simpler, not harder.** `_matmul` currently models one
-tile; the macro version is one atomic operation over the full `M×K×N` shape. Bit-exactness
-is preserved regardless of tile order because int32 accumulation is associative (including
-under two's-complement wraparound), so the ISS does **not** need to replicate the hardware's
-`n`-outer/`k`-inner order to match.
-
-The VPU macro ops must model the pass structure exactly — specifically pass 2's fused
-requant-then-LUT and its **int8** intermediate — because that *is* the numerics. Do not
-model `softmax` as float and round at the end.
-
-### `pytpu.py`
-
-Its whole reason for existing (docstring: "instruction memory is 1024 words, so anything
-shaped like a tensor loop has to stay a loop") is substantially relieved. It stays useful
-for the layer/geometry loop, but the tile loops it exists to emit move into hardware.
-
-## 7. Observability — this becomes mandatory
-
-Hardware tiling **hides the tile loop from the program**, so you can no longer infer
-weight-load vs. stream vs. drain from an instruction trace. Today `cycle_timer` counts one
-number: total `busy` cycles for a run. That was already too coarse for a roofline; after
-this change it is the *only* thing you'd have.
-
-Add alongside `cycle_timer`, surfaced on the UART `'T'` command:
-
-| Counter | Source | Answers |
-| --- | --- | --- |
-| `mxu_busy_cycles` | `mxu.busy` | MXU utilization |
-| `mxu_load_cycles` | `mxu.state == S_LOAD` | weight-load overhead — and the phase-2 double-buffer payoff |
-| `vpu_busy_cycles` | `vpu.busy` | how much of the layer is attention rather than GEMM |
-| `dma_busy_cycles` | `dma.busy` | memory-bound vs. compute-bound — the roofline's x-axis |
-| `su_wait_cycles` | `scalar_unit.state == S_WAIT` | control overhead, i.e. what issue-and-wait actually costs |
-| ~~`vpu_mm_cycles`~~ | *was `vpu.vpu_mm_busy`* | of the VPU's share, how much is `vecmatmul` — **retired with the op**; counter 6 (`vmm`) is tied low and kept only so the `'T'` reply does not renumber |
-
-Six 32-bit counters and their UART readback: ~200 FFs, ~150 LUTs. This is the cheapest
-work in this document and the only item that directly produces the analysis the project
-exists for. **Build it first** — it also gives you honest before/after numbers for
-everything else here.
-
-**On the last row.** It was added after the fact, for a concrete reason. On the full
-adder model the VPU counter reads **41.2% of the run** — implausibly high for a unit whose
-surviving ops are pointwise over vectors of at most 128 elements, and `vpu_busy` alone
-cannot say which op it is. `vecmatmul` was the suspect because it is the only VPU op whose
-cost is quadratic in sequence length: it re-enters the inner dot product once per
-(row, col) pair, and each entry pays the whole `S_RD0`/`S_RD0D`/`S_RD1`/`S_RD1D`/`S_EXEC`/
-`S_WB` round trip around a contraction only `head_dim = 32` long. Counter 6
-(`vmm`, `vpu_mm_busy = vpu_busy && mm_active`) settles that by measurement rather than by
-argument, and being a strict subset of counter 3 it subtracts to give the pointwise share
-for free.
-
-Measured on the board (`host/run_adder.py -p COM6 -n 64`, Cmod A7 @ 12 MHz, 2 layers,
-542 656 clocks/problem, mean over 64 runs):
-
-| counter | % of run |
-| --- | --- |
-| mxu | 34.0 |
-|  of which mload | 5.7 |
-| vpu | 41.2 |
-|  of which **vmm** | **36.4** |
-| dma | 24.2 |
-| swait | 99.5 |
-
-So **`vecmatmul` is 88.3% of all VPU time** and the other five ops together are 4.8% of the
-run. The VPU's share is not the pointwise datapath at all — it is the macro op's per-pair
-sequencing overhead, and it is now the single largest non-`swait` counter after the MXU.
-Any attempt to bring the VPU's 41% down has to attack `vecmatmul`'s inner loop (the six
-states per pair, over a 32-element contraction that occupies only two of the sixteen lanes'
-worth of chunks); tuning the pointwise path can recover at most 4.8%.
-
-**That is what happened, and it is why the op no longer exists.** The inner loop was not
-tuned — it was made unnecessary: packing K and V to int4 (`QUANT4`) put both attention
-matmuls on the array, which deleted the 36.4% rather than shrinking it. `vecmatmul` was
-then dead code and was removed. This counter is the reason the change was made to the
-right thing, and it is also the reason the counter itself is no longer needed: the VPU
-now runs only pointwise ops, so `vpu` is no longer ambiguous.
-
-## 8. Migration plan
-
-Each phase leaves the tree green.
-
-| Phase | Work | Status |
-| --- | --- | --- |
-| 0 | Cycle counters (§7) + `'T'` command extension | **done** — seven counters, `'T'` returns a 7-word block, word 0 still the run length |
-| 1 | `vpu_op` widened to 5 bits; new cfg registers + `setcfgr` (§3) wired through `scalar_unit`/`tpu_top`; assembler + ISS know the names | **done** — no behavior change; whole suite still green |
-| 2 | MXU strides from cfg (§4.1), still single-tile | **done** — `tiled_matmul.tpu` passes unmodified; `strided_matmul.tpu` proves the strides are consulted |
-| 3 | MXU tile loop + `matmul_t` opcode (§4.2) | **done** — `tiled_matmul_hw.tpu`, checked against an independent Python matmul over the full K |
-| 4 | `vecmatmul` | built and validated (`vecmatmul.tpu`, deliberately non-square 12×20), then **removed** — int4 K/V put attention on the array and it lost its last caller |
-| 5 | `softmax` | built and validated, then **removed** — the model does not use softmax |
-| 6 | `rsqrt` LUT + `layernorm` | **dropped** — DyT replaced LayerNorm; `dyt` (`0x21`) needs no macro op |
-| 7 | Full layer rewritten; re-measure against the phase-0 baseline | not started |
-| 8 | Optional: MXU weight double-buffering (§4.5) | not started |
-
-**Phase-0 baseline**, for phase 7 to measure against (8×8 array, 100 MHz sim clock):
-
-| Program | run | mxu | mload | vpu | dma | swait |
-| --- | --- | --- | --- | --- | --- | --- |
-| `relu_layer.tpu` | 1968 | 37 | 10 | 7 | 1856 (94%) | 1905 (97%) |
-| `vector_add.tpu` | 6457 | 0 | 0 | 21 | 6400 (99%) | 6424 |
-| `tiled_matmul.tpu` (software) | — | 616 | 160 (26% of MXU) | 0 | 7328 | 7981 |
-| `tiled_matmul_hw.tpu` (2 matmuls) | — | 582 | 160 | 0 | 8864 | 9451 |
-
-Two things fall straight out and neither was visible before phase 0. Every kernel at this
-size is **DMA-bound** — 94–99% of the run is the byte-at-a-time SRAM path, so the array
-geometry is nowhere near the limiter yet. And **26% of MXU time is weight loading**
-(`mload`/`mxu`), which is the §4.5 double-buffering opportunity quantified: it is worth
-having, and it is worth roughly a quarter of MXU time, not more.
-
-**Keep every primitive opcode.** `matmul` and the primitive VPU ops stay in the ISA at
-their current encodings, so `tiled_matmul.tpu`, `vpu_matmul.tpu` and
-their golden vectors remain a live regression suite the whole way through. That is what
-makes each phase verifiable rather than a rewrite you hope is equivalent.
-
-## 9. Risks and open questions
-
-1. **Area.** 92% LUTs, and `mxu` is 56% of them. Phases 3 and 8 both grow it. If §4.4 comes
-   back over budget, the `synth.md` §5 knobs are `TOK_W` first (the `resbuf[0:63][0:7]`
-   int32 buffer is ~16k FFs alone — and §4.3 says you only need 24 tokens, so `TOK_W=5`
-   halves it for free), then 64-byte operand alignment to delete the barrel rotates.
-   **`TOK_W = 5` is probably the cleanest way to pay for this whole proposal.**
-
-2. **Decode with a KV cache — the layout is a non-issue; the *runtime config* is the real
-   requirement.**
-
-   Preallocate `K[MAX_T][d]` and `V[MAX_T][d]` at fixed scratchpad bases and write token
-   `t`'s row at `base + t*d`. Then:
-
-   - **The write** is a projection matmul with `t_len=1` whose `out_addr` is a register
-     (`adds` from a step counter). Registers already hold addresses — nothing new.
-   - **The read** is rows `0 .. t` of a fixed row-major tensor at a constant stride `d`.
-     Contiguous, and exactly the `base + count + stride` shape §4.1 and §5.3 already
-     express. Nothing ragged about it.
-   - **Capacity** is not a constraint: at `d = 128`, even `MAX_T = 64` is 8 KB each for K
-     and V against a 64 KB scratchpad.
-   - **Causal masking comes free**, and is already the intended approach — iterate `j ≤ i`
-     rather than materializing the `-1e9` mask (`scalar_unit.md` §5).
-
-   What decode *does* require is that `vcols = t+1` change every step. Config registers are
-   `setcfg`-immediate-only today, so **`setcfgr` (§3) is the actual prerequisite**, not any
-   change to the address generators. It is ~20 LUTs. Add it in phase 1 and decode stays
-   open at essentially no cost — this is much cheaper than the "decide now, expensive to
-   retrofit" tradeoff an earlier draft of this section claimed.
-
-   The genuinely rigid thing is narrower: the strides are *runtime* values but the **tensor
-   layout convention** (activations row-major int8, weights column-major 2-bit packed) is
-   compiled into the address arithmetic. A layout change is a retrofit; a shape change is
-   a `setcfgr`.
-
-3. **Decode is weight-load bound, and that is a result rather than a defect.** With
-   `t_len = 1`, each projection pays a full `LOAD` (COLS cycles) plus pipeline drain
-   (~ROWS cycles) to push one token row, so MXU utilization is roughly `1/(ROWS+COLS)` —
-   about 6% at the board's 8×8. The §4.5 weight double-buffer does not help, because there
-   is no activation stream to hide the load behind.
-
-   This is the standard prefill-vs-decode arithmetic-intensity split, and it is precisely
-   the kind of thing the phase-0 counters (§7) exist to show. Do not design around it —
-   measure it, and let `mxu_load_cycles` versus `mxu_busy_cycles` make the point on a
-   roofline.
-
-4. **`rsqrt` LUT precision.** A 256-entry int8 table over the variance range may be too
-   coarse for LayerNorm to match `nn.LayerNorm` acceptably. Validate against `torch_ref.py`
-   **before** committing the RTL. Fallback: keep `layernorm` decomposed and accept the
-   instruction cost — it is 2 per layer, not 2 per row.
-
-5. **`vecmatmul` cost.** It removes ~120 instruction words but does not make attention
-   faster; it is still `vrows²` VPU dot products. If phase-0 counters show attention
-   dominating `vpu_busy_cycles`, the real answer is an int8×int8 mode in the MXU, which is
-   a much larger change (the PE is a select+conditional-negate adder, not a multiplier)
-   and is out of scope here. Measure before deciding.
-
-   > **Resolved, and this risk was real:** the counters showed 36.4% of the run in
-   > `vecmatmul` (§7). The answer was not an int8×int8 MXU but the mirror image of one —
-   > narrow the *activation* to the weight width instead of widening the weight path.
-   > `QUANT4` packs K and V to int4, both matmuls became `matmul_t`, and `vecmatmul` was
-   > deleted.
-
-6. **`softmax` operand count.** Three addresses plus `cfg vscalar` is the ceiling of what
-   the encoding holds. If a macro op ever needs a fourth address, that is the signal the
-   instruction format — not the op — needs revisiting.
+Full tables in [picorv32_migration.md](picorv32_migration.md) §Measurements.

@@ -77,6 +77,20 @@ CFLAGS  := $(ARCH) -Os -ffreestanding -nostdlib -fno-builtin -Wall -Wextra \
 # or when RQ changes (../host/run_adder.py deletes the kernel's objects itself).
 #   make M=8 KTILES=16 NTILES=16
 #   make PROG=infer GEN=3     tokens for infer.c to generate (default T-PROMPT)
+#   make PROG=infer PHASE=prefill|decode|both
+#                             which half of a generation the image runs.
+#                             Both (the default) is the whole thing and is
+#                             what the accuracy path builds; the other two
+#                             are benchmarks, since the perf counters reset
+#                             at 'G' and cannot be read mid-run.
+#   make PROG=infer BLOCK=8   prefill rows per sequence per pass (default 32,
+#                             the array's dispatch limit). Lower it to shrink
+#                             every activation buffer, at one weight stream
+#                             per extra pass; it is what makes BATCH>1 fit.
+#   make PROG=infer BATCH=2   independent sequences sharing one weight
+#                             stream. Costs 48 KB of DRAM per sequence for
+#                             the KV cache, so infer.c's DR_END assert is
+#                             the ceiling.
 #   make PROG=adder RQ=/tmp/adder_rq_ckpt.h
 #                             adder.c's requant table, derived from a real
 #                             checkpoint by `accel/tpulang/adder_export.py
@@ -88,8 +102,23 @@ M      ?=
 KTILES ?=
 NTILES ?=
 GEN    ?=
+BATCH  ?=
+BLOCK  ?=
+PHASE  ?=
 RQ     ?=
-SHAPEFLAGS := $(if $(M),-DM=$(M)) $(if $(KTILES),-DKTILES=$(KTILES)) \
+
+PHASEFLAGS :=
+ifneq ($(PHASE),)
+ifeq ($(PHASE),prefill)
+PHASEFLAGS := -DINFER_PREFILL=1 -DINFER_DECODE=0
+else ifeq ($(PHASE),decode)
+PHASEFLAGS := -DINFER_PREFILL=0 -DINFER_DECODE=1
+else ifneq ($(PHASE),both)
+$(error PHASE must be prefill, decode or both)
+endif
+endif
+
+SHAPEFLAGS := $(PHASEFLAGS) $(if $(BATCH),-DBATCH=$(BATCH)) $(if $(BLOCK),-DBLOCK=$(BLOCK)) $(if $(M),-DM=$(M)) $(if $(KTILES),-DKTILES=$(KTILES)) \
               $(if $(NTILES),-DNTILES=$(NTILES)) $(if $(GEN),-DINFER_GEN=$(GEN)) \
               $(if $(RQ),-DADDER_RQ_H=$(call strquote,$(abspath $(RQ))))
 CFLAGS += $(SHAPEFLAGS)

@@ -214,6 +214,13 @@ def operands_mha(args) -> dict:
     return img
 
 
+# ---- adder.c ----------------------------------------------------------------
+# Its DRAM map, at the d=128 / f=512 / T=128 shape. `adder_export.py` carries
+# the same six numbers and stages a real checkpoint into them.
+AD_X, AD_MASK, AD_WFC, AD_LOG = 0x00000, 0x04000, 0x1C000, 0x1E000
+AD_LAYER, AD_LSTEP = 0x20000, 0x18000
+
+
 def operands_adder(args) -> dict:
     """adder.c: the whole model's DRAM image, with **synthetic** weights.
 
@@ -223,12 +230,18 @@ def operands_adder(args) -> dict:
     unrunnable the moment the model is retrained. `adder_export.py` stages the
     real thing into this same map.
 
-    The map is adder.c's, and this is the only other place it is written down:
+    The map is adder.c's, and this is the only other place it is written down.
+    It fills the 512 KB chip exactly: 128 KB of activations and host inputs
+    below, 96 KB of weights per layer above.
 
-        0x00000 X0     [T][D]   int8    0x00800 mask  [T][T]  int8
-        0x01400 W_fc   [D][16]  int4    0x01800 logits[T][16] int32 (out)
-        0x02000 + L*0x6000: Wq [D][D], +0x0800 Wk, +0x1000 Wv, +0x1800 Wo,
-                            +0x2000 W1 [D][F], +0x4000 W2 [F][D]
+        0x00000 X0     [T][D]   int8    0x04000 mask  [T][T]  int8
+        0x1C000 W_fc   [D][16]  int4    0x1E000 logits[T][16] int32 (out)
+        0x20000 + L*0x18000: Wq [D][D], +0x02000 Wk, +0x04000 Wv, +0x06000 Wo,
+                             +0x08000 W1 [D][F], +0x10000 W2 [F][D]
+
+    0x08000 .. 0x1BFFF are the tensors the kernel itself writes (Q, K, V, K^T,
+    A) and are seeded with nothing — they are 16 KB apiece and the run
+    overwrites every byte of each before reading it.
 
     Every tensor gets its own salt so a mis-addressed weight shows up as a wrong
     answer rather than as a coincidentally equal one, and the padding columns of
@@ -242,25 +255,25 @@ def operands_adder(args) -> dict:
     kind of neighbour, which would make an addressing bug between them
     invisible.
     """
-    T, D, DFF, VPAD, LAYERS = 32, 64, 256, 16, 4
+    T, D, DFF, VPAD, LAYERS = 128, 128, 512, 16, 4
     img: dict = {}
 
-    put_rowmajor_i8(img, 0x00000, T, D, D, a_val)
+    put_rowmajor_i8(img, AD_X, T, D, D, a_val)
     for t in range(T):
         for s in range(T):
             # 0 where s <= t, -8 above. S is int4, so S-8 <= -1 for every S in
             # range and ReLU takes a masked entry to exactly zero.
-            img[0x00800 + t * T + s] = (0 if s <= t else -8) & 0xFF
-    put_rowmajor_i4(img, 0x01400, D, VPAD, lambda r, c: w_hash(r, c, 0))
+            img[AD_MASK + t * T + s] = (0 if s <= t else -8) & 0xFF
+    put_rowmajor_i4(img, AD_WFC, D, VPAD, lambda r, c: w_hash(r, c, 0))
 
     for l in range(LAYERS):
-        base = 0x02000 + l * 0x06000
-        for i, off in enumerate((0x0000, 0x0800, 0x1000, 0x1800)):   # Wq Wk Wv Wo
+        base = AD_LAYER + l * AD_LSTEP
+        for i, off in enumerate((0x0000, 0x2000, 0x4000, 0x6000)):   # Wq Wk Wv Wo
             put_rowmajor_i4(img, base + off, D, D,
                             lambda r, c, s=6 * l + i + 1: w_hash(r, c, s))
-        put_rowmajor_i4(img, base + 0x2000, D, DFF,
+        put_rowmajor_i4(img, base + 0x8000, D, DFF,
                         lambda r, c, s=6 * l + 5: w_hash(r, c, s))
-        put_rowmajor_i4(img, base + 0x4000, DFF, D,
+        put_rowmajor_i4(img, base + 0x10000, DFF, D,
                         lambda r, c, s=6 * l + 6: w_hash(r, c, s))
     return img
 
@@ -327,29 +340,53 @@ def reference_spadwin(tpu: TPU) -> None:
 
 
 # ---- infer.c ----------------------------------------------------------------
-# Its DRAM map. Everything it shares with adder.c is at the same address; what
-# was the embedded X0 is now the embedding table and the token sequence, because
-# this kernel embeds and argmaxes on the device.
-IN_EMB, IN_TOK, IN_MASK, IN_WFC, IN_LOG = (0x00000, 0x00400, 0x00800,
-                                           0x01400, 0x01800)
-IN_T, IN_D, IN_DFF, IN_NH, IN_LAYERS = 32, 64, 256, 4, 4
-IN_VOCAB, IN_VPAD, IN_PROMPT = 13, 16, 15
+# Its DRAM map. The WEIGHTS are adder.c's, at the same addresses and the same
+# salts — both kernels are `adder_int4_wide`, d=128 / f=512 — so the two really
+# are running one model and a divergence between them means something again.
+#
+# EVERYTHING BELOW THE WEIGHTS IS COMPUTED, not assigned: infer.c lays its DRAM
+# out as a chain off the shape (every tensor it has lives there, activations
+# included) and this is the same chain in Python. Keep the two in step — the
+# kernel is the source of truth and its `DR_END <= DR_LAYER0` assert is what
+# says a shape still fits.
+IN_T, IN_D, IN_DFF, IN_NH, IN_LAYERS = 64, 128, 512, 4, 4
+IN_VOCAB, IN_VPAD, IN_PROMPT = 13, 16, 32
 IN_DH = IN_D // IN_NH
+IN_BLOCK = 32                       # fw/infer.c BLOCK (= TPU_TOKENS_MAX)
 
-# The synthetic prompt: "321+54" then pads to 14 and '=', which is the shape
-# numbers_data emits (digits least-significant first, answer at EQUALS_POS=15).
-# The weights below are not a checkpoint, so this decodes to nothing — it is
-# here because a prompt that looks like a prompt makes a wrong gather obvious.
-IN_PROMPT_IDS = [3, 2, 1, 10, 5, 4] + [12] * 8 + [11]
 
-# fw/adder_rq.h's table, which fw/infer.c compiles in. DUPLICATED FROM THAT
+def _in_align(addr: int) -> int:
+    """fw/infer.c's DR_ALIGN: 64-byte granularity."""
+    return (addr + 63) & ~63
+
+
+IN_EMB = 0x00000
+IN_TOK = _in_align(IN_EMB + IN_VOCAB * IN_D)
+IN_LOG = _in_align(IN_TOK + IN_T * 4)
+IN_MASK = _in_align(IN_LOG + IN_T * IN_VPAD * 4)
+IN_WFC = _in_align(IN_MASK + IN_T * IN_T)
+# The K and V caches follow, then the activations. Nothing seeds any of them:
+# the kernel's whole claim about the cache is that its uninitialized tail is
+# harmless, and an activation is written before it is read.
+IN_KCACHE = _in_align(IN_WFC + IN_D * (IN_VPAD // 2))
+IN_VCACHE = _in_align(IN_KCACHE + IN_LAYERS * IN_D * IN_T)
+IN_ACT = _in_align(IN_VCACHE + IN_LAYERS * IN_T * (IN_D // 2))
+
+# The synthetic prompt: "321+54" then pads to 31 and '=', which is the shape
+# numbers_data emits at `equals_pos=32` (digits least-significant first, the
+# answer starting at 32). The weights below are not a checkpoint, so this
+# decodes to nothing — it is here because a prompt that looks like a prompt
+# makes a wrong gather obvious.
+IN_PROMPT_IDS = [3, 2, 1, 10, 5, 4] + [12] * 25 + [11]
+
+# fw/infer_rq.h's table, which fw/infer.c compiles in. DUPLICATED FROM THAT
 # HEADER on purpose: the reference below has to know the fixed point to predict
 # a single byte, and there is no path from a C macro to here. If the two drift
 # the reference fails loudly on the first requant, which is the failure mode to
 # want.
-IN_RQ = {"Q": (1, 5), "K": (1, 5), "V": (1, 5), "KP": (1, 0), "VP": (1, 0),
-         "S": (1, 3), "ID": (1, 0), "P": (1, 0), "A": (1, 5), "O": (1, 5),
-         "XO": (1, 0), "X1": (1, 1), "H": (1, 5), "HR": (1, 0), "F": (1, 6),
+IN_RQ = {"Q": (1, 6), "K": (1, 6), "V": (1, 6), "KP": (1, 0), "VP": (1, 0),
+         "S": (1, 4), "ID": (1, 0), "P": (1, 0), "A": (1, 6), "O": (1, 6),
+         "XO": (1, 0), "X1": (1, 1), "H": (1, 6), "HR": (1, 0), "F": (1, 7),
          "X2": (1, 1)}
 
 
@@ -361,9 +398,10 @@ def emb_val(v: int, d: int) -> int:
 def operands_infer(args) -> dict:
     """infer.c: the embedding table, the prompt ids, the mask, the head, the weights.
 
-    Same synthetic weights as :func:`operands_adder`, at the same addresses and
-    the same salts, so the two kernels are running one model — that is what lets
-    a divergence between them mean something.
+    The same synthetic weights, at the same addresses and with the same salts,
+    as :func:`operands_adder` — the two kernels are one model again (d=128,
+    f=512, four layers), so a divergence between them means something. Only the
+    sequence differs: the mask below is [64][64] where adder.c's is [128][128].
     """
     del args
     img: dict = {}
@@ -378,13 +416,13 @@ def operands_infer(args) -> dict:
     put_rowmajor_i4(img, IN_WFC, IN_D, IN_VPAD, lambda r, c: w_hash(r, c, 0))
 
     for l in range(IN_LAYERS):
-        base = 0x02000 + l * 0x06000
-        for i, off in enumerate((0x0000, 0x0800, 0x1000, 0x1800)):   # Wq Wk Wv Wo
+        base = AD_LAYER + l * AD_LSTEP
+        for i, off in enumerate((0x0000, 0x2000, 0x4000, 0x6000)):   # Wq Wk Wv Wo
             put_rowmajor_i4(img, base + off, IN_D, IN_D,
                             lambda r, c, s=6 * l + i + 1: w_hash(r, c, s))
-        put_rowmajor_i4(img, base + 0x2000, IN_D, IN_DFF,
+        put_rowmajor_i4(img, base + 0x8000, IN_D, IN_DFF,
                         lambda r, c, s=6 * l + 5: w_hash(r, c, s))
-        put_rowmajor_i4(img, base + 0x4000, IN_DFF, IN_D,
+        put_rowmajor_i4(img, base + 0x10000, IN_DFF, IN_D,
                         lambda r, c, s=6 * l + 6: w_hash(r, c, s))
     return img
 

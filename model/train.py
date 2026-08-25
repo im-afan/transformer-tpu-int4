@@ -24,8 +24,8 @@ def train(
     batches=10000,
     mini_batch_size=32,
     batch_size=32,
-    max_tokens=32,
-    max_digits=5,
+    max_tokens=numbers_data.MAX_TOKENS,
+    max_digits=(numbers_data.EQUALS_POS - 2) // 2,
     save_freq=100,
     grad_clip=1.0,
 ):
@@ -114,21 +114,26 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--arch",
-        choices=["vanilla", "gqa", "int4_vanilla"],
-        default="vanilla",
+        choices=["vanilla", "gqa", "int4_vanilla", "int4_wide"],
+        default="int4_wide",
         help="Which adder architecture to use",
     )
     parser.add_argument("--save_freq", type=int, default=50)
     parser.add_argument("--mini_batch_size", type=int, default=256)
     parser.add_argument("--batch_size", type=int, default=512)
     parser.add_argument(
-        "--max_tokens", type=int, default=32, help="Context length (sequence length)"
+        "--max_tokens",
+        type=int,
+        default=numbers_data.MAX_TOKENS,
+        help="Context length (sequence length)",
     )
     parser.add_argument(
         "--max_digits",
         type=int,
-        default=5,
-        help="Max digits per operand in addition expressions",
+        default=(numbers_data.EQUALS_POS - 2) // 2,
+        help="Max digits per operand in addition expressions. The ceiling is "
+        "(EQUALS_POS - 2) // 2: both operands and the '+' have to fit before "
+        "the '=' at EQUALS_POS - 1",
     )
     parser.add_argument(
         "--grad_clip",
@@ -145,9 +150,10 @@ if __name__ == "__main__":
         model = transformer.adder_gqa()
     elif args.arch == "vanilla":
         model = transformer.adder_vanilla()
-    # elif args.arch == "int4_vanilla":
-    else:
+    elif args.arch == "int4_vanilla":
         model = transformer.adder_int4_vanilla()
+    else:
+        model = transformer.adder_int4_wide()
 
     optim = Adam(model.parameters(), lr=1e-3)
     train(

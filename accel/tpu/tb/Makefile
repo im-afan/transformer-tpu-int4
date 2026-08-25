@@ -122,8 +122,8 @@ sim: $(TB) $(RTL)
 #   make fw M=8 KTILES=16 NTILES=16   a different shape -- the firmware, the
 #                                     native trace and the golden operands are
 #                                     all rebuilt at it (see FWSHAPEARGS)
-#   make fw FWPROG=infer        prefill + decode with a KV cache, 4606 commands
-#   make fw FWPROG=infer GEN=3  ...generating 3 tokens instead of 17, for speed
+#   make fw FWPROG=infer        prefill + decode with a KV cache, d=128 / T=64
+#   make fw FWPROG=infer GEN=3  ...generating 3 tokens instead of 32, for speed
 FWPROG ?= matmul
 M      ?=
 KTILES ?=
@@ -137,9 +137,10 @@ FWSHAPE := $(if $(M),-DFW_M=$(M)) $(if $(KTILES),-DFW_KT=$(KTILES)) \
 # kernel rather than globally, because a watchdog that never fires on a hang is
 # worth nothing -- and skipped entirely if IVFLAGS already sets one.
 FW_WATCHDOG_adder := 60000000
-# infer is a prefill plus 16 decode steps in one run, and every step re-streams
-# 96 KB of weights: ~150 k clocks per generated token.
-FW_WATCHDOG_infer := 400000000
+# infer is a prefill plus 31 decode steps in one run, and every step re-streams
+# all 384 KB of the weights plus 48 KB of KV cache -- an estimated ~460 k clocks
+# per generated token, so ~16 M for the whole run. Use GEN= while iterating.
+FW_WATCHDOG_infer := 1000000000
 FW_WATCHDOG := $(if $(findstring WATCHDOG,$(IVFLAGS)),,\
                  $(if $(FW_WATCHDOG_$(FWPROG)),-DWATCHDOG_NS=$(FW_WATCHDOG_$(FWPROG))))
 
