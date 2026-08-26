@@ -503,7 +503,7 @@ def main(argv=None) -> int:
                     help="which half of a generation the image runs. 'both' "
                          "(the default) is scored; the other two are benchmarks "
                          "and stage no weights")
-    ap.add_argument("--ckpt", default="model/saved/int4_d128_f512_l4.pt",
+    ap.add_argument("--ckpt", default="model/saved/int4_d64_f256_l4.pt",
                     help="the checkpoint to run (default: %(default)s)")
     ap.add_argument("--seed", type=int, default=0,
                     help="problem generator seed; 0 is infer_export.py's, so the "

@@ -341,7 +341,7 @@ def reference_spadwin(tpu: TPU) -> None:
 
 # ---- infer.c ----------------------------------------------------------------
 # Its DRAM map. The WEIGHTS are adder.c's, at the same addresses and the same
-# salts — both kernels are `adder_int4_wide`, d=128 / f=512 — so the two really
+# salts — both kernels are `adder_int4_vanilla`, d=64 / f=256 — so the two really
 # are running one model and a divergence between them means something again.
 #
 # EVERYTHING BELOW THE WEIGHTS IS COMPUTED, not assigned: infer.c lays its DRAM
@@ -349,7 +349,7 @@ def reference_spadwin(tpu: TPU) -> None:
 # included) and this is the same chain in Python. Keep the two in step — the
 # kernel is the source of truth and its `DR_END <= DR_LAYER0` assert is what
 # says a shape still fits.
-IN_T, IN_D, IN_DFF, IN_NH, IN_LAYERS = 64, 128, 512, 4, 4
+IN_T, IN_D, IN_DFF, IN_NH, IN_LAYERS = 64, 64, 256, 4, 4
 IN_VOCAB, IN_VPAD, IN_PROMPT = 13, 16, 32
 IN_DH = IN_D // IN_NH
 IN_BLOCK = 32                       # fw/infer.c BLOCK (= TPU_TOKENS_MAX)

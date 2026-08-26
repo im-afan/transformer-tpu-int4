@@ -83,11 +83,11 @@
 #endif
 
 #define T         64
-#define D         128
-#define DFF       512
+#define D         64
+#define DFF       256
 #define HEADS     4
 #define HEAD_DIM  (D / HEADS)
-#define LAYERS    2
+#define LAYERS    4
 #define VOCAB     13
 #define VOCAB_PAD 16            /* the 13 logits, padded to a whole array tile */
 

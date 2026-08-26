@@ -68,7 +68,7 @@ from fw_vectors import coexecute  # noqa: E402
 from iss import TPU  # noqa: E402
 
 # Geometry and the DRAM map, from fw/infer.c. The six WEIGHT blocks per layer
-# are adder.c's, at the same addresses — both kernels are `adder_int4_wide` —
+# are adder.c's, at the same addresses — both kernels are `adder_int4_vanilla` —
 # but everything else is this kernel's own and is COMPUTED off the shape, so it
 # is taken from `fw_vectors` rather than restated here. That is the same chain
 # fw/infer.c's DR_* macros walk; see the note above them for why it moved.
@@ -186,9 +186,9 @@ def batch_prompt_image(rows, batch: int = 1) -> dict:
 def mask_image(batch: int = 1) -> dict:
     """The causal mask at THIS kernel's T and THIS kernel's address.
 
-    adder.c's is [128][128]; read as [64][64] it would put row 2t where row t
-    belongs, so the row stride is the reason this cannot be shared even though
-    the values are the same rule.
+    adder.c's is [32][32] and this kernel's is [64][64], so the row stride
+    differs and the mask cannot be shared even though the values are the same
+    rule.
     """
     base = layout(batch)["mask"]
     return {base + t * T + s: (0 if s <= t else -8) & 0xFF
@@ -278,7 +278,7 @@ def torch_generate(model, prompt_ids: list, n_gen: int) -> list:
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--model-path", default="model/saved/int4_d128_f512_l4.pt")
+    ap.add_argument("--model-path", default="model/saved/int4_d64_f256_l4.pt")
     ap.add_argument("-n", "--problems", type=int, default=16,
                     help="addition problems to generate (each is one ISS run of "
                          f"the whole kernel — a prefill and {NGEN - 1} decode "

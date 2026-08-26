@@ -70,7 +70,7 @@ from iss import TPU, parse_trace  # noqa: E402
 FW_DIR = os.path.join(REPO, "accel", "tpu", "fw")
 
 # ---- geometry. Must agree with fw/adder.c, and is checked against the model. --
-T, D, DFF, NH, LAYERS = 128, 128, 512, 4, 4
+T, D, DFF, NH, LAYERS = 32, 64, 256, 4, 4
 DH = D // NH
 VOCAB, VPAD = 13, 16
 ROWS = COLS = 8
@@ -363,7 +363,7 @@ def read_logits(tpu: TPU) -> torch.Tensor:
 # =============================================================================
 def load_model(path: str):
     """An `adder_int4_wide` checkpoint, checked against the kernel's shape."""
-    model = transformer.adder_int4_wide()
+    model = transformer.adder_int4_vanilla()
     state = torch.load(path if os.path.isabs(path) else os.path.join(REPO, path),
                        map_location="cpu")
     model.load_state_dict(state)

@@ -21,8 +21,8 @@ def time_func(f, samples, *args, **kwargs):
 # choose architecture
 import argparse
 parser = argparse.ArgumentParser()
-parser.add_argument('--arch', choices=['vanilla', 'gqa', 'int4', 'int4_wide'], default='int4_wide', help='Which adder architecture to use')
-parser.add_argument('--model-path', type=str, default='model/saved/int4_d128_f512_l4.pt')
+parser.add_argument('--arch', choices=['vanilla', 'gqa', 'int4', 'int4_wide'], default='int4', help='Which adder architecture to use')
+parser.add_argument('--model-path', type=str, default='model/saved/int4_d64_f256_l4.pt')
 args = parser.parse_args()
 
 if args.arch == 'gqa':
