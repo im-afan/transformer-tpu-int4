@@ -1,4 +1,4 @@
-# Bitnet Transformer TPU
+# Int4 Transformer + TPU
 
 A small decoder-only transformer that does multi-digit **addition**, plus a custom
 SystemVerilog TPU that runs it end to end on an FPGA.
