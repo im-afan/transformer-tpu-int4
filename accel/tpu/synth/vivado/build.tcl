@@ -53,7 +53,6 @@ array set ARGMAP {
 
     rows        ROWS
     cols        COLS
-    vpu_bytes   VPU_BYTES
     addr_w      ADDR_W
     xlen        XLEN
     imem_aw     IMEM_AW
@@ -391,7 +390,7 @@ proc read_design {{with_constraints 1}} {
 
 banner "accel/tpu — board=$BOARD  part=$PART  mode=$MODE"
 puts "  top       : $TOP"
-puts "  geometry  : ${ROWS}x${COLS} array, ADDR_W=$ADDR_W, VPU_BYTES=$VPU_BYTES"
+puts "  geometry  : ${ROWS}x${COLS} array, ADDR_W=$ADDR_W"
 puts "  clock     : ${CLK_MHZ} MHz  ->  UART_CPB=$UART_CPB @ ${BAUD} baud"
 puts "  outdir    : $OUTDIR"
 

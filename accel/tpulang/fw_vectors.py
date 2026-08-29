@@ -183,98 +183,34 @@ def coexecute(tpu: TPU, exe: str, quiet: bool = False) -> tuple:
 # kernel adds a function here and nothing else.
 # =============================================================================
 def operands_matmul(args) -> dict:
-    """matmul.c / matmul_loop.c: A[M][K] int8, W[K][N] int4, both at their own bases."""
+    """matmul.c: A[M][K] and W[K][N], both int4 row-major at their own bases."""
     k, n = args.ktiles * ROWS, args.ntiles * COLS
     img: dict = {}
-    put_rowmajor_i8(img, A_ADDR, args.M, k, k, a_val)
+    put_rowmajor_i4(img, A_ADDR, args.M, k, a_val)
     put_rowmajor_i4(img, W_ADDR, k, n, w_val)
     return img
 
 
 def operands_ffn(args) -> dict:
-    """ffn.c: X[T][D] int8, W1[D][F] int4, W2[F][D] int4."""
+    """ffn.c: X[T][D], W1[D][F], W2[F][D], all int4 row-major."""
     T, D, F = 8, 8, 16
     img: dict = {}
-    put_rowmajor_i8(img, 0x0000, T, D, D, a_val)
-    put_rowmajor_i4(img, 0x0400, D, F, w_val)
+    put_rowmajor_i4(img, 0x0000, T, D, a_val)
+    put_rowmajor_i4(img, 0x1000, D, F, w_val)
     # A different salt so a builder mix-up shows up as a wrong answer, not a
     # coincidentally-equal one.
-    put_rowmajor_i4(img, 0x0800, F, D, lambda r, c: ((r * 3 + c * 7) % 16) - 8)
+    put_rowmajor_i4(img, 0x2000, F, D, lambda r, c: ((r * 3 + c * 7) % 16) - 8)
     return img
 
 
 def operands_mha(args) -> dict:
-    """mha.c: X[T][D] int8 and three [D][DH] int4 projections, distinct salts."""
+    """mha.c: X[T][D] and three [D][DH] projections, all int4, distinct salts."""
     T, D, DH = 8, 8, 8
     img: dict = {}
-    put_rowmajor_i8(img, 0x0000, T, D, D, a_val)
-    put_rowmajor_i4(img, 0x0400, D, DH, w_val)
-    put_rowmajor_i4(img, 0x0500, D, DH, lambda r, c: ((r * 3 + c * 7) % 16) - 8)
-    put_rowmajor_i4(img, 0x0600, D, DH, lambda r, c: ((r * 11 + c * 5) % 16) - 8)
-    return img
-
-
-# ---- adder.c ----------------------------------------------------------------
-# Its DRAM map, at the d=128 / f=512 / T=128 shape. `adder_export.py` carries
-# the same six numbers and stages a real checkpoint into them.
-AD_X, AD_MASK, AD_WFC, AD_LOG = 0x00000, 0x04000, 0x1C000, 0x1E000
-AD_LAYER, AD_LSTEP = 0x20000, 0x18000
-
-
-def operands_adder(args) -> dict:
-    """adder.c: the whole model's DRAM image, with **synthetic** weights.
-
-    Deliberately not a checkpoint. `make fw FWPROG=adder` is a datapath
-    regression — does the CPU issue the right commands and does the array
-    compute what the ISS says — and tying it to an untracked `.pt` would make it
-    unrunnable the moment the model is retrained. `adder_export.py` stages the
-    real thing into this same map.
-
-    The map is adder.c's, and this is the only other place it is written down.
-    It fills the 512 KB chip exactly: 128 KB of activations and host inputs
-    below, 96 KB of weights per layer above.
-
-        0x00000 X0     [T][D]   int8    0x04000 mask  [T][T]  int8
-        0x1C000 W_fc   [D][16]  int4    0x1E000 logits[T][16] int32 (out)
-        0x20000 + L*0x18000: Wq [D][D], +0x02000 Wk, +0x04000 Wv, +0x06000 Wo,
-                             +0x08000 W1 [D][F], +0x10000 W2 [F][D]
-
-    0x08000 .. 0x1BFFF are the tensors the kernel itself writes (Q, K, V, K^T,
-    A) and are seeded with nothing — they are 16 KB apiece and the run
-    overwrites every byte of each before reading it.
-
-    Every tensor gets its own salt so a mis-addressed weight shows up as a wrong
-    answer rather than as a coincidentally equal one, and the padding columns of
-    W_fc carry **live** weights: staged as zeros they would agree with a kernel
-    that strided its second output tile wrongly, because both would be zero.
-
-    The weights come from :func:`w_hash` rather than the `(a*r + b*c) % 16`
-    pattern the smaller kernels use: `c*b mod 16` has a period dividing 16, so a
-    linear pattern makes blocks that differ only by a multiple-of-16 column
-    offset bit-identical — and the four [D][D] projections here are exactly that
-    kind of neighbour, which would make an addressing bug between them
-    invisible.
-    """
-    T, D, DFF, VPAD, LAYERS = 128, 128, 512, 16, 4
-    img: dict = {}
-
-    put_rowmajor_i8(img, AD_X, T, D, D, a_val)
-    for t in range(T):
-        for s in range(T):
-            # 0 where s <= t, -8 above. S is int4, so S-8 <= -1 for every S in
-            # range and ReLU takes a masked entry to exactly zero.
-            img[AD_MASK + t * T + s] = (0 if s <= t else -8) & 0xFF
-    put_rowmajor_i4(img, AD_WFC, D, VPAD, lambda r, c: w_hash(r, c, 0))
-
-    for l in range(LAYERS):
-        base = AD_LAYER + l * AD_LSTEP
-        for i, off in enumerate((0x0000, 0x2000, 0x4000, 0x6000)):   # Wq Wk Wv Wo
-            put_rowmajor_i4(img, base + off, D, D,
-                            lambda r, c, s=6 * l + i + 1: w_hash(r, c, s))
-        put_rowmajor_i4(img, base + 0x8000, D, DFF,
-                        lambda r, c, s=6 * l + 5: w_hash(r, c, s))
-        put_rowmajor_i4(img, base + 0x10000, DFF, D,
-                        lambda r, c, s=6 * l + 6: w_hash(r, c, s))
+    put_rowmajor_i4(img, 0x0000, T, D, a_val)
+    put_rowmajor_i4(img, 0x1000, D, DH, w_val)
+    put_rowmajor_i4(img, 0x1400, D, DH, lambda r, c: ((r * 3 + c * 7) % 16) - 8)
+    put_rowmajor_i4(img, 0x1800, D, DH, lambda r, c: ((r * 11 + c * 5) % 16) - 8)
     return img
 
 
@@ -340,19 +276,19 @@ def reference_spadwin(tpu: TPU) -> None:
 
 
 # ---- infer.c ----------------------------------------------------------------
-# Its DRAM map. The WEIGHTS are adder.c's, at the same addresses and the same
-# salts — both kernels are `adder_int4_vanilla`, d=64 / f=256 — so the two really
-# are running one model and a divergence between them means something again.
+# Its DRAM map. EVERYTHING BELOW THE WEIGHTS IS COMPUTED, not assigned: infer.c
+# lays its DRAM out as a chain off the shape (every tensor it has lives there,
+# activations included) and this is the same chain in Python. Keep the two in
+# step — the kernel is the source of truth and its `DR_END <= DR_LAYER0` assert
+# is what says a shape still fits.
 #
-# EVERYTHING BELOW THE WEIGHTS IS COMPUTED, not assigned: infer.c lays its DRAM
-# out as a chain off the shape (every tensor it has lives there, activations
-# included) and this is the same chain in Python. Keep the two in step — the
-# kernel is the source of truth and its `DR_END <= DR_LAYER0` assert is what
-# says a shape still fits.
+# Every element is int4, two per byte, so every extent below is halved against
+# the byte counts the int8 datapath needed.
 IN_T, IN_D, IN_DFF, IN_NH, IN_LAYERS = 64, 64, 256, 4, 4
 IN_VOCAB, IN_VPAD, IN_PROMPT = 13, 16, 32
 IN_DH = IN_D // IN_NH
-IN_BLOCK = 32                       # fw/infer.c BLOCK (= TPU_TOKENS_MAX)
+IN_BLOCK = 32                       # fw/infer.c BLOCK
+IN_LAYER0, IN_LSTEP = 0x20000, 0x18000
 
 
 def _in_align(addr: int) -> int:
@@ -360,17 +296,23 @@ def _in_align(addr: int) -> int:
     return (addr + 63) & ~63
 
 
+def _i4(cols: int) -> int:
+    """Bytes in a row-major int4 row — fw/infer.c's I4()."""
+    return cols // 2
+
+
 IN_EMB = 0x00000
-IN_TOK = _in_align(IN_EMB + IN_VOCAB * IN_D)
+IN_TOK = _in_align(IN_EMB + IN_VOCAB * _i4(IN_D))
 IN_LOG = _in_align(IN_TOK + IN_T * 4)
-IN_MASK = _in_align(IN_LOG + IN_T * IN_VPAD * 4)
-IN_WFC = _in_align(IN_MASK + IN_T * IN_T)
-# The K and V caches follow, then the activations. Nothing seeds any of them:
-# the kernel's whole claim about the cache is that its uninitialized tail is
-# harmless, and an activation is written before it is read.
-IN_KCACHE = _in_align(IN_WFC + IN_D * (IN_VPAD // 2))
-IN_VCACHE = _in_align(IN_KCACHE + IN_LAYERS * IN_D * IN_T)
-IN_ACT = _in_align(IN_VCACHE + IN_LAYERS * IN_T * (IN_D // 2))
+IN_MASK = _in_align(IN_LOG + IN_T * _i4(IN_VPAD))
+IN_WFC = _in_align(IN_MASK + IN_T * _i4(IN_T))
+# Both caches are [T][D] int4 now: the MXU transposes its second operand, so K
+# is stored exactly as it leaves its projection and the append is a copy.
+# Nothing seeds either of them — the kernel's whole claim about the cache is
+# that its uninitialized tail is harmless.
+IN_KCACHE = _in_align(IN_WFC + IN_D * _i4(IN_VPAD))
+IN_VCACHE = _in_align(IN_KCACHE + IN_LAYERS * IN_T * _i4(IN_D))
+IN_ACT = _in_align(IN_VCACHE + IN_LAYERS * IN_T * _i4(IN_D))
 
 # The synthetic prompt: "321+54" then pads to 31 and '=', which is the shape
 # numbers_data emits at `equals_pos=32` (digits least-significant first, the
@@ -384,10 +326,10 @@ IN_PROMPT_IDS = [3, 2, 1, 10, 5, 4] + [12] * 25 + [11]
 # a single byte, and there is no path from a C macro to here. If the two drift
 # the reference fails loudly on the first requant, which is the failure mode to
 # want.
-IN_RQ = {"Q": (1, 6), "K": (1, 6), "V": (1, 6), "KP": (1, 0), "VP": (1, 0),
+IN_RQ = {"Q": (1, 6), "K": (1, 6), "V": (1, 6),
          "S": (1, 4), "ID": (1, 0), "P": (1, 0), "A": (1, 6), "O": (1, 6),
          "XO": (1, 0), "X1": (1, 1), "H": (1, 6), "HR": (1, 0), "F": (1, 7),
-         "X2": (1, 1)}
+         "X2": (1, 1), "LOGIT": (1, 3)}
 
 
 def emb_val(v: int, d: int) -> int:
@@ -398,25 +340,22 @@ def emb_val(v: int, d: int) -> int:
 def operands_infer(args) -> dict:
     """infer.c: the embedding table, the prompt ids, the mask, the head, the weights.
 
-    The same synthetic weights, at the same addresses and with the same salts,
-    as :func:`operands_adder` — the two kernels are one model again (d=128,
-    f=512, four layers), so a divergence between them means something. Only the
-    sequence differs: the mask below is [64][64] where adder.c's is [128][128].
+    Every one of them is int4 now, including the embeddings and the mask, which
+    were the last int8 tensors the model had.
     """
     del args
     img: dict = {}
 
-    put_rowmajor_i8(img, IN_EMB, IN_VOCAB, IN_D, IN_D, emb_val)
+    put_rowmajor_i4(img, IN_EMB, IN_VOCAB, IN_D, emb_val)
     for i, tok in enumerate(IN_PROMPT_IDS):        # int32, little-endian
         for b in range(4):
             img[IN_TOK + i * 4 + b] = (tok >> (8 * b)) & 0xFF
-    for t in range(IN_T):
-        for s in range(IN_T):
-            img[IN_MASK + t * IN_T + s] = (0 if s <= t else -8) & 0xFF
+    put_rowmajor_i4(img, IN_MASK, IN_T, IN_T,
+                    lambda t, s: 0 if s <= t else -8)
     put_rowmajor_i4(img, IN_WFC, IN_D, IN_VPAD, lambda r, c: w_hash(r, c, 0))
 
     for l in range(IN_LAYERS):
-        base = AD_LAYER + l * AD_LSTEP
+        base = IN_LAYER0 + l * IN_LSTEP
         for i, off in enumerate((0x0000, 0x2000, 0x4000, 0x6000)):   # Wq Wk Wv Wo
             put_rowmajor_i4(img, base + off, IN_D, IN_D,
                             lambda r, c, s=6 * l + i + 1: w_hash(r, c, s))
@@ -429,38 +368,50 @@ def operands_infer(args) -> dict:
 
 # ---- tiled.c ----------------------------------------------------------------
 # Its DRAM map, written once and read by both the operand builder and the
-# reference below.
-TL_A1, TL_W1, TL_C1, TL_C2 = 0x00000, 0x00600, 0x00800, 0x00E00
-TL_A3, TL_W3, TL_C3 = 0x01400, 0x01600, 0x01700
-TL_M1, TL_K1, TL_N1 = 40, 32, 32
-TL_M3, TL_K3, TL_N3 = 8, 64, 8
+# reference below. Every tensor is int4.
+TL_A1, TL_W1, TL_C1, TL_C2 = 0x00000, 0x02000, 0x04000, 0x04100
+TL_V1, TL_V2, TL_C3 = 0x04200, 0x04700, 0x04C00
+TL_A4, TL_B4, TL_C4 = 0x05200, 0x05400, 0x05700
+TL_M1, TL_K1, TL_N1 = 16, 1024, 16
+TL_VEC = 2500
+TL_M4, TL_K4, TL_N4 = 12, 64, 20
+
+TL_RQ1, TL_RQ2, TL_RQ3, TL_RQ4 = (1, 8), (1, 0), (1, 1), (1, 4)
 
 
-def _tl_a3(r: int, c: int) -> int:
+def _tl_a4(r: int, c: int) -> int:
     return ((r * 7 + c * 3) % 9) - 4
 
 
-def _tl_w3(r: int, c: int) -> int:
+def _tl_b4(r: int, c: int) -> int:
     return ((r * 3 + c * 7) % 16) - 8
 
 
+def _tl_v1(i: int) -> int:
+    return ((i * 5) % 16) - 8
+
+
+def _tl_v2(i: int) -> int:
+    return ((i * 3) % 16) - 8
+
+
 def operands_tiled(args) -> dict:
-    """tiled.c: two matmuls and one elementwise pass, all DRAM to DRAM."""
+    """tiled.c: two matmuls and two elementwise passes, all DRAM to DRAM."""
     del args
     img: dict = {}
-    put_rowmajor_i8(img, TL_A1, TL_M1, TL_K1, TL_K1, a_val)
+    put_rowmajor_i4(img, TL_A1, TL_M1, TL_K1, a_val)
     put_rowmajor_i4(img, TL_W1, TL_K1, TL_N1, w_val)
-    put_rowmajor_i8(img, TL_A3, TL_M3, TL_K3, TL_K3, _tl_a3)
-    put_rowmajor_i4(img, TL_W3, TL_K3, TL_N3, _tl_w3)
+    put_rowmajor_i4(img, TL_V1, 1, TL_VEC, lambda r, c: _tl_v1(c))
+    put_rowmajor_i4(img, TL_V2, 1, TL_VEC, lambda r, c: _tl_v2(c))
+    put_rowmajor_i4(img, TL_A4, TL_M4, TL_K4, _tl_a4)
+    put_rowmajor_i4(img, TL_B4, TL_N4, TL_K4, _tl_b4)   # [cols][depth]
     return img
 
 
 OPERANDS = {
     "matmul": operands_matmul,
-    "matmul_loop": operands_matmul,
     "ffn": operands_ffn,
     "mha": operands_mha,
-    "adder": operands_adder,
     "infer": operands_infer,
     "spadwin": operands_spadwin,
     "tiled": operands_tiled,
@@ -481,41 +432,66 @@ OPERANDS = {
 # both agree on the wrong answer. So a kernel may register a reference here, and
 # it is checked against the ISS's DRAM before any vector file is written.
 # =============================================================================
+def _sx4(code: int) -> int:
+    """A 4-bit two's-complement nibble as a signed value."""
+    return code - 16 if code >= 8 else code
+
+
+def _narrow(acc: int, mn, lo: int = -8) -> int:
+    """`clip((acc*m0 + 2**(n-1)) >> n)` — iss.TPU._narrow, on one scalar."""
+    m0, n = mn
+    v = (acc * m0 + ((1 << (n - 1)) if n else 0)) >> n
+    return max(lo, min(7, v))
+
+
 def _ref_matmul(a, w, m: int, k: int, n: int, rq_m0: int, rq_n: int) -> list:
     """C = requant(A @ W), plain Python. `a`/`w` are index functions."""
-    out = []
-    for i in range(m):
-        row = []
-        for j in range(n):
-            acc = sum(a(i, t) * w(t, j) for t in range(k))
-            v = (acc * rq_m0 + (1 << (rq_n - 1) if rq_n else 0)) >> rq_n
-            row.append(max(-8, min(7, v)))
-        out.append(row)
-    return out
+    return [[_narrow(sum(a(i, t) * w(t, j) for t in range(k)), (rq_m0, rq_n))
+             for j in range(n)] for i in range(m)]
 
 
 def reference_tiled(tpu: TPU) -> None:
-    """tiled.c's three results, computed without the ISS or the kernel."""
-    c1 = _ref_matmul(a_val, w_val, TL_M1, TL_K1, TL_N1, 1, 4)
-    c3 = _ref_matmul(_tl_a3, _tl_w3, TL_M3, TL_K3, TL_N3, 1, 4)
-    want = {}
-    for i in range(TL_M1):
-        for j in range(TL_N1):
-            want[TL_C1 + i * TL_N1 + j] = c1[i][j] & 0xFF
-            want[TL_C2 + i * TL_N1 + j] = max(c1[i][j], 0) & 0xFF
-    for i in range(TL_M3):
-        for j in range(TL_N3):
-            want[TL_C3 + i * TL_N3 + j] = c3[i][j] & 0xFF
+    """tiled.c's four results, computed without the ISS or the kernel."""
+    def nib(base, i):
+        return _sx4((tpu.dram[base + (i >> 1)] >> (4 * (i & 1))) & 0xF)
 
-    bad = [(a, tpu.dram[a], v) for a, v in sorted(want.items()) if tpu.dram[a] != v]
+    def check_i4(base, rows, cols, want, tag, bad):
+        row_bytes = cols // 2
+        for i in range(rows):
+            for j in range(cols):
+                got = nib(base + i * row_bytes, j)
+                if got != want[i][j]:
+                    bad.append(f"{tag}[{i}][{j}] = {got}, expected {want[i][j]}")
+
+    bad: list = []
+    n = 0
+
+    c1 = _ref_matmul(a_val, w_val, TL_M1, TL_K1, TL_N1, *TL_RQ1)
+    check_i4(TL_C1, TL_M1, TL_N1, c1, "C1", bad)
+    n += TL_M1 * TL_N1
+
+    c2 = [[_narrow(max(v, 0), TL_RQ2) for v in row] for row in c1]
+    check_i4(TL_C2, TL_M1, TL_N1, c2, "C2", bad)
+    n += TL_M1 * TL_N1
+
+    c3 = [[_narrow(_tl_v1(i) + _tl_v2(i), TL_RQ3) for i in range(TL_VEC)]]
+    check_i4(TL_C3, 1, TL_VEC, c3, "C3", bad)
+    n += TL_VEC
+
+    # The transposed matmul: B is [cols][depth], so its index function is
+    # swapped rather than its storage.
+    c4 = _ref_matmul(_tl_a4, lambda t, j: _tl_b4(j, t),
+                     TL_M4, TL_K4, TL_N4, *TL_RQ4)
+    check_i4(TL_C4, TL_M4, TL_N4, c4, "C4", bad)
+    n += TL_M4 * TL_N4
+
     if bad:
-        for a, got, exp in bad[:8]:
-            print(f"  REF FAIL dram[0x{a:05x}] = 0x{got:02x}, expected 0x{exp:02x}",
-                  file=sys.stderr)
-        raise SystemExit(f"tiled: {len(bad)} of {len(want)} result bytes disagree "
+        for b in bad[:8]:
+            print(f"  REF FAIL {b}", file=sys.stderr)
+        raise SystemExit(f"tiled: {len(bad)} of {n} result elements disagree "
                          f"with the independent reference — the kernel's tiling "
                          f"is wrong, not just the hardware's copy of it")
-    print(f"reference: {len(want)} result bytes match an independent matmul")
+    print(f"reference: {n} result elements match an independent matmul")
 
 
 def _rq(acc, mn, lo=-8, hi=7):
@@ -546,6 +522,9 @@ def reference_infer(tpu: TPU) -> None:
     tiling, and no requant table but `IN_RQ` above. If the device's cache is
     right, a cached step and a full recompute are the same arithmetic — that is
     the claim the kernel is making, and this is the check of it.
+
+    The logits are int4: the MXU requantizes on store, so `IN_RQ["LOGIT"]` is
+    what decides whether an argmax over them can separate anything at all.
     """
     try:
         import numpy as np
@@ -602,7 +581,7 @@ def reference_infer(tpu: TPU) -> None:
             F = _rq(HR @ w["w2"], IN_RQ["F"])
             X = _rq(X1 + F, IN_RQ["X2"], lo=-7)                     # dyt
 
-        logits = X[pos] @ wfc                                       # int32, raw
+        logits = _rq(X[pos] @ wfc, IN_RQ["LOGIT"])                  # int4
         want_log[pos] = logits
         nxt = int(np.argmax(logits[:IN_VOCAB]))                     # ties -> lowest
         want_tok[pos + 1] = nxt
@@ -613,6 +592,10 @@ def reference_infer(tpu: TPU) -> None:
         v = sum(tpu.dram[addr + b] << (8 * b) for b in range(4))
         return v - (1 << 32) if v >= (1 << 31) else v
 
+    def dram_i4(base, i):
+        code = (tpu.dram[base + (i >> 1)] >> (4 * (i & 1))) & 0xF
+        return code - 16 if code >= 8 else code
+
     bad = []
     for pos, want in sorted(want_tok.items()):
         got = dram_i32(IN_TOK + pos * 4)
@@ -621,7 +604,7 @@ def reference_infer(tpu: TPU) -> None:
     n_log = 0
     for pos, want in sorted(want_log.items()):
         for j in range(IN_VPAD):
-            got = dram_i32(IN_LOG + (pos * IN_VPAD + j) * 4)
+            got = dram_i4(IN_LOG + pos * _i4(IN_VPAD), j)
             n_log += 1
             if got != int(want[j]):
                 bad.append(f"logit[{pos}][{j}] = {got}, expected {int(want[j])}")

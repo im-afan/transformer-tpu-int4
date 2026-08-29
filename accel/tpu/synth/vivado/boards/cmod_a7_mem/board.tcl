@@ -63,7 +63,6 @@ set SRAM_CPA   0
 set ROWS      0
 set COLS      0
 set ADDR_W    0
-set VPU_BYTES 0
 
 # ---- Generics passed to the top level ----------------------------------------
 # Only what cmod_a7_mem_top actually declares. build.tcl's generic_args would

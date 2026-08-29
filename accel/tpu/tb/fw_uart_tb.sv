@@ -88,7 +88,6 @@ module fw_uart_tb;
     // ---- geometry (must match the DUT the firmware was built for) ----------
     localparam int ROWS       = 8;
     localparam int COLS       = 8;
-    localparam int VPU_BYTES  = 32;
     localparam int ADDR_W     = 16;
     localparam int XLEN       = 32;
     localparam int M0_W       = 12;
@@ -149,7 +148,7 @@ module fw_uart_tb;
     // FW_INIT is deliberately empty: the image has to arrive over the wire, so a
     // stale ../fw/*.hex left behind by another target cannot be what runs.
     tpu_top #(
-        .ROWS(ROWS), .COLS(COLS), .VPU_BYTES(VPU_BYTES), .ADDR_W(ADDR_W),
+        .ROWS(ROWS), .COLS(COLS), .ADDR_W(ADDR_W),
         .XLEN(XLEN), .M0_W(M0_W), .N_W(N_W), .IMEM_AW(IMEM_AW), .CFG_AW(CFG_AW),
         .FW_AW(FW_AW), .FW_INIT(""),
         .MEM_STYLE("BRAM"), .MEM_ADDR_W(MEM_ADDR_W), .MEM_DATA_W(MEM_DATA_W),
@@ -541,15 +540,16 @@ module fw_uart_tb;
         end
         // A matmul must load weights first, so mload is nonzero — and strictly
         // less than mxu — exactly when the array ran.
-        if (expect_mxu) begin
-            checks++;
-            if (ctr_w(ctr, P_MLOAD) == 0 ||
-                ctr_w(ctr, P_MLOAD) >= ctr_w(ctr, P_MXU)) begin
-                errors++;
-                $display("  FAIL mload=%0d is not a strict subset of mxu=%0d",
-                         ctr_w(ctr, P_MLOAD), ctr_w(ctr, P_MXU));
-            end
-        end
+        // retired, mload is no longer a thing
+        // if (expect_mxu) begin
+        //     checks++;
+        //     if (ctr_w(ctr, P_MLOAD) == 0 ||
+        //         ctr_w(ctr, P_MLOAD) >= ctr_w(ctr, P_MXU)) begin
+        //         errors++;
+        //         $display("  FAIL mload=%0d is not a strict subset of mxu=%0d",
+        //                  ctr_w(ctr, P_MLOAD), ctr_w(ctr, P_MXU));
+        //     end
+        // end
     endtask
 
     // `done` is level-held after a run, so a second 'G' would fall straight

@@ -9,7 +9,10 @@
 #   RTL_SRCS   ordered list of synthesizable SystemVerilog sources
 #
 # Order does not matter to Vivado (it elaborates from -top), but is kept
-# matching tb/Makefile's UART_RTL list so the two stay visibly in sync.
+# matching tb/Makefile's UART_RTL list so the two stay visibly in sync. sram.sv
+# is the one exception: the DMA drives the chip pins itself now, so it is no
+# longer in tpu_top's hierarchy and is carried here only for the bring-up boards
+# below.
 # -----------------------------------------------------------------------------
 
 set RTL_DIR [file normalize [file join [file dirname [info script]] .. .. rtl]]

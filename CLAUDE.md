@@ -7,7 +7,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - Respond to me concisely, and don't tell me things I didn't ask for. After making edits, create a summary of every change you made, but keep it short: concise bullet points for everything, not full paragraphs.
 - Don't use unneccessary jargon that just creates further confusion. For example, you once told me that a test has "teeth" when referring to a modified testbench... what does that even mean? Just keep the responses straightforward and simple.
 - Keep code self-documenting. Instead of writing long comments explaining everything, make variable names clear. Feel free to make names as long as needed!
-- Chill out with the comments. You don't need a 2:1 comment:code ratio, nor do you need to narrate every single line of code with a 4-line paragraph. The comments only confuse me more. Don't justify design choices in code, either. Just describe what it does (if it's confusing) and move on; leave the justification to the docs.
+-  Keep comments to a minimum. You do not need to narrate every single line of code with a 4-line paragraph. The comments only confuse me more. Don't justify design choices in code, either. Just describe what it does (if it's confusing) and move on; leave the justification to the docs. Don't make a huge line of text at the beginning of a file, either. Leave all that to docs.
+  - make a doc file for code changes instead of making huge comments
 - Double-check before claiming something as fact. Don't state things confidently without a source - if you can't verify it, say so or go verify it first. Trust verified evidence over a single conflicting source.
 
 ## What this is

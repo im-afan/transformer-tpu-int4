@@ -1,20 +1,6 @@
-/* memops.c — the two functions a freestanding gcc may call without being asked.
- *
- * `-ffreestanding -fno-builtin` stops gcc from recognising memcpy/memset in
- * source, but not from emitting calls to them: the ABI lowers a struct
- * assignment or a large aggregate initializer to `memcpy` whatever the flags
- * say. Nothing here links libc or libgcc, so without this file a kernel that
- * uses a struct fails at link with "undefined reference to memcpy".
- *
- * Both are word-wise where the pointers and length allow, because these sit on
- * the CPU's issue path where every clock is exposed.
- *
- * NO SHIPPED KERNEL LINKS THIS TODAY. tpulib.h's `always_inline` entry points
- * fold every descriptor into constants, so none is ever materialized or copied,
- * and --gc-sections drops this file. It stays because that is a property of
- * these kernels, not of the library: a kernel with genuinely runtime shapes
- * gets the general path, gets a descriptor in memory, and needs this.
- */
+/* memops.c — the two functions a freestanding gcc may call without being
+ * asked (memcpy/memset, lowered to implicitly by the ABI). See docs/fw.md for
+ * why no shipped kernel currently links this. */
 #include <stddef.h>
 #include <stdint.h>
 

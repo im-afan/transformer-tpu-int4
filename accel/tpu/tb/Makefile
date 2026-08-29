@@ -52,8 +52,8 @@ RTL_uart_memory := ../rtl/uart_memory.sv ../rtl/uart_interface.sv \
 RTL_uart_bram := ../rtl/uart_bram.sv ../rtl/uart_interface.sv \
                  ../rtl/uart_receiver.sv ../rtl/uart_transmitter.sv ../rtl/bram.sv
 # dma_tb instantiates the DUT against the real scratchpad and a behavioral SRAM
-# chip, so it needs all three (without this `make all` cannot elaborate it).
-RTL_dma := ../rtl/dma.sv ../rtl/scratchpad.sv ../rtl/sram.sv
+# chip. The DMA drives the chip pins itself, so sram.sv is not in the list.
+RTL_dma := ../rtl/dma.sv ../rtl/scratchpad.sv
 # The command front ends share one FIFO module.
 RTL_cmd_queue := ../rtl/cmd_queue.sv
 RTL_cmd_plane := ../rtl/cmd_queue.sv ../rtl/cmd_mxu.sv ../rtl/cmd_vpu.sv ../rtl/cmd_dma.sv
@@ -71,7 +71,7 @@ VVP      := vvp
 TPULANG  := ../../tpulang
 UART_TOP := tpu_top_uart_tb
 UART_RTL := ../rtl/tpu_top.sv ../rtl/mxu.sv ../rtl/vpu.sv \
-            ../rtl/scratchpad.sv ../rtl/dma.sv ../rtl/sram.sv \
+            ../rtl/scratchpad.sv ../rtl/dma.sv \
             ../rtl/uart_interface.sv ../rtl/uart_receiver.sv ../rtl/uart_transmitter.sv \
             ../rtl/perf_counters.sv \
             ../rtl/cmd_queue.sv ../rtl/cmd_mxu.sv ../rtl/cmd_vpu.sv ../rtl/cmd_dma.sv \

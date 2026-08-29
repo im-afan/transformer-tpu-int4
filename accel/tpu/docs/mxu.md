@@ -1,129 +1,119 @@
 # MXU — Matrix Unit
 
-Weight-stationary systolic array. It computes **every matmul in the model**.
+## Overview
+- `N x N` output-stationary systolic array, int4 in and int4 out. One accumulator per PE.
+- One dispatch computes `C[N][N] = A[N][len] @ B`, or `@ B'` when `transpose`.
+- `len` is the contraction length in int4 elements, and also the number of streaming
+  clocks. It is 16 bits, so a contraction never has to be split.
+- Every operand word is `N*4` bits — one scratchpad bank word. A, B and C all use it.
+- Requant to int4 is unconditional; there is no int32 store path and no hardware tiling.
 
-Dispatch arrives from `cmd_mxu.sv`'s 128-bit command queue, which carries the operands and
-geometry — nothing is read out of a global config register at `start`.
+## Ports
+- Basic: `clk`, `rst_n`
+- Dispatch (in): `start`, `transpose`, `accumulate`, `len`,
+  `a_base`/`a_stride`, `b_base`/`b_stride`, `c_base`/`c_stride`, `rq_word`
+- Dispatch (out): `busy`, `done`
+- Scratchpad: `A_re`/`A_addr`/`A_rdata`/`A_gnt`, `B_re`/`B_addr`/`B_rdata`/`B_gnt`,
+  `C_en`/`C_we`/`C_addr`/`C_wdata`/`C_rdata`/`C_gnt`
 
-## 1. What runs on it
+`start` is a one-clock pulse; the producer holds the operands until `done`.
 
-At `d=128`, `f=512`, `head_dim=32`:
+## Operand layouts
 
-| Op | Shape per token tile | Notes |
-| --- | --- | --- |
-| Wq, Wk, Wv, Wo | `T x 128 @ 128 x 128` | attention projections |
-| `Q @ K^T` | `T x 32 @ 32 x T` | per head; K is an int4 *activation* |
-| `P @ V` | `T x T @ T x 32` | per head; V likewise |
-| FFN `W1` | `T x 128 @ 128 x 512` | tiled over output columns |
-| FFN `W2` | `T x 512 @ 512 x 128` | tiled over the contraction |
-| output head | `T x 128 @ 128 x 16` | 13 logits padded to a whole tile |
+All three are row-major, 4-bit packed, two elements per byte, low nibble first.
 
-- The head is padded because the array stores a whole `COLS`-wide output tile — a
-  13-column result would have its second tile overrun into the next token's row.
-- **Both attention matmuls are here now.** They are activation x activation, which this
-  array cannot do, so they used to run on the VPU as `vecmatmul` — one serial dot product
-  per output element, and 36.4% of the whole run. The fix was `quant4`: pack whichever
-  operand lands on the *weight* side (K in `Q@K^T`, V in `P@V`) into the array's 4-bit
-  layout. `vecmatmul` has since been removed.
-- There is no softmax anywhere. Attention is ReLU, so the only thing between the two
-  matmuls is a `vecadd` against an int8 mask and a `relu`, both on the VPU.
+| Operand | Shape | Row stride | Read as |
+| --- | --- | --- | --- |
+| A | `[N][len]` | `a_stride` (default `len/2`) | one contiguous chunk of N elements per array row |
+| B, `transpose=0` | `[len][N]` | `b_stride` (default `N/2`) | one whole B row per contraction step |
+| B, `transpose=1` | `[N][len]` | `b_stride` (default `len/2`) | one contiguous chunk of N elements per array column |
+| C | `[N][N]` | `c_stride` (default `N/2`) | one row per store |
 
-## 2. The PE is a real multiplier
+- A zero stride means the densely packed default. There is no `tiled` flag: a stride is
+  either given or defaulted, and nothing survives between dispatches.
+- `transpose=0` is what the projections want (weights stored `[K][N]`).
+  `transpose=1` is what `Q@K'` and `P@V` want (the KV cache stored `[T][head_dim]`),
+  which is why the DMA no longer needs a transposing mode.
 
-This used to say the opposite, and the change is the main cost of int4.
+## Input constraints
+- A, B and C must not share a scratchpad bank. A and B are read on the same clock and
+  a bank serves one read per clock, so an overlap loses B's word silently. `scratchpad.sv`
+  prints a simulation warning the first time it sees it.
+- All three bases and strides must be multiples of `N/2` bytes — the banked scratchpad
+  addresses whole words, with no unaligned window.
+- `N` must be a power of two, at least 2.
 
-- With **ternary** weights the multiply degenerated into a select + conditional negate, so
-  a PE was an add/sub plus a 2-bit register — no DSP, no multiplier. That was the whole
-  reason for ternary.
-- With **int4** weights there are 16 levels, so `weight_product` is a signed multiply:
-  `acc = psum_in + a * w`, `a` an int4 value in an int8 container.
+## Output constraints
+- Always writes `N` rows of `N` int4 to `c_base`, row by row. There is no row count in the
+  dispatch, so a matmul with fewer than `N` live rows still reads `N` rows of A and writes
+  `N` rows of C — the caller allocates the whole block.
+- `C = requant(A @ B)`, and with `accumulate`, `C = clip4(requant(A @ B) + C_old)`.
+  Because the store is int4, `accumulate` is a fused int4 add, not an int32 partial sum.
 
-What softens it: the activation narrowed at the same time. The product bound went from
-`127 x 1` to `8 x 8`, so the **accumulator got cheaper**, not dearer — `PSUM_W = 16`
-carries `ROWS*64` where the ternary array needed `ROWS*127`. The cost is confined to the
-multiplier array.
+## Datapath
+- A enters the column-0 edge and flows toward column `N-1`; B enters the row-0 edge and
+  flows down. PE(i,j) accumulates `a_in * b_in` when the valid riding with A is set.
+- **A is never read column-by-column.** A column of A is a strided gather out of a
+  row-major matrix. Instead one `N*4`-bit chunk — N contraction elements of one array
+  row — is loaded into that row's edge register, round-robin: row 0 at clock 0, row 1 at
+  clock 1, and back to row 0 at clock N.
+- **The round-robin is the skew.** Row *i* must start injecting at clock *i*, which is
+  exactly when its chunk lands, and it holds N elements, which is exactly how long until
+  its next chunk. No input skew registers on the A side at all.
+- `transpose=1` feeds B the same way, one chunk per array column.
+- `transpose=0` reads one whole B row per clock instead, so the top edge needs a
+  triangular skew chain: column *j* taps stage *j*.
+- Element *k* of row *i* is injected at step `i + k + 1`; element *k* of column *j* at
+  step `j + k + 1`. Both reach PE(i,j) at step `i + j + k + 1`.
+- Streaming ends at step `len + 2N - 2`, the last accumulation at PE(N-1,N-1).
 
-The int4 range is **enforced, not assumed**: every `requant` / `dyt` / `quant4` clips to
-`[-8, 7]` (or `[-7, 7]`), so no chain of matmuls can present an operand that overflows.
-Genuine int8 activations would need `ROWS <= 32`.
+## Stalls
+- The operand fetch runs one step ahead of the array. A denied `A_gnt`/`B_gnt` re-presents
+  the same address and the whole array freezes for that clock — the pipeline holds, no word
+  is lost or repeated.
+- The C port is top of the scratchpad's write chain and is only used while A and B are
+  idle, so a store is never denied.
 
-## 3. Geometry
+## Writeback
+- `N` clocks without `accumulate`; the requant is `clip((acc*m0 + round) >> n)` to
+  `[-8, 7]`, one nibble per column, packed into one word per row.
+- With `accumulate`, each row costs a read then a write.
+- `{m0, n}` is the `rq_word` literal in the command, not a scratchpad address.
 
-Parameterized `ROWS x COLS`. The `tpu_top.sv` default is 128x128; **the Cmod A7 board
-builds 8x8** (`boards/cmod_a7/board.tcl`), which is what every kernel and golden vector is
-written against.
+## Command encoding
 
-- **Rows** = contraction dimension. Each row streams one activation element per clock.
-- **Cols** = output features. Each column holds one stationary weight column.
-- Dataflow: activations left→right, partial sums top→bottom.
+Two 128-bit commands. A self-contained matmul would need three addresses, three strides,
+`len` and the requant word, which does not fit, so the geometry rides its own command and
+is sticky inside this unit's queue. The producer can skip a `GEOM` whose values have not
+changed; nothing outside the queue can write it.
 
-```
-          a_in (int8) --------------+
-                                    v
-weight reg (int4) --> [  x  ] -->( + )--> acc --> psum_out (down)
-                                    ^
-          psum_in (from PE above)
-                        a_out --> next PE (right)
-```
+`MXU_GEOM` (`0x01`) — latched, retires in one clock, starts nothing:
 
-Each PE registers `a_in` for one cycle before passing it right, creating the systolic skew.
-
-## 4. Phases
-
-1. **Weight load.** Stream the `ROWS x COLS` int4 tile from the scratchpad into the PE
-   registers. Weights are **row-major**, so one `W_rd` is one array *row* (`COLS` nibbles)
-   and the loop runs `ROWS` times. Overlaps the previous tile's drain.
-2. **Feed.** Read one activation column per clock and inject it **staggered** — row *i*
-   delayed *i* cycles, so all contributions to an output element line up. This is why the
-   scratchpad must deliver a full column per clock.
-3. **Drain.** Column sums fall out after `ROWS + COLS + T` cycles into `result_buf`, which
-   absorbs the output skew (each column result is placed by its propagated token id, so
-   there is no separate de-skew network).
-
-Latency for one tile is about `ROWS + COLS + T` cycles; throughput is one output column
-per clock once full.
-
-## 5. Numerics
-
-- Accumulate in int32 (`PSUM_W` internally, widened on store).
-- **Requantize on store**, gated by the `requant` input: assert it to narrow to int8, leave
-  it clear to write int32 — the mode intermediate contraction tiles use so `accumulate` can
-  keep running int32 partials in the result bank.
-- The rescale is fixed-point `clip((acc*m0 + 2**(n-1)) >> n)`, applied by the store-path
-  requantizer, not inside the PEs.
-- **`{m0,n}` is a literal in the command** (`rq_word`), not a scratchpad address. Same 16
-  bits either way, and it deleted a two-state fetch here and in `vpu.sv`.
-- The store uses a per-byte `C_wstrb`, so an int8 requant row writes only its lanes and
-  does not clobber neighbouring int32 result bytes.
-- No bias add: the model is `use_bias=False`.
-
-## 6. Tiling
-
-- `COLS_array < N_out`: iterate output tiles, reloading weights each tile.
-- `ROWS_array < K`: split the contraction, keep a running **int32 partial** in the result
-  bank via `accumulate`, and requantize only on the last tile.
-- `matmul_t` walks that grid **in hardware** — `k_tiles` and `n_tiles` are 8-bit fields in
-  the command, and the whole walk costs the CPU ~380 clocks at any shape. Firmware can also
-  walk it itself (`matmul_loop.c`), which costs ~85 clocks per dispatch.
-
-## 7. Command fields
-
-| Field | Meaning |
+| bits | field |
 | --- | --- |
-| `act_addr`, `weight_addr`, `out_addr` | scratchpad bases |
-| `rq_word` | `{n, m0}` literal, used when `requant` |
-| `t_len` | token rows, `<= 32` (`MAX_TOKENS`, the result buffer's depth) |
-| `accumulate` | add into the existing int32 result |
-| `requant` | narrow the store int32 -> int8 |
-| `tiled` | use the strides below and the tile counts |
-| `a_row`, `c_row`, `w_row` | row strides in bytes: `K`, `N*4`, `N*4/8`. `w_row` is the **output** width now, where under column-major weights it was the column stride |
-| `k_tiles`, `n_tiles` | `K / ROWS`, `N / COLS`, 8 bits each |
+| `w0[7:0]` | op |
+| `w0[31:16]` | `a_stride` |
+| `w1[15:0]` | `b_stride` |
+| `w1[31:16]` | `c_stride` |
+| `w2[15:0]` | `len` |
 
-Scratchpad ports: `A_rd` (ROWS int8), `W_rd` (COLS int4), `C_rw` (COLS int32, with
-per-byte strobes). `load_active` drives the `mload` perf counter.
+`MXU_MM` (`0x02`) — one matmul:
 
-## 8. Sizing
+| bits | field |
+| --- | --- |
+| `w0[7:0]` | op |
+| `w0[8]` | `accumulate` |
+| `w0[9]` | `transpose` |
+| `w0[31:16]` | `c_base` |
+| `w1[15:0]` | `a_base` |
+| `w1[31:16]` | `b_base` |
+| `w2[15:0]` | `rq_word` = `{n, m0}` |
 
-Post-route on the Cmod A7 at 8x8: **7588 LUTs**, 5842 FFs, 18 DSPs — the largest block in
-the design (43% of its LUTs). `TOK_W` (the result buffer depth) is the knob if area gets
-tight.
+## Notable changes
+- Weight-stationary became output-stationary, so there is no weight-load phase. The
+  `mload` perf counter (index 2) is tied low rather than renumbered.
+- Hardware tiling is gone — `tiled`, `k_tiles`, `n_tiles` and the tile-walk loop with it.
+  Output-stationary already tiles the contraction, and the CPU walks the other two axes.
+- `t_len` and the `MAX_TOKENS` result buffer are gone. The output block is always `N x N`.
+- The int32 store path and its `requant` flag are gone. int4 is forced, so an MXU result
+  is directly usable as the A or B operand of the next matmul, with no `quant4` pass.

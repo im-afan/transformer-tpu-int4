@@ -42,7 +42,6 @@ module cmod_a7_top #(
     // Geometry — overridden from synth/vivado/boards/cmod_a7/board.tcl.
     parameter int ROWS       = 8,
     parameter int COLS       = 8,
-    parameter int VPU_BYTES  = 64,
     parameter int ADDR_W     = 16,
     parameter int XLEN       = 32,
     parameter int IMEM_AW    = 10,
@@ -53,7 +52,6 @@ module cmod_a7_top #(
     // External SRAM (the "DRAM" behind the DMA engine): 512K x 8.
     parameter int MEM_ADDR_W = 19,
     parameter int MEM_DATA_W = 8,
-    parameter int SRAM_CPA   = 0,
 
     // UART: 115200 8N1 off a 12 MHz core clock. 12e6/115200 = 104.17 -> 104,
     // a 0.16% bit-period error, well inside 8N1's ~5% tolerance.
@@ -140,7 +138,6 @@ module cmod_a7_top #(
     tpu_top #(
         .ROWS            (ROWS),
         .COLS            (COLS),
-        .VPU_BYTES       (VPU_BYTES),
         .ADDR_W          (ADDR_W),
         .XLEN            (XLEN),
         .M0_W            (M0_W),
@@ -149,7 +146,6 @@ module cmod_a7_top #(
         .CFG_AW          (CFG_AW),
         .MEM_ADDR_W      (MEM_ADDR_W),
         .MEM_DATA_W      (MEM_DATA_W),
-        .SRAM_CPA        (SRAM_CPA),
         .UART_CPB        (UART_CPB),
         .UART_RX_TIMEOUT (UART_RX_TIMEOUT),
         .MEM_STYLE       ("BRAM"),

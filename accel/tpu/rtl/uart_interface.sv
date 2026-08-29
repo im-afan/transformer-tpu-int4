@@ -87,7 +87,8 @@ module uart_interface #(
     output logic [7:0] data_out,
     input  logic       transmitter_busy,
 
-    // sram_controller user-side interface (muxed with the DMA engine in tpu_top)
+    // Single-byte DRAM access. Served by the DMA engine's host port while the
+    // core is idle (tpu_top); by sram_controller in the bring-up board images.
     output logic              sram_start,
     output logic              sram_we,
     output logic [ADDR_W-1:0] sram_addr,

@@ -1,675 +1,306 @@
 `timescale 1ns/1ps
-// -----------------------------------------------------------------------------
-// mxu.sv — TPU weight-stationary int4 systolic matrix unit
-//
-// Implements the block described in accel/tpu/docs/mxu.md: a ROWS x COLS
-// systolic array that computes the transformer's int4-weight x int4-activation
-// projection GEMMs (Wq/Wk/Wv/Wo, FF fc1/fc2). Weights are stationary in the PEs;
-// activations stream left->right; partial sums flow top->bottom.
-//
-// **Weights are int4, not ternary.** Each element is a 4-bit two's-complement
-// value in [-8, 7], two per byte — so a PE is a real signed multiply, not the
-// select+conditional-negate the ternary encoding allowed (mxu.md §2). See
-// `weight_product` below.
-//
-// Activations keep their **int8 container** even though the model's values are
-// int4: the A port, the DMA and every scratchpad activation buffer stay
-// byte-per-element, and only the *range* narrows. `requant8` below is what
-// enforces that range on store.
-//
-// Dispatched by the scalar unit (scalar_unit.sv OP_MATMUL) with the issue-and-wait
-// handshake: pulse `start` with {act_addr, weight_addr, out_addr, t_len,
-// accumulate}, then block on `done` (mxu.md §7).
-//
-//   Matmul:  C[T x COLS] = A[T x d] @ W[d x COLS],   d = ROWS
-//
-// Phases (mxu.md §4), sequenced by the FSM:
-//   LOAD  stream the ROWS x COLS int4 tile into the PE weight registers, one
-//         array-**row** (COLS nibbles, 4-bit packed = W_rd width) per clock.
-//         Weights are stored **row-major** (see the layout note below); for a
-//         square array this is the same port width and the same ROWS clocks the
-//         old column-major load took, only the fill order transposes.
-//   RUN   feed one activation token vector (d int8 = A_rd width) per clock into
-//         the array, injected staggered across rows by the input-skew buffer
-//         (row i delayed i cycles) so every contribution to an output element
-//         lines up on the descending partial sum. Column sums fall out the bottom
-//         after ROWS(+skew) cycles; each is scattered into
-//         `result_buf[token][col]` (the result buffer absorbs the output skew, so
-//         no de-skew shift regs).
-//   WB    write the T result rows to out_addr as int32. With `accumulate` the
-//         existing int32 partials are read back and summed first (contraction
-//         tiling, mxu.md §6).
-//
-// Numerics (mxu.md §5). PSUM_W = 16 and the bound is `ROWS * |a|max * |w|max`.
-// With int4 on both sides that is ROWS*8*8 = 8192 at ROWS=128, comfortably
-// inside int16 — and *smaller* than the ternary array's ROWS*127*1 = 16256,
-// because narrowing the activation buys more than widening the weight costs.
-// The precondition is that activations really are int4: full int8 activations
-// against int4 weights would need ROWS <= 32, and every requant below clips to
-// [-8, 7] precisely so nothing in a chain of matmuls can violate it.
-//
-// The store path optionally **requantizes on store** (int32 -> int4 in an int8
-// container): when `requant` is asserted the final element is rescaled by the
-// fixed-point pair {M0, N} as `clip((acc*M0 + round) >> N)` (the same math as
-// vpu.sv VOP_REQUANT) and written as one byte; the {M0, N} word arrives in
-// the dispatch's own `rq_word` field. When `requant` is clear the MXU writes int32 as
-// before — this is the mode intermediate contraction tiles use so `accumulate`
-// can keep running int32 partials in the result bank (mxu.md §6); the final tile
-// asserts `requant` to narrow. The int8 output row is COLS bytes (C_wstrb masks
-// the upper lanes), consistent with "the scratchpad stores whatever width the
-// writer produces" (scratchpad.md §2).
-//
-// Memory / scratchpad ports (scratchpad.md §4). Synchronous reads: address/enable
-// presented one cycle, data valid the next (same contract as vpu.sv / scalar_unit).
-//   A_rd : one activation token vector per clock  (ROWS x int8  = ROWS*8 bits)
-//   W_rd : one weight array-row per clock          (COLS int4   = COLS*4 bits)
-//   C_rw : one int32 result row per clock          (COLS x int32 = COLS*32 bits)
-//          The doc lists C as a write port (C_wr); the accumulate/tiling path
-//          reads back the running partial, so it is exposed here as a read/write
-//          C_rw pair. Non-accumulate matmuls never assert C_re.
-//
-// Scratchpad tile layouts assumed by the address arithmetic below:
-//   Activations  row-major  A[t][i] at act_addr    + t*ROWS + i           (int8)
-//   Weights      ROW-major  W[i][j] at weight_addr + i*(COLS*4/8), 4-bit
-//                packed within the row: col j in bits [j*4 +: 4], plain two's
-//                complement. A whole array-**row** loads in one W_rd.
-//   Results      row-major  C[t][j] at out_addr     + t*(COLS*4) + j*4     (int32)
-//
-// **Weights were column-major and are now row-major.** For a square array the two
-// are interchangeable — same W_rd width, same ROWS==COLS clocks, the load loop
-// just fills the PE grid by row instead of by column — and row-major is the
-// layout the tooling naturally produces, so it removes a transpose rather than
-// adding one. The k/n tile steps swap roles accordingly (see wgt_ktile_step /
-// wgt_ntile_step). Nothing here assumes ROWS==COLS *except* that the W port is
-// sized off COLS while the load runs for ROWS clocks, which is the correct
-// generalization: a non-square array simply reads a COLS-wide row ROWS times.
-//
-// Validate bit-exactly against Int4Linear in model/transformer.py: the array
-// computes the integer product A_int @ W_int4 (mxu.md §5); the model's absmax/7
-// scale is folded in by the separate requant step.
-//
-// Skew note (mxu.md §8 open question): the input stagger uses dedicated triangular
-// shift registers (skew_*). Output skew is absorbed by scattering each drained
-// column result into result_buf by its propagated token id, so no output de-skew
-// registers are needed.
-// -----------------------------------------------------------------------------
+// N x N output-stationary int4 systolic array. One dispatch computes
+// C[N][N] = A[N][len] @ B (or @ B' when `transpose`), requantized to int4.
+// See docs/mxu.md.
 
 module mxu #(
-    parameter int ROWS   = 128,  // contraction dim d (rows = one activation elem each)
-    parameter int COLS   = 128,  // output features (cols = one stationary weight col)
-    parameter int ADDR_W = 16,   // scratchpad byte-address width
-    parameter int M0_W   = 12,   // requant fixed-point multiplier width (requant.sv)
-    parameter int N_W    = 4     // requant shift width
+    parameter int N      = 8,    // array size; every operand word is N*4 bits
+    parameter int ADDR_W = 16,   // scratchpad byte address
+    parameter int M0_W   = 12,   // requant multiplier width
+    parameter int N_W    = 4,    // requant shift width
+    parameter int ACC_W  = 32    // per-PE accumulator
 ) (
     input  logic clk,
     input  logic rst_n,
 
-    // ---- Dispatch from the scalar unit (mxu.md §7) --------------------------
-    input  logic              start,
-    input  logic [ADDR_W-1:0] act_addr,     // activation tile base
-    input  logic [ADDR_W-1:0] weight_addr,  // int4 weight tile base
-    input  logic [ADDR_W-1:0] out_addr,     // result base (int32, or int8 if requant)
-    // Requant {M0, N} as a LITERAL, not a scratchpad address. It is M0_W + N_W
-    // = 16 bits, exactly the width of the address that used to point at it, so
-    // the 128-bit command it now rides in is no tighter for it
-    // (docs/picorv32_migration.md §3). What goes away is the one-shot C-port
-    // fetch this unit used to run before every requantized store: two states,
-    // two scratchpad reads, and one more contender on the arbitrated read port
-    // per matmul.
-    input  logic [M0_W+N_W-1:0] rq_word,    // {n, m0} (used when requant)
-    input  logic [5:0]        t_len,        // number of token columns T
-    input  logic              accumulate,   // add into existing int32 result (tiling)
-    input  logic              requant,      // narrow store int32 -> int8 via {M0, N}
+    // ---- dispatch -----------------------------------------------------------
+    input  logic                start,
+    input  logic                transpose,    // B is transposed in the matmul
+    input  logic                accumulate,   // add the existing C
+    input  logic [15:0]         len,          // contraction length, int4 elements
+    input  logic [ADDR_W-1:0]   a_base,
+    input  logic [ADDR_W-1:0]   a_stride,     // bytes between A rows
+    input  logic [ADDR_W-1:0]   b_base,
+    input  logic [ADDR_W-1:0]   b_stride,     // bytes between B rows
+    input  logic [ADDR_W-1:0]   c_base,
+    input  logic [ADDR_W-1:0]   c_stride,     // bytes between C rows
+    input  logic [M0_W+N_W-1:0] rq_word,      // {n, m0}
+    output logic                busy,
+    output logic                done,
 
-    // ---- Operand strides (config registers; docs/macro_ops.md §4.1) ---------
-    // The three strides that used to be compile-time constants, because each one
-    // assumed the operand *was* one tile. A tile of a larger matrix has the
-    // larger matrix's stride, so hardware tiling cannot work until these are
-    // parameters.
-    //
-    // `tiled` SELECTS THEM. With `tiled` low the strides are ignored outright
-    // and the single-tile constants apply (a_row=ROWS, c_row=COLS*4,
-    // w_row=COLS*4/8), which is exactly the behaviour they replaced. That is not
-    // just for backward compatibility: config registers survive across runs (no
-    // reset between programs), so a plain matmul keyed off "the strides happen
-    // to be zero" would silently inherit whatever the *previous* program left in
-    // them. Making the instruction say which mode it is in removes the hazard
-    // rather than documenting it. Within tiled mode a zero stride still falls
-    // back to the single-tile value, purely so an unset register degrades to
-    // something sane instead of addressing everything at offset zero.
-    //
-    // `c_row` is the **int32** row stride. A requantized store writes int8 and
-    // therefore steps `c_row/4`, preserving the exact RQ_ROW_BYTES =
-    // RES_ROW_BYTES/4 relationship these were hardcoded to. One register, both
-    // strides — which matters because `.acc.rq` uses *both* in the same dispatch:
-    // it reads int32 partials back at the wide stride and stores int8 at the
-    // narrow one.
-    input  logic              tiled,        // use the config strides below
-    input  logic [ADDR_W-1:0] a_row,        // activation row stride, bytes (= K)
-    input  logic [ADDR_W-1:0] c_row,        // int32 result row stride, bytes (= N*4)
-    // Row-major weights, so this is the stride between weight *rows* — the full
-    // matrix's output width, N*4/8 — where it used to be the column stride K*2/8.
-    input  logic [ADDR_W-1:0] w_row,        // weight row stride, bytes (= N*4/8)
+    // ---- scratchpad ---------------------------------------------------------
+    output logic              A_re,
+    output logic [ADDR_W-1:0] A_addr,
+    input  logic [N*4-1:0]    A_rdata,
+    input  logic              A_gnt,
 
-    // ---- Tile counts (config; only with `tiled`) ----------------------------
-    // How many array-sized tiles the operands span. With both 1 (or 0, which is
-    // read as 1) this is a single-tile matmul and the loop below runs once.
-    //
-    // The loop order is **n outer, k inner**, which is what makes the
-    // contraction free: partial sums stay in `result_buf` across the whole k
-    // loop and only reach the scratchpad once, when the n-tile is finished.
-    // Nothing reads or writes the C port during the contraction, so `.acc`'s
-    // readback path is not on the critical path of a tiled matmul at all — it
-    // survives only for accumulating into a *pre-existing* C.
-    input  logic [7:0]        k_tiles,      // contraction tiles = K / ROWS
-    input  logic [7:0]        n_tiles,      // output tiles      = N / COLS
-    output logic              busy,
-    output logic              done,
-    // High during the weight-load phase (S_LOAD). Broken out so perf_counters.sv
-    // can separate weight-load time from streaming time over a run — the
-    // measurement that says whether double-buffering the PE weight registers
-    // (docs/macro_ops.md §4.5) would pay, and the one that shows why decode with
-    // t_len=1 is weight-load bound. Debug/telemetry only.
-    output logic              load_active,
+    output logic              B_re,
+    output logic [ADDR_W-1:0] B_addr,
+    input  logic [N*4-1:0]    B_rdata,
+    input  logic              B_gnt,
 
-    // ---- Scratchpad A_rd port (activation feed, ROWS x int8) ----------------
-    output logic                A_re,
-    output logic [ADDR_W-1:0]   A_raddr,
-    input  logic [ROWS*8-1:0]   A_rdata,     // valid the cycle after A_re
-
-    // ---- Scratchpad W_rd port (weight load, COLS x 4-bit) -------------------
-    output logic                W_re,
-    output logic [ADDR_W-1:0]   W_raddr,
-    input  logic [COLS*4-1:0]   W_rdata,     // valid the cycle after W_re
-
-    // ---- Scratchpad C_rw port (int32 result row, COLS x int32) --------------
-    // Also carries the accumulate readback and the one-shot requant {M0, N}
-    // fetch. Writes are per-byte masked by C_wstrb so an int8 requant row
-    // (COLS bytes) does not clobber the neighbouring int32-width lanes.
-    output logic                C_re,
-    output logic [ADDR_W-1:0]   C_raddr,
-    input  logic [COLS*32-1:0]  C_rdata,     // valid the cycle after C_re
-    output logic                C_we,
-    output logic [ADDR_W-1:0]   C_waddr,
-    output logic [COLS*32-1:0]  C_wdata,
-    output logic [COLS*4-1:0]   C_wstrb      // per-byte write enable
+    output logic              C_en,
+    output logic              C_we,
+    output logic [ADDR_W-1:0] C_addr,
+    output logic [N*4-1:0]    C_wdata,
+    input  logic [N*4-1:0]    C_rdata,
+    input  logic              C_gnt
 );
 
-    // -------------------------------------------------------------------------
-    // Local widths / derived constants.
-    // -------------------------------------------------------------------------
-    localparam int ACT_W         = 8;                 // activation element, int8 container
-    localparam int WT_W          = 4;                 // weight element, int4 two's complement
-    localparam int PSUM_W        = 16;                // partial-sum accumulator
-    localparam int TOK_W         = 5;                 // EXPERIMENT: 32 token slots
-    localparam int MAX_TOKENS    = (1 << TOK_W);      // result-buffer token depth
-    localparam int WGT_ROW_BYTES = (COLS * WT_W) / 8; // bytes per packed weight row
-    localparam int RES_ROW_BYTES = COLS * 4;          // bytes per int32 result row
-    localparam int RQ_ROW_BYTES  = COLS;              // bytes per int8 (requant) result row
-    localparam int REQUANT_W     = 48;                // requant intermediate width (headroom)
+    localparam int LOGN       = (N > 1) ? $clog2(N) : 1;
+    localparam int WORD_BYTES = N / 2;
+    localparam int CNT_W      = 20;
+    localparam int RQ_W       = ACC_W + M0_W + 4;
+    localparam int QMIN       = -8;
+    localparam int QMAX       =  7;
 
-    // The int4 activation range every requant lands in. Not the int8 container's
-    // range: an activation that left this unit at 100 would be a legal byte and
-    // an illegal operand, and the next matmul would overflow PSUM_W rather than
-    // saturate. Clipping here is what makes the accumulator bound above true by
-    // construction, and it is the same clip model/transformer.py's ActQuant
-    // applies (INT4_QMIN / INT4_QMAX).
-    localparam int ACT_QMIN      = -8;
-    localparam int ACT_QMAX      = 7;
+    initial if (N < 2 || (N & (N - 1)) != 0)
+        $fatal(1, "mxu: N (%0d) must be a power of two, at least 2", N);
 
-    // int32 -> int4 requantize: clip((acc*m0 + round) >> n), written into an int8
-    // container (sign-extended). Mirrors vpu.sv requant8. m0 is a positive scale.
-    function automatic logic [7:0] requant8(input logic signed [PSUM_W-1:0] acc_i32,
-                                            input logic [M0_W-1:0]          mult_m0,
-                                            input logic [N_W-1:0]           shift_n);
-        logic signed [REQUANT_W-1:0] product, round_bias, shifted;
-        product    = acc_i32 * $signed({1'b0, mult_m0});
-        round_bias = (shift_n == 0) ? '0 : (REQUANT_W'(1) <<< (shift_n - 1));
-        shifted    = (product + round_bias) >>> shift_n;  // arithmetic (signed) shift
-        if (shifted > ACT_QMAX)      requant8 = 8'(signed'(ACT_QMAX));
-        else if (shifted < ACT_QMIN) requant8 = 8'(signed'(ACT_QMIN));
-        else                         requant8 = shifted[7:0];
+    // int32 -> int4: clip((acc*m0 + round) >> n).
+    function automatic logic signed [3:0] requant4(input logic signed [ACC_W-1:0] acc_i,
+                                                   input logic [M0_W-1:0]         m0,
+                                                   input logic [N_W-1:0]          n);
+        logic signed [RQ_W-1:0] product, bias, shifted;
+        product = acc_i * $signed({1'b0, m0});
+        bias    = (n == 0) ? '0 : (RQ_W'(1) <<< (n - 1));
+        shifted = (product + bias) >>> n;
+        if      (shifted > QMAX) requant4 = 4'(signed'(QMAX));
+        else if (shifted < QMIN) requant4 = 4'(signed'(QMIN));
+        else                     requant4 = 4'(shifted);
     endfunction
 
-    // int4 weight x int8 activation. A real signed multiply — the ternary
-    // encoding's select+conditional-negate is gone with the encoding (mxu.md §2),
-    // and this is the one place the int4 migration costs area rather than saving
-    // it. Both operands are sign-extended to PSUM_W and the product is exact:
-    // |a|max * |w|max = 127*8 fits in 11 bits, so no intermediate width is lost.
-    function automatic logic signed [PSUM_W-1:0] weight_product(
-            input logic signed [ACT_W-1:0] act,
-            input logic signed [WT_W-1:0]  wt);
-        weight_product = PSUM_W'(act) * PSUM_W'(wt);
+    function automatic logic signed [3:0] clip4(input logic signed [5:0] v);
+        if      (v > QMAX) clip4 = 4'(signed'(QMAX));
+        else if (v < QMIN) clip4 = 4'(signed'(QMIN));
+        else               clip4 = 4'(v);
     endfunction
 
-    // -------------------------------------------------------------------------
-    // FSM.
-    // -------------------------------------------------------------------------
-    typedef enum logic [2:0] {
-        S_IDLE,           // waiting for a dispatch
-        S_LOAD,           // streaming a weight tile into the PE registers
-        S_RUN,            // feeding activations / draining column sums
-        S_WB_ACC_RD,      // accumulate readback of one existing int32 result row
-        S_WB_WRITE,       // write one result row out
-        S_DONE            // one-cycle completion pulse
-    } state_t;
-    state_t state, state_n;
+    localparam int S_IDLE = 0, S_STREAM = 1, S_DRAIN_RD = 2, S_DRAIN_WR = 3, S_DONE = 4;
+    logic [2:0] state;
 
-    // Latched dispatch parameters.
-    logic [ADDR_W-1:0] act_base, wgt_base, out_base;
-    // Effective strides, resolved once at dispatch (zero -> single-tile default).
-    // Latched rather than read live so a dispatch cannot straddle a config write;
-    // under issue-and-wait it cannot anyway, but the address generators below
-    // then match the rest of the latched dispatch state.
-    logic [ADDR_W-1:0] act_row_stride;   // bytes between activation rows
-    logic [ADDR_W-1:0] res_row_stride;   // bytes between int32 result rows
-    logic [ADDR_W-1:0] wgt_row_stride;   // bytes between packed weight rows
-    // int8 store stride for a requantized writeback: res_row_stride/4 (see the
-    // port comment). Only meaningful when requant_mode.
-    wire  [ADDR_W-1:0] res_row_stride_i8 = res_row_stride >> 2;
+    // ---- latched dispatch ---------------------------------------------------
+    logic                transpose_q, acc_q;
+    logic [15:0]         len_q;
+    logic [ADDR_W-1:0]   a_base_q, b_base_q, c_base_q;
+    logic [ADDR_W-1:0]   a_stride_q, b_stride_q, c_stride_q;
+    logic [M0_W-1:0]     rq_m0;
+    logic [N_W-1:0]      rq_n;
+    logic [CNT_W-1:0]    a_reads, b_reads, sc_last;
 
-    // ---- Tile loop state ----------------------------------------------------
-    logic [7:0]        k_tile_count, n_tile_count;  // latched tile counts (>= 1)
-    logic [7:0]        k_tile_idx,   n_tile_idx;    // current contraction / output tile
-    // Running operand bases, stepped at tile boundaries rather than recomputed
-    // with a multiplier per access.
-    logic [ADDR_W-1:0] act_tile_base;    // act_base + k_tile_idx*ROWS
-    // Row-major weights swap what the two tile axes cost. An n-tile is a step
-    // *along* a row (COLS more elements = WGT_ROW_BYTES, a constant); a k-tile is
-    // a step *down* ROWS whole rows (ROWS*w_row, which needs the stride). Under
-    // the old column-major layout it was exactly the other way round.
-    logic [ADDR_W-1:0] wgt_ntile_base;   // wgt_base + n_tile_idx*WGT_ROW_BYTES (n-tile origin)
-    logic [ADDR_W-1:0] wgt_tile_base;    // wgt_ntile_base + k_tile_idx*ROWS*w_row
-    logic [ADDR_W-1:0] out_tile_base;    // out_base + n_tile_idx*COLS*(4 or 1)
-    logic [ADDR_W-1:0] wgt_ntile_step;   // WGT_ROW_BYTES
-    logic [ADDR_W-1:0] wgt_ktile_step;   // ROWS*wgt_row_stride, computed once at dispatch
-    logic [ADDR_W-1:0] out_ntile_step;   // COLS*4 (int32) or COLS (requant int8)
+    // Zero stride means the densely packed default.
+    wire [ADDR_W-1:0] len_bytes    = ADDR_W'(len >> 1);
+    wire [ADDR_W-1:0] a_stride_sel = (a_stride != '0) ? a_stride : len_bytes;
+    wire [ADDR_W-1:0] b_stride_sel = (b_stride != '0) ? b_stride
+                                   : (transpose ? len_bytes : ADDR_W'(WORD_BYTES));
+    wire [ADDR_W-1:0] c_stride_sel = (c_stride != '0) ? c_stride : ADDR_W'(WORD_BYTES);
 
-    // Stride selection, as combinational wires so the dispatch latch and the
-    // derived per-tile steps below cannot disagree about how a stride resolved.
-    wire [ADDR_W-1:0] act_row_stride_sel =
-        (!tiled || a_row == '0) ? ADDR_W'(ROWS)           : a_row;
-    wire [ADDR_W-1:0] res_row_stride_sel =
-        (!tiled || c_row == '0) ? ADDR_W'(RES_ROW_BYTES)  : c_row;
-    wire [ADDR_W-1:0] wgt_row_stride_sel =
-        (!tiled || w_row == '0) ? ADDR_W'(WGT_ROW_BYTES)  : w_row;
+    wire [CNT_W-1:0] chunks_sel = (CNT_W'(len) + CNT_W'(N-1)) >> LOGN;
 
-    wire k_tile_last = (k_tile_idx == k_tile_count - 8'd1);
-    wire n_tile_last = (n_tile_idx == n_tile_count - 8'd1);
-    // First contraction tile of an n-tile initialises result_buf; later ones add
-    // to it. That is the entire cost of accumulating across the contraction — no
-    // clear pass, no extra state.
-    wire k_tile_first = (k_tile_idx == 8'd0);
+    // ---- operand feed -------------------------------------------------------
+    logic [CNT_W-1:0]  iq;                     // operand words requested
+    logic [CNT_W-1:0]  sc;                     // array steps taken
+    logic              arrive;                 // the bus carries step `sc`'s words
+    logic [ADDR_W-1:0] a_off_row, a_off_chunk;
+    logic [ADDR_W-1:0] b_off_row, b_off_chunk;
 
-    logic [5:0]        tok_count;      // T, tokens in this dispatch
-    logic              acc_mode;       // latched `accumulate`
-    logic              requant_mode;   // latched `requant`
-    logic [M0_W-1:0]   rq_mult_m0;     // requant multiplier (latched from rq_word)
-    logic [N_W-1:0]    rq_shift_n;     // requant shift
-    logic [15:0]       expected_completions;  // total bottom completions = T * COLS
+    wire a_req    = (state == S_STREAM) && (iq < a_reads);
+    wire b_req    = (state == S_STREAM) && (iq < b_reads);
+    wire issue_ok = (!a_req || A_gnt) && (!b_req || B_gnt);
+    wire issue_go = (a_req || b_req) && issue_ok;
+    wire row_wrap = (iq[LOGN-1:0] == LOGN'(N-1));
 
-    // -------------------------------------------------------------------------
-    // PE array. Weights stationary; a-stream (value+token+valid) flows right;
-    // int32 partial sums flow down.
-    // -------------------------------------------------------------------------
-    logic [WT_W-1:0]           pe_weight    [0:ROWS-1][0:COLS-1];
-    logic signed [ACT_W-1:0]   pe_act       [0:ROWS-1][0:COLS-1];
-    logic [TOK_W-1:0]          pe_tok       [0:ROWS-1][0:COLS-1];
-    logic                      pe_act_valid [0:ROWS-1][0:COLS-1];
-    logic signed [PSUM_W-1:0]  pe_psum      [0:ROWS-1][0:COLS-1];
+    wire issues_done = (iq >= a_reads) && (iq >= b_reads);
+    wire array_en    = (state == S_STREAM) && (arrive || issues_done);
 
-    // Input skew: skew_*[i][k] = the row-i feed delayed by (k+1) cycles. Row i's
-    // left-edge injection reads delay i (skew_*[i][i-1]); row 0 injects with no
-    // delay. Declared square but only the k <= i-1 triangle is ever read.
-    logic signed [ACT_W-1:0]   skew_act   [0:ROWS-1][0:ROWS-1];
-    logic [TOK_W-1:0]          skew_tok   [0:ROWS-1][0:ROWS-1];
-    logic                      skew_valid [0:ROWS-1][0:ROWS-1];
+    assign A_re   = a_req;
+    assign B_re   = b_req;
+    assign A_addr = a_base_q + a_off_row + a_off_chunk;
+    assign B_addr = b_base_q + b_off_row + b_off_chunk;
 
-    // Left-edge values presented to the array this cycle (combinational).
-    logic signed [ACT_W-1:0]   edge_act   [0:ROWS-1];
-    logic [TOK_W-1:0]          edge_tok   [0:ROWS-1];
-    logic                      edge_valid [0:ROWS-1];
+    // ---- edge registers -----------------------------------------------------
+    // A always arrives as a chunk of N contraction elements for one array row,
+    // round-robin, so the round-robin is the skew. B does the same when
+    // transposed; otherwise a whole B row lands at once and the top edge needs a
+    // triangular skew chain.
+    logic [N*4-1:0] arow_buf [0:N-1];
+    logic [N*4-1:0] bcol_buf [0:N-1];
+    logic [N*4-1:0] bskew    [0:N-1];
+    logic [N-1:0]   vchain;
 
-    // Result buffer: drained column sums scattered here by token id, then drained
-    // to scratchpad in the writeback phase.
-    logic signed [PSUM_W-1:0]  result_buf [0:MAX_TOKENS-1][0:COLS-1];
+    wire feed_valid = (sc >= CNT_W'(1)) && (sc <= CNT_W'(len_q));
 
-    // Weight-load pipeline. Two pointers, one cycle apart, because the scratchpad
-    // read has one cycle of latency: req counts what has been asked for, rcv what
-    // has landed, and the inflight flag bridges the two.
-    logic [15:0] wgt_req_cnt, wgt_rcv_cnt;
-    logic        wgt_rd_inflight;   // a W_rd was issued last cycle (data valid now)
+    logic signed [3:0] a_edge [0:N-1];
+    logic signed [3:0] b_edge [0:N-1];
+    logic              v_edge [0:N-1];
 
-    // Activation-feed pipeline (same two-pointer structure).
-    logic [15:0] act_req_cnt;       // token vectors requested
-    logic [15:0] inj_tok_idx;       // token id of the vector being injected now
-    logic [15:0] completions;       // bottom-row results scattered so far this tile
-    logic        act_rd_inflight;   // an A_rd was issued last cycle (data valid now)
-
-    // Writeback token pointer.
-    logic [15:0] wb_tok_idx;
-
-    // -------------------------------------------------------------------------
-    // Left-edge feed (combinational). Row 0 injects the just-arrived vector with
-    // no delay; row i reads its skew chain at delay i.
-    // -------------------------------------------------------------------------
     always_comb begin
-        for (int row_i = 0; row_i < ROWS; row_i++) begin
-            if (row_i == 0) begin
-                edge_act[0]   = A_rdata[0 +: ACT_W];
-                edge_tok[0]   = inj_tok_idx[TOK_W-1:0];
-                edge_valid[0] = act_rd_inflight;
-            end else begin
-                edge_act[row_i]   = skew_act[row_i][row_i-1];
-                edge_tok[row_i]   = skew_tok[row_i][row_i-1];
-                edge_valid[row_i] = skew_valid[row_i][row_i-1];
-            end
+        for (int i = 0; i < N; i++) begin
+            a_edge[i] = 4'(arow_buf[i]);
+            b_edge[i] = transpose_q ? 4'(bcol_buf[i]) : bskew[i][i*4 +: 4];
+            v_edge[i] = (i == 0) ? feed_valid : vchain[i-1];
         end
     end
 
-    // -------------------------------------------------------------------------
-    // Scratchpad port drive (combinational per state).
-    // -------------------------------------------------------------------------
-    logic signed [PSUM_W-1:0] wb_elem_i32;   // final int32 element for the current lane
-    always_comb begin
-        A_re    = 1'b0; A_raddr = '0;
-        W_re    = 1'b0; W_raddr = '0;
-        C_re    = 1'b0; C_raddr = '0;
-        C_we    = 1'b0; C_waddr = '0; C_wdata = '0; C_wstrb = '0;
-        wb_elem_i32 = '0;
+    // ---- PE array -----------------------------------------------------------
+    logic signed [3:0]       pe_a [0:N-1][0:N-1];
+    logic signed [3:0]       pe_b [0:N-1][0:N-1];
+    logic                    pe_v [0:N-1][0:N-1];
+    logic signed [ACC_W-1:0] acc  [0:N-1][0:N-1];
 
-        unique case (state)
-            S_LOAD: begin
-                W_re    = (wgt_req_cnt < ROWS);
-                W_raddr = wgt_tile_base + ADDR_W'(wgt_req_cnt * wgt_row_stride);
-            end
-            S_RUN: begin
-                A_re    = (act_req_cnt < {10'b0, tok_count});
-                A_raddr = act_tile_base + ADDR_W'(act_req_cnt * act_row_stride);
-            end
-            S_WB_ACC_RD: begin        // accumulate readback (int32 running partial)
-                C_re    = 1'b1;
-                // always the int32 stride: the partials are int32 whatever the
-                // store width ends up being.
-                C_raddr = out_tile_base + ADDR_W'(wb_tok_idx * res_row_stride);
-            end
-            S_WB_WRITE: begin
-                C_we    = 1'b1;
-                // int8 requant rows step res_row_stride/4; int32 rows step the full one.
-                C_waddr = out_tile_base
-                        + ADDR_W'(wb_tok_idx * (requant_mode ? res_row_stride_i8
-                                                             : res_row_stride));
-                for (int col_j = 0; col_j < COLS; col_j++) begin
-                    wb_elem_i32 = result_buf[wb_tok_idx[TOK_W-1:0]][col_j]
-                                + (acc_mode ? $signed(C_rdata[col_j*32 +: 32]) : '0);
-                    if (requant_mode) begin
-                        C_wdata[col_j*8 +: 8] = requant8(wb_elem_i32, rq_mult_m0, rq_shift_n);
-                        C_wstrb[col_j]        = 1'b1;          // one int8 byte per col
-                    end else begin
-                        C_wdata[col_j*32 +: 32] = wb_elem_i32;
-                        C_wstrb[col_j*4 +: 4]   = 4'b1111;     // full int32 lane
-                    end
-                end
-            end
-            default: ;
-        endcase
+    logic signed [3:0] in_a, in_b;
+    logic signed [7:0] in_prod;
+    logic              in_v;
+
+    // ---- writeback ----------------------------------------------------------
+    logic [LOGN-1:0] drow;
+
+    logic signed [3:0] rq_elem, old_elem;
+    always_comb begin
+        C_wdata = '0;
+        for (int j = 0; j < N; j++) begin
+            rq_elem  = requant4(acc[drow][j], rq_m0, rq_n);
+            old_elem = acc_q ? $signed(C_rdata[j*4 +: 4]) : 4'sd0;
+            C_wdata[j*4 +: 4] = clip4(6'(rq_elem) + 6'(old_elem));
+        end
     end
 
-    // -------------------------------------------------------------------------
-    // Next-state logic.
-    // -------------------------------------------------------------------------
-    always_comb begin
-        state_n = state;
-        unique case (state)
-            S_IDLE:  if (start) begin
-                         if (t_len == 0) state_n = S_DONE;
-                         else            state_n = S_LOAD;
-                     end
-            S_LOAD:  if (wgt_rcv_cnt == ROWS) state_n = S_RUN;
-            // End of a contraction tile. If more remain, go straight back to
-            // LOAD for the next weight tile with the partials still sitting in
-            // result_buf — the scratchpad is not touched between tiles. Only
-            // after the last one does the result drain out. The requant {M0, N}
-            // arrives in the dispatch itself, so there is nothing to fetch
-            // before the drain any more.
-            S_RUN:   if (completions == expected_completions) begin
-                         if      (!k_tile_last)  state_n = S_LOAD;
-                         else if (acc_mode)      state_n = S_WB_ACC_RD;
-                         else                    state_n = S_WB_WRITE;
-                     end
-            S_WB_ACC_RD:                         state_n = S_WB_WRITE;
-            // Output tile finished. If more remain, restart the contraction for
-            // the next one; otherwise the whole matmul is done.
-            S_WB_WRITE: if (wb_tok_idx == (16'(tok_count) - 16'd1)) begin
-                            // if/else rather than a ternary: mixing two enum
-                            // values in a conditional expression loses the enum
-                            // type and needs an explicit cast.
-                            if (n_tile_last) state_n = S_DONE;
-                            else             state_n = S_LOAD;
-                        end
-                        else if (acc_mode)       state_n = S_WB_ACC_RD;
-                        else                     state_n = S_WB_WRITE;
-            S_DONE:                              state_n = S_IDLE;
-            default:                             state_n = S_IDLE;
-        endcase
-    end
+    assign C_en   = (state == S_DRAIN_RD) || (state == S_DRAIN_WR);
+    assign C_we   = (state == S_DRAIN_WR);
+    assign C_addr = c_base_q + ADDR_W'(drow) * c_stride_q;
 
-    // -------------------------------------------------------------------------
-    // Sequential datapath.
-    // -------------------------------------------------------------------------
-    integer row_i, col_j, dly_k;      // loop indices: array row, array column, skew stage
-    integer bottom_hits;              // bottom-row results produced this cycle
+    assign busy = (state != S_IDLE);
+    assign done = (state == S_DONE);
 
-    // Operands entering the PE currently being evaluated, and the sum leaving it.
-    logic signed [ACT_W-1:0]  in_act;    // from the left neighbour (or the array edge)
-    logic [TOK_W-1:0]         in_tok;    // token id riding along with in_act
-    logic                     in_valid;  // in_act carries a real activation
-    logic signed [PSUM_W-1:0] in_psum;   // from the row above (0 at the top row)
-    logic signed [PSUM_W-1:0] out_psum;  // in_psum + this PE's int4 product
-
-    always_ff @(posedge clk) begin
+    always_ff @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
-            state <= S_IDLE;
-            wgt_req_cnt <= '0; wgt_rcv_cnt <= '0; wgt_rd_inflight <= 1'b0;
-            act_req_cnt <= '0; inj_tok_idx <= '0; completions <= '0;
-            act_rd_inflight <= 1'b0;
-            wb_tok_idx <= '0;
-            // Clear valids so no phantom completions before the first feed.
-            for (row_i = 0; row_i < ROWS; row_i++) begin
-                for (col_j = 0; col_j < COLS; col_j++) pe_act_valid[row_i][col_j] <= 1'b0;
-                for (dly_k = 0; dly_k < ROWS; dly_k++) skew_valid[row_i][dly_k]   <= 1'b0;
-            end
+            state       <= S_IDLE;
+            iq          <= '0;
+            sc          <= '0;
+            arrive      <= 1'b0;
+            drow        <= '0;
+            vchain      <= '0;
+            transpose_q <= 1'b0;
+            acc_q       <= 1'b0;
+            for (int i = 0; i < N; i++)
+                for (int j = 0; j < N; j++) pe_v[i][j] <= 1'b0;
         end else begin
-            state <= state_n;
+            arrive <= issue_go;
 
-            unique case (state)
-                // -------------------------------------------------------------
-                S_IDLE: if (start && t_len != 0) begin
-                    act_base       <= act_addr;
-                    wgt_base       <= weight_addr;
-                    out_base       <= out_addr;
-                    rq_mult_m0     <= rq_word[M0_W-1:0];
-                    rq_shift_n     <= rq_word[M0_W +: N_W];
-                    tok_count      <= t_len;
-                    acc_mode       <= accumulate;
-                    requant_mode   <= requant;
-                    act_row_stride <= act_row_stride_sel;
-                    res_row_stride <= res_row_stride_sel;
-                    wgt_row_stride <= wgt_row_stride_sel;
+            case (state)
+                S_IDLE: if (start) begin
+                    transpose_q <= transpose;
+                    acc_q       <= accumulate;
+                    len_q       <= len;
+                    a_base_q    <= a_base;
+                    b_base_q    <= b_base;
+                    c_base_q    <= c_base;
+                    a_stride_q  <= a_stride_sel;
+                    b_stride_q  <= b_stride_sel;
+                    c_stride_q  <= c_stride_sel;
+                    rq_m0       <= rq_word[M0_W-1:0];
+                    rq_n        <= rq_word[M0_W +: N_W];
+                    a_reads     <= chunks_sel << LOGN;
+                    b_reads     <= transpose ? (chunks_sel << LOGN) : CNT_W'(len);
+                    sc_last     <= CNT_W'(len) + CNT_W'(2*N - 2);
 
-                    // Tile loop. A count of 0 reads as 1 so an unset config
-                    // register is a plain single-tile matmul rather than a
-                    // dispatch that computes nothing.
-                    k_tile_count <= (tiled && k_tiles != 8'd0) ? k_tiles : 8'd1;
-                    n_tile_count <= (tiled && n_tiles != 8'd0) ? n_tiles : 8'd1;
-                    k_tile_idx   <= '0;
-                    n_tile_idx   <= '0;
-                    act_tile_base  <= act_addr;
-                    wgt_ntile_base <= weight_addr;
-                    wgt_tile_base  <= weight_addr;
-                    out_tile_base  <= out_addr;
-                    // Per-tile steps: one array width along each axis. Both are
-                    // resolved here so neither address path carries a multiplier.
-                    wgt_ntile_step <= ADDR_W'(WGT_ROW_BYTES);
-                    wgt_ktile_step <= ADDR_W'(ROWS) * wgt_row_stride_sel;
-                    out_ntile_step <= requant ? ADDR_W'(RQ_ROW_BYTES)
-                                              : ADDR_W'(RES_ROW_BYTES);
-                    expected_completions <= 16'(t_len) * 16'(COLS);
-                    wgt_req_cnt <= '0; wgt_rcv_cnt <= '0; wgt_rd_inflight <= 1'b0;
-                    act_req_cnt <= '0; inj_tok_idx <= '0; completions <= '0;
-                    act_rd_inflight <= 1'b0;
-                    wb_tok_idx <= '0;
-                    // Fresh matmul: clear a-stream / skew valids.
-                    for (row_i = 0; row_i < ROWS; row_i++) begin
-                        for (col_j = 0; col_j < COLS; col_j++) pe_act_valid[row_i][col_j] <= 1'b0;
-                        for (dly_k = 0; dly_k < ROWS; dly_k++) skew_valid[row_i][dly_k]   <= 1'b0;
-                    end
-                end
-
-                // -------------------------------------------------------------
-                // Weight load: one array-row (COLS int4) per clock. The counter
-                // walks ROWS now, and the received word scatters across the
-                // *columns* of one PE row — the transpose of the column-major
-                // load, and the only thing the layout change costs.
-                S_LOAD: begin
-                    if (wgt_req_cnt < ROWS) wgt_req_cnt <= wgt_req_cnt + 16'd1;
-                    wgt_rd_inflight <= (wgt_req_cnt < ROWS);
-                    if (wgt_rd_inflight) begin
-                        for (col_j = 0; col_j < COLS; col_j++)
-                            pe_weight[wgt_rcv_cnt[$clog2(ROWS)-1:0]][col_j]
-                                <= W_rdata[col_j*WT_W +: WT_W];
-                        wgt_rcv_cnt <= wgt_rcv_cnt + 16'd1;
-                    end
-                end
-
-                // -------------------------------------------------------------
-                // Feed + drain.
-                S_RUN: begin
-                    // Activation read pipeline: issue one token vector per clock;
-                    // its data (and injection) lands the following cycle.
-                    if (act_req_cnt < {10'b0, tok_count}) act_req_cnt <= act_req_cnt + 16'd1;
-                    act_rd_inflight <= (act_req_cnt < {10'b0, tok_count});
-                    if (act_rd_inflight) inj_tok_idx <= inj_tok_idx + 16'd1;
-
-                    // Input-skew shift registers (triangular; row i => delay i).
-                    for (row_i = 0; row_i < ROWS; row_i++) begin
-                        skew_act[row_i][0]   <= A_rdata[row_i*ACT_W +: ACT_W];
-                        skew_tok[row_i][0]   <= inj_tok_idx[TOK_W-1:0];
-                        skew_valid[row_i][0] <= act_rd_inflight;
-                        for (dly_k = 1; dly_k < ROWS; dly_k++) begin
-                            skew_act[row_i][dly_k]   <= skew_act[row_i][dly_k-1];
-                            skew_tok[row_i][dly_k]   <= skew_tok[row_i][dly_k-1];
-                            skew_valid[row_i][dly_k] <= skew_valid[row_i][dly_k-1];
+                    iq          <= '0;
+                    sc          <= '0;
+                    arrive      <= 1'b0;
+                    drow        <= '0;
+                    vchain      <= '0;
+                    a_off_row   <= '0;
+                    a_off_chunk <= '0;
+                    b_off_row   <= '0;
+                    b_off_chunk <= '0;
+                    for (int i = 0; i < N; i++)
+                        for (int j = 0; j < N; j++) begin
+                            acc[i][j]  <= '0;
+                            pe_v[i][j] <= 1'b0;
                         end
-                    end
 
-                    // Systolic PE update. Each PE uses its incoming (left/top)
-                    // operands so pe_act and pe_psum advance one hop per cycle.
-                    // Note pe_psum is not an accumulator: it is recomputed every
-                    // cycle from the row above plus this PE's product, so the
-                    // sum over the contraction dim is spatial (down the array),
-                    // not temporal.
-                    bottom_hits = 0;
-                    for (row_i = 0; row_i < ROWS; row_i++) begin
-                        for (col_j = 0; col_j < COLS; col_j++) begin
-                            in_act   = (col_j == 0) ? edge_act[row_i]
-                                                    : pe_act[row_i][col_j-1];
-                            in_tok   = (col_j == 0) ? edge_tok[row_i]
-                                                    : pe_tok[row_i][col_j-1];
-                            in_valid = (col_j == 0) ? edge_valid[row_i]
-                                                    : pe_act_valid[row_i][col_j-1];
-                            in_psum  = (row_i == 0) ? '0
-                                                    : pe_psum[row_i-1][col_j];
-                            out_psum = in_psum + weight_product(in_act,
-                                                                pe_weight[row_i][col_j]);
+                    state <= (len == 16'd0) ? S_DONE : S_STREAM;
+                end
 
-                            pe_act[row_i][col_j]       <= in_act;
-                            pe_tok[row_i][col_j]       <= in_tok;
-                            pe_act_valid[row_i][col_j] <= in_valid;
-                            pe_psum[row_i][col_j]      <= out_psum;
-
-                            // Bottom row: a completed column dot product. Scatter
-                            // into the result buffer by its propagated token id.
-                            // Contraction tile 0 initialises the running sum;
-                            // every later tile adds to it, which is how the
-                            // partials stay resident across the k loop instead
-                            // of round-tripping through the scratchpad.
-                            if (row_i == ROWS-1 && in_valid) begin
-                                result_buf[in_tok][col_j] <=
-                                    k_tile_first ? out_psum
-                                                 : (result_buf[in_tok][col_j] + out_psum);
-                                bottom_hits = bottom_hits + 1;
+                S_STREAM: begin
+                    // Operand fetch. A denied port re-presents; nothing advances.
+                    if (issue_go) begin
+                        iq <= iq + CNT_W'(1);
+                        if (a_req) begin
+                            if (row_wrap) begin
+                                a_off_row   <= '0;
+                                a_off_chunk <= a_off_chunk + ADDR_W'(WORD_BYTES);
+                            end else begin
+                                a_off_row   <= a_off_row + a_stride_q;
+                            end
+                        end
+                        if (b_req) begin
+                            if (transpose_q && row_wrap) begin
+                                b_off_row   <= '0;
+                                b_off_chunk <= b_off_chunk + ADDR_W'(WORD_BYTES);
+                            end else begin
+                                b_off_row   <= b_off_row + b_stride_q;
                             end
                         end
                     end
-                    completions <= completions + bottom_hits[15:0];
 
-                    // Contraction tile finished and more remain: step the two
-                    // operand bases one array width along the contraction axis.
-                    // The result stays in result_buf — nothing is written out here.
-                    if (completions == expected_completions && !k_tile_last) begin
-                        k_tile_idx    <= k_tile_idx    + 8'd1;
-                        act_tile_base <= act_tile_base + ADDR_W'(ROWS);
-                        wgt_tile_base <= wgt_tile_base + wgt_ktile_step;
+                    if (array_en) begin
+                        sc     <= sc + CNT_W'(1);
+                        vchain <= (vchain << 1) | N'(feed_valid);
+
+                        // Edge buffers. A load beats the shift: the clock a row
+                        // takes its next chunk is the clock it runs out.
+                        for (int i = 0; i < N; i++) begin
+                            if (sc < a_reads && sc[LOGN-1:0] == LOGN'(i))
+                                arow_buf[i] <= A_rdata;
+                            else if (v_edge[i])
+                                arow_buf[i] <= arow_buf[i] >> 4;
+                        end
+
+                        if (transpose_q) begin
+                            for (int j = 0; j < N; j++) begin
+                                if (sc < b_reads && sc[LOGN-1:0] == LOGN'(j))
+                                    bcol_buf[j] <= B_rdata;
+                                else if (v_edge[j])
+                                    bcol_buf[j] <= bcol_buf[j] >> 4;
+                            end
+                        end else begin
+                            bskew[0] <= B_rdata;
+                            for (int s = 1; s < N; s++) bskew[s] <= bskew[s-1];
+                        end
+
+                        for (int i = 0; i < N; i++)
+                            for (int j = 0; j < N; j++) begin
+                                in_a = (j == 0) ? a_edge[i] : pe_a[i][j-1];
+                                in_v = (j == 0) ? v_edge[i] : pe_v[i][j-1];
+                                in_b = (i == 0) ? b_edge[j] : pe_b[i-1][j];
+                                in_prod = in_a * in_b;
+
+                                pe_a[i][j] <= in_a;
+                                pe_v[i][j] <= in_v;
+                                pe_b[i][j] <= in_b;
+                                if (in_v)
+                                    acc[i][j] <= acc[i][j]
+                                               + {{(ACC_W-8){in_prod[7]}}, in_prod};
+                            end
+
+                        if (sc == sc_last) state <= acc_q ? S_DRAIN_RD : S_DRAIN_WR;
                     end
                 end
 
-                // -------------------------------------------------------------
-                // Writeback: one result row per token (int32, or int8 if requant).
-                // On the last row, if output tiles remain, step to the next one:
-                // reset the contraction, rewind the activation base to column 0,
-                // and advance the weight/result bases by one array width.
-                S_WB_WRITE: begin
-                    wb_tok_idx <= wb_tok_idx + 16'd1;
-                    if (wb_tok_idx == (16'(tok_count) - 16'd1) && !n_tile_last) begin
-                        n_tile_idx     <= n_tile_idx + 8'd1;
-                        k_tile_idx     <= '0;
-                        wb_tok_idx     <= '0;
-                        act_tile_base  <= act_base;
-                        wgt_ntile_base <= wgt_ntile_base + wgt_ntile_step;
-                        wgt_tile_base  <= wgt_ntile_base + wgt_ntile_step;
-                        out_tile_base  <= out_tile_base  + out_ntile_step;
-                    end
+                S_DRAIN_RD: if (C_gnt) state <= S_DRAIN_WR;
+
+                S_DRAIN_WR: if (C_gnt) begin
+                    drow <= drow + LOGN'(1);
+                    if (drow == LOGN'(N-1)) state <= S_DONE;
+                    else                    state <= acc_q ? S_DRAIN_RD : S_DRAIN_WR;
                 end
 
-                default: ; // S_WB_ACC_RD (C_re asserted comb), S_DONE
+                S_DONE: state <= S_IDLE;
+
+                default: state <= S_IDLE;
             endcase
-
-            // ---------------------------------------------------------------
-            // Per-tile streaming reset. Every *entry* into S_LOAD begins a fresh
-            // weight load and activation stream, whether that is the first tile
-            // of a dispatch, the next contraction tile, or the first tile of the
-            // next output tile — so the counters are cleared in one place rather
-            // than at each of the three transitions.
-            //
-            // This sits AFTER the case on purpose. On the cycle S_RUN hands over
-            // to S_LOAD the systolic block above still runs and assigns
-            // `completions <= completions + bottom_hits`; the later assignment in
-            // the same always_ff is the one that takes effect, so the clear has
-            // to come last or the next tile would start with the previous tile's
-            // completion count and drain immediately.
-            //
-            // result_buf is deliberately NOT cleared: carrying it across the
-            // contraction is the whole point, and `k_tile_first` selects load-vs-
-            // accumulate at the scatter.
-            // ---------------------------------------------------------------
-            if (state_n == S_LOAD && state != S_LOAD) begin
-                wgt_req_cnt <= '0; wgt_rcv_cnt <= '0; wgt_rd_inflight <= 1'b0;
-                act_req_cnt <= '0; inj_tok_idx <= '0; completions <= '0;
-                act_rd_inflight <= 1'b0;
-                for (row_i = 0; row_i < ROWS; row_i++) begin
-                    for (col_j = 0; col_j < COLS; col_j++) pe_act_valid[row_i][col_j] <= 1'b0;
-                    for (dly_k = 0; dly_k < ROWS; dly_k++) skew_valid[row_i][dly_k]   <= 1'b0;
-                end
-            end
         end
     end
-
-    // -------------------------------------------------------------------------
-    // Status.
-    // -------------------------------------------------------------------------
-    assign busy = (state != S_IDLE);
-    assign done = (state == S_DONE);
-    assign load_active = (state == S_LOAD);
 
 endmodule

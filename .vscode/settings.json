@@ -3,5 +3,7 @@
     "python.analysis.extraPaths": [
         "${workspaceFolder}/.venv/lib/python3.12/site-packages"
     ],
-    "cmake.sourceDirectory": "/home/andrew/Desktop/transformer/src"
+    "cmake.sourceDirectory": "/home/andrew/Desktop/transformer/src",
+    "python-envs.defaultEnvManager": "ms-python.python:conda",
+    "python-envs.defaultPackageManager": "ms-python.python:conda"
 }

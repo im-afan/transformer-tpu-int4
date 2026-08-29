@@ -56,7 +56,6 @@ set BLOCK_LEN 64
 set ROWS      0
 set COLS      0
 set ADDR_W    0
-set VPU_BYTES 0
 
 # ---- Generics passed to the top level ----------------------------------------
 # Only what cmod_a7_echo_top actually declares. build.tcl's generic_args would

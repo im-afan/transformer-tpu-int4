@@ -74,7 +74,7 @@ CFLAGS  := $(ARCH) -Os -ffreestanding -nostdlib -fno-builtin -Wall -Wextra \
 
 # Problem shape. Empty = the kernel's own #defines. Make does not track a
 # changed -D, so `make clean` first when sweeping (../tb/run_fw_sweep.sh does)
-# or when RQ changes (../host/run_adder.py deletes the kernel's objects itself).
+# or when RQ changes.
 #   make M=8 KTILES=16 NTILES=16
 #   make PROG=infer GEN=3     tokens for infer.c to generate (default T-PROMPT)
 #   make PROG=infer PHASE=prefill|decode|both
@@ -83,21 +83,22 @@ CFLAGS  := $(ARCH) -Os -ffreestanding -nostdlib -fno-builtin -Wall -Wextra \
 #                             what the accuracy path builds; the other two
 #                             are benchmarks, since the perf counters reset
 #                             at 'G' and cannot be read mid-run.
-#   make PROG=infer BLOCK=8   prefill rows per sequence per pass (default 32,
-#                             the array's dispatch limit). Lower it to shrink
+#   make PROG=infer BLOCK=8   prefill rows per sequence per pass (default 32).
+#                             There is no hardware row limit: the array's
+#                             output block is N x N whatever the live extent,
+#                             so this is bounded by DRAM. Lower it to shrink
 #                             every activation buffer, at one weight stream
 #                             per extra pass; it is what makes BATCH>1 fit.
 #   make PROG=infer BATCH=2   independent sequences sharing one weight
-#                             stream. Costs 48 KB of DRAM per sequence for
-#                             the KV cache, so infer.c's DR_END assert is
-#                             the ceiling.
-#   make PROG=adder RQ=/tmp/adder_rq_ckpt.h
-#                             adder.c's requant table, derived from a real
-#                             checkpoint by `accel/tpulang/adder_export.py
-#                             --emit-rq`, in place of the checked-in adder_rq.h.
-#                             The {m0,n} words are literals in the commands, so
-#                             an image built without this one carries the
-#                             synthetic table and scores nothing.
+#                             stream. Costs one KV cache per sequence, so
+#                             infer.c's DR_END assert is the ceiling.
+#   make PROG=infer RQ=/tmp/infer_rq_ckpt.h
+#                             infer.c's requant table, derived from a real
+#                             checkpoint by `accel/tpulang/infer_export.py
+#                             --emit-rq`, in place of the checked-in
+#                             infer_rq.h. The {m0,n} words are literals in the
+#                             commands, so an image built without this one
+#                             carries the synthetic table and scores nothing.
 M      ?=
 KTILES ?=
 NTILES ?=
@@ -182,8 +183,9 @@ endif
 endif
 TRACEFLAGS := -DTPU_TRACE -I. -Wall -Wextra -O1 $(SHAPEFLAGS)
 
-# The host build gets memcpy from libc, so memops.c is not in this line.
-%.trace: %.c mock/tpu_trace.c tpu.h tpulib.h
+# The host build gets memcpy from libc, so memops.c is not in this line. The
+# requant headers are prerequisites because a kernel compiles its table in.
+%.trace: %.c mock/tpu_trace.c tpu.h tpulib.h infer_rq.h
 	$(HOSTCC) $(TRACEFLAGS) -o $@ $< mock/tpu_trace.c
 
 # stdin closed on purpose. A kernel that reads the scratchpad window blocks for
