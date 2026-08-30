@@ -1,5 +1,12 @@
 # UART echo self-test
 
+
+> **The host scripts this document describes are gone.** `host/uart_echo.py` and
+> `host/test_uart_link.py` were deleted with `accel/tpu/host/`. The bitstream, the RTL
+> (`rtl/uart_echo.sv`) and its testbench (`make echo`) are unchanged, and the forensics
+> below are still the right way to read a bad byte — but reproducing the board half
+> needs a script that no longer exists.
+
 A standalone FPGA image that does one thing: it receives **64 bytes** into a
 register file, sends those 64 bytes back, and repeats, from reset until
 power-off. No commands, no addresses, no modes — the block length is the whole
@@ -7,13 +14,13 @@ protocol, fixed at synthesis (`BLOCK_LEN` in `boards/cmod_a7_echo/board.tcl`).
 The host sends a 64-byte block of random data, reads the reply, and compares.
 
 The point is to shrink the search space when a byte goes wrong on the real link.
-A bad byte in `host/test_uart_link.py` could come from `uart_receiver`,
+A bad byte in a link test could come from `uart_receiver`,
 `uart_transmitter`, `uart_interface`, the SRAM controller, the arbitration mux,
 the cable or the host. This image deletes four of those.
 
 > **The corruption this was built to chase is solved, and the fault was on the
 > host** — reading the serial port while the bridge was still transmitting. See
-> the post-mortem in [`../host/README.md`](../host/README.md). This image is kept
+> the post-mortem in [`uart_host.md`](uart_host.md). This image is kept
 > as a bring-up rung, and it is what produced the evidence that settled it.
 
 It instantiates the **same** `uart_receiver` and `uart_transmitter` the production
@@ -35,7 +42,7 @@ is worth being explicit about the trade:
   visible event rather than a silent corruption.
 * The device now has **state** the streaming echo did not: a partial block. The
   host walks it to a known position before starting (`resync` in
-  `host/uart_echo.py`), or an interrupted previous run leaves every exchange
+  the host driver), or an interrupted previous run leaves every exchange
   short by the same few bytes and the byte diff blames the link.
 
 ---
@@ -52,15 +59,15 @@ vivado -mode batch -source synth/vivado/build.tcl -tclargs board=cmod_a7_echo mo
 vivado -mode batch -source synth/vivado/build.tcl -tclargs board=cmod_a7_echo mode=program
 
 # 3. drive it
-python accel/tpu/host/uart_echo.py --offline               # check the forensics first
-python accel/tpu/host/uart_echo.py -p COM5                 # 30-second run
-python accel/tpu/host/uart_echo.py -p COM5 --minutes 30    # soak until it breaks
-python accel/tpu/host/uart_echo.py -p COM5 --baud 117000   # sampling-margin check
+# The host driver for this image was deleted with accel/tpu/host/. The bitstream
+# and its RTL testbench (`cd accel/tpu/tb && make echo`) are still here; driving
+# the board half needs a script that writes 64 bytes and reads 64 back, which
+# accel/test/tpu_uart.py's serial port gives you but does not itself do.
 ```
 
 `mode=bit` writes to `synth/build/cmod_a7_echo/`, so the self-test and production
 bitstreams can never be confused. **Reflash `board=cmod_a7` before running
-`test_uart_link.py` or `run_adder.py`** — they will time out against this image.
+anything on `-b board`** — it will time out against this image.
 
 **LEDs.** `led[0]` is a ~1.4 Hz heartbeat, so a dead clock or an unconfigured FPGA
 is distinguishable from a dead link without opening a terminal; it switches to a
@@ -86,9 +93,9 @@ startup rather than letting it surface as a byte diff.
 | `synth/vivado/boards/cmod_a7_echo/board.tcl` | New board target — `build.tcl` already dispatches on `board=`, so it needed no changes |
 | `constraints/cmod_a7_echo.xdc` | Six pins. `cmod_a7.xdc` is not reusable: `set_property` against an empty `get_ports` is an error, and this top declares none of the 31 SRAM ports |
 | `tb/uart_echo_tb.sv` | Testbench: drives a block into `uart_rx` and decodes the reply off `uart_tx` |
-| `host/uart_echo.py` | Host driver, soak loop and failure analysis |
+| `host/uart_echo.py` | Host driver, soak loop and failure analysis — **deleted**; see the note above |
 
-**Modified:** `synth/vivado/sources.tcl` (reads `uart_echo.sv`), `tb/Makefile` (`make echo`), `host/README.md`.
+**Modified:** `synth/vivado/sources.tcl` (reads `uart_echo.sv`), `tb/Makefile` (`make echo`).
 
 `rtl/uart_receiver.sv` and `rtl/uart_transmitter.sv` are **not touched**.
 
@@ -135,7 +142,7 @@ happens to be low, which is the very thing under test.
 
 ## Reading a failure
 
-`host/uart_echo.py` does not just print a diff. Three structurally different bugs
+The (now deleted) host driver did not just print a diff. Three structurally different bugs
 produce an identical-looking byte-by-byte mismatch, so on failure it works out
 which one it is:
 
@@ -176,6 +183,39 @@ side of 115200 and see where it actually falls over:
 
 ---
 
+## Sibling image: UART + external memory, no core (`cmod_a7_mem`)
+
+`rtl/uart_memory.sv` is `tpu_top` minus the machine: scalar unit, MXU, VPU,
+scratchpad and the DMA engine are gone, and with them the SRAM arbitration mux
+(there is only one requester left, so `mem_* = uart_mem_*` unconditionally).
+What remains is exactly the path a full link test exercises —
+`uart_receiver` -> `uart_interface` -> `sram_controller` -> the chip pins, and
+back — instantiated from the same unmodified files the production image uses,
+at the same pinout.
+
+It is the middle rung of the ladder:
+
+| Image | Core | Protocol | Memory |
+|---|---|---|---|
+| `cmod_a7` | yes | yes | external SRAM |
+| `cmod_a7_mem` | no | yes | external SRAM |
+| `cmod_a7_bram` | no | yes | on-chip block RAM |
+| `cmod_a7_echo` | no | no | 64-byte register file |
+
+So it splits the remaining search space in half. If a full link test still
+corrupts against this image, the fault is in `uart_interface` or
+`sram_controller` — nothing else is left. If it runs clean, the fault needs the
+core present: the arbitration mux, `core_busy`, or the DMA engine's half of the
+shared controller.
+
+Two things behave differently from `tpu_top`, both deliberate and both visible
+only to commands this rig is not meant to be driven with: `'I'` (write IMEM) and
+`'G'` (go) are still decoded, range-checked and ACK'd because `uart_interface`
+is unmodified, but there is no instruction memory and no core, so the write
+lands nowhere and the run never starts — use `'R'`/`'W'` only; and `core_busy`
+is tied low, so nothing is ever NAK'd for arbitration, removing the core's
+claim on the controller from the experiment entirely.
+
 ## Sibling image: UART + block RAM (`cmod_a7_bram`)
 
 The echo image removes the protocol along with the memory, so a clean echo run
@@ -199,20 +239,28 @@ a faster controller would move every turnaround and the comparison would be
 worthless. What leaves with the SRAM is the bidirectional bus, the OE#/CE#
 timing, the chip, and the 30 switching bank-14 pins.
 
+`bram_controller` keeps `CLOCKS_PER_ACCESS`'s beat length even though a synchronous
+BRAM needs no wait state and the two-clock write beat existed only to fit a WE#
+edge that block RAM doesn't have — the point is an equal-latency comparison, not
+a faster one. `ADDR_W` (19 bits) is the protocol address width; `DEPTH_W` is what
+is actually built, since 2**19 bytes doesn't fit in the 35T's block RAM. An
+address above `2**DEPTH_W` aliases down (`addr[DEPTH_W-1:0]`, high bits
+discarded) — deterministic, and flagged sticky on `aliased`.
+
 *Still corrupts* ⇒ the fault is in `uart_interface` (or the host).
 *Runs clean* ⇒ the fault needs the external memory present.
 
 ```bash
 cd accel/tpu/tb && make bram                       # simulate
 vivado -mode batch -source synth/vivado/build.tcl -tclargs board=cmod_a7_bram mode=deploy
-python accel/tpu/host/test_uart_link.py -p COM5 --only sram_roundtrip
+python accel/test/run_suite.py -b board -p COM5 -k matmul
 ```
 
 **Only 2\*\*`BRAM_AW` bytes exist** (64 KiB by default; 2\*\*19 will not fit in an
 Artix-7 35T). The protocol space stays the full 19 bits because the range checks
 are part of what is under test, so addresses above the window fold down onto it —
 deterministically, and flagged on the sticky `aliased` output. Consequences for
-`test_uart_link.py`, which otherwise runs unchanged:
+the board backend, which otherwise runs unchanged:
 
 * `sram_isolation` and `sram_address_bus` **fail, expectedly**. Both probe the top
   of the 19-bit space to check the address lines of a chip this image does not
@@ -224,6 +272,13 @@ deterministically, and flagged on the sticky `aliased` output. Consequences for
 
 `led[0]` is the heartbeat / collision flag as elsewhere. `led[1]` is the activity
 LED, plus a fast blink when the link is idle if any access ever aliased.
+
+`collision` (sticky, `cmod_a7_bram` and `cmod_a7_mem` both) sets on either of two
+things, both meaning "the host got ahead of the device": a byte landing while the
+device was mid-transmit (survivable — `uart_interface`'s RX holding register keeps
+it, so this is information about the host, not a device fault by itself), or
+`uart_interface`'s `rx_overrun` (a byte arrived with the holding register still
+full, so one really was lost).
 
 ---
 

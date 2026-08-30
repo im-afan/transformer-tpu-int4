@@ -27,23 +27,16 @@ plus a custom SystemVerilog TPU that runs it end to end on an FPGA.
 (so `head_dim=32`), int4 weights and activations, no bias. `numbers_data` supplies
 `EQUALS_POS = 64` and `MAX_TOKENS = 128`.
 
-`accel/tpu/fw/infer.c` is that model as inference at `T=64` (a 32-token prompt), and is the
-kernel everything else points at.
+`accel/test/tests/infer/infer.c` is that model as inference, and is the kernel everything
+else points at. Its shape and its whole DRAM map come from a generated `infer_config.h`.
 
 ### Things that are currently out of step — check before trusting them
 
-- **`fw/adder.c` has not been migrated.** It is still `T=32, D=64, DFF=256` with the old
-  DRAM map (`DR_LAYER0 = 0x02000`, stride `0x06000`), while `fw_vectors.py` and
-  `adder_export.py` stage `d=128 / f=512 / T=128` at `0x20000` / `0x18000`. So
-  `make fw FWPROG=adder` and `adder_export.py` do not line up.
-- **`fw/infer.c` is compiled with `LAYERS 2`**, not the config's 4. `fw_vectors.py`'s
-  `IN_LAYERS` is 4. Set it back before trusting an accuracy number.
 - **There is no trained checkpoint at the wide shape.** `python -m model.make_dummy_checkpoint`
   writes an untrained one at `model/saved/int4_d128_f512_l4.pt` so the export, staging and
   RTL paths can run. Any accuracy it scores is chance — `fw/perf_notes.md`'s 0.00% is that.
-- `model/quant.py` and `model/calibrate.py` still describe the retired ternary/int8 model.
-  They fail on the missing `adder_ternary_vanilla` factory rather than exporting something
-  wrong.
+- **`numpy` and `torch` are needed for the `infer` test and for `export.py`.** The other
+  five kernels need only a host C compiler.
 
 ## Commands
 
@@ -55,36 +48,32 @@ python -m model.tests.test_inference --arch int4_wide
 python -m model.make_dummy_checkpoint           # untrained .pt, for plumbing only
 ```
 
-TPU stack — **one command producer, PicoRV32 firmware in `accel/tpu/fw/`**. There is no
-assembler and no `.tpu` language.
+TPU stack — **one command producer, PicoRV32 firmware built out of `accel/tpu/fw/`**. There
+is no assembler and no `.tpu` language. Everything runs through `accel/test`:
 
 ```bash
-make -C accel/tpu/fw PROG=infer             # build a kernel (needs RISC-V gcc)
-make -C accel/tpu/fw PROG=infer trace       # native command trace, host cc only
-make -C accel/tpu/fw PROG=infer dis|size
+python accel/test/run_suite.py                  # 5 kernels on the ISS, <1 s
+python accel/test/run_suite.py -b rtl           # ...through the whole core, ~20 s
+python accel/test/run_suite.py -b rtl -k tiled -v
+python accel/test/run_suite.py -b rtl-uart      # ...loaded over the simulated UART, ~6x
+python accel/test/run_suite.py -b board -p COM5
 
-cd accel/tpu/tb && make fw FWPROG=infer GEN=3   # through the RTL, 3 tokens
-cd accel/tpu/tb && make fw FWPROG=spadwin       # the CPU's scratchpad window, ~1 s
-cd accel/tpu/tb && make fw FWPROG=tiled         # tpulib.h's block loops, ~20 s
-cd accel/tpu/tb && make fwtime FWPROG=infer     # ...plus a per-command timeline
-cd accel/tpu/tb && make fwuart FWPROG=ffn       # the same over the simulated UART
-cd accel/tpu/tb && make list                    # RTL testbenches
+python accel/test/tests/matmul/generate.py -b rtl --ktiles 16 --ntiles 16
+python accel/test/tests/infer/generate.py -b iss --synthetic --gen 3 -n 1
+python accel/test/tests/infer/generate.py -b iss -n 256        # accuracy, generating
+python -m accel.test.export --dump-rq --model-path model/saved/int4_d128_f512_l4.pt
 
-python accel/tpulang/infer_export.py -n 256     # accuracy, generating, on the ISS
-python accel/tpulang/adder_export.py -n 256     # accuracy, teacher-forced
-python accel/tpulang/adder_export.py --dump-rq -n 0   # the 16 requant words per layer
-python accel/tpu/host/run_adder.py -p COM5 -n 64      # on the board
-python accel/tpu/host/run_fw_matmul.py --dry-run      # one kernel, no board
+cd accel/tpu/tb && make list                    # RTL block testbenches
+cd accel/tpu/tb && make TEST=mxu                # one of them
 ```
 
-Build knobs for `infer.c`: `GEN=n` (tokens), `BATCH=n` (sequences sharing one weight
-stream), `BLOCK=n` (prefill rows per pass), `PHASE=prefill|decode|both`, `RQ=<header>`,
-`TPU_WGT_PREFETCH=0`.
+`infer`'s knobs are `--gen`, `--batch`, `--block`, `-T/--prompt`, and (synthetic only)
+`-d/-f/-L/--heads`. They land in the generated header, not in `-D` flags.
 
-`fw_vectors.py` takes the trace **binary** (`-x`) and runs it as a co-process, because
-`infer.c` argmaxes its own logits and the token it picks lands in the *address* of the next
-DMA — its command stream is not a function of the program alone. `-t <file>` still reads a
-captured trace.
+`ISSBackend` **runs** the `-DTPU_TRACE` binary as a co-process rather than reading a
+captured trace, because `infer.c` argmaxes its own logits and the token it picks lands in
+the *address* of the next DMA — its command stream is not a function of the program alone.
+The ISS answers each `SRD` out of its own scratchpad.
 
 Deps are `torch` (+ jupyter for `model/notebook.ipynb`) and `pyserial` for the host driver.
 The venv is checked in at `.venv/` (Python 3.12); there is no requirements.txt.
@@ -135,7 +124,7 @@ The venv is checked in at `.venv/` (Python 3.12); there is no requirements.txt.
 - **`EQUALS_POS = 64`** is the first *answer* position; `=` is at 63. Operands are padded so
   this holds regardless of length. Implies `max_digits <= (EQUALS_POS - 2) // 2` = 31, and
   the generator raises rather than silently shifting.
-- `equals_pos` is a per-call argument. `infer_export.py` pins it to 32 for the `T=64` kernel.
+- `equals_pos` is a per-call argument. `accel/test/export.py` pins it to the kernel's `PROMPT`.
 - Padding token is `'N'` (`PAD_ID = 12`); `tokenize` builds an additive `-1e9` mask from the
   pad positions, which the model ignores.
 - `_sample_number` samples uniformly over **digit count**, not value.
@@ -196,7 +185,7 @@ one and `Q@K^T`'s is the one needing the transposing DMA.
 - **`VOP_DOT` stayed** with no caller: it *is* the reduction path and the only int8 x int8
   reduction the ISA has.
 - `GELU`, `EXP`, `SQUARE`, `ELEMENT_MUL`, `SCALAR_*`, `REDUCEMAX`, `REDUCESUM` and the
-  `SOFTMAX` macro op were removed with both activation ROMs, `rtl/luts/`, `accel/tpulang/luts.py`,
+  `SOFTMAX` macro op were removed with both activation ROMs, `rtl/luts/`, `accel/tpulang/luts.py` (all deleted),
   the restoring divider, the softmax sequencer and the reduction path's max fold.
   Measured by OOC synthesis of `vpu` alone: **10012 -> 5162 LUTs (−48%), 897 -> 667 FFs,
   90 -> 32 DSPs (−64%)**.
@@ -250,11 +239,11 @@ command queues 815, `dma` 493.
   splits the **contraction, never the columns** — a column split makes `tpu_move2d` issue one
   DMA per contraction row. It costs the int32 partials a split contraction forces.
   `TPU_WGT_PREFETCH=0` compiles it out, which is the A/B.
-- `fw/tiled.c` is the regression for the block loops themselves: DRAM to DRAM, a tiny arena,
-  and `fw_vectors.py::reference_tiled` checking the ISS against a plain Python matmul —
+- `tests/tiled/` is the regression for the block loops themselves: DRAM to DRAM, a tiny arena,
+  and `tests/tiled/generate.py` checking every backend against a plain Python matmul —
   because a mis-tiled matmul is something the ISS would reproduce as faithfully as the RTL.
 
-### `fw/infer.c` — the model generating
+### `tests/infer/infer.c` — the model generating
 
 A **32-token prefill**, then 31 decode steps of M=1 against a KV cache in DRAM. One
 `infer_block(rows, first_pos)` serves both, so **M is the only difference between the
@@ -272,32 +261,46 @@ training shape and the generation shape**.
 - **Nothing is zeroed and nothing needs to be.** The mask that makes attention causal (`-8`
   against an int4 score, then ReLU) is also what makes the uninitialized tail of the cache
   exactly zero. So the scratchpad is not cleared between problems, on the board or in
-  `infer_export.py` — that is the test, not a shortcut.
+  the suite — that is the test, not a shortcut. (The KV cache *is* zeroed once, in the
+  static image, so the first problem sees the same memory on every backend; nothing
+  touches it after that.)
 - **The argmax and the embedding gather are on the device.** `cpu_subsys.sv` maps the
   scratchpad at `0x9xxx_xxxx`, so the head writes its logits there, the CPU reads them back
   (`tpu_spad_ld`) and argmaxes, and the gather is a DMA at `DR_EMB + tok*D`. The host
-  tokenizes and nothing else. `fw/spadwin.c` is that window's own ~1 s regression; the window
+  tokenizes and nothing else. `tests/spadwin/` is that window's own regression; the window
   is **unsynchronized** — a load is not a command, so it needs the same `tpu_wait` a
   dependent command would, 32 bits wide and 4-byte aligned (the S port has no byte strobes).
 - **`BATCH` sequences share every weight stream.** X is `[BATCH][rows][D]`, so the
   projections, `Wo` and both FFN matmuls run once over `BATCH*rows` rows. Attention stays per
   sequence. That is the point at decode, where a step is one row of arithmetic against
   ~390 KB of weights.
-- **The image is 15 772 bytes of a 16 KB firmware RAM**, with the stack growing down from the
-  top of the same RAM. ~600 bytes of headroom. `-DTPU_WGT_PREFETCH=0` builds at 11 782.
+- **The image is ~15.8 KB of a 16 KB firmware RAM** at `d=128 / f=512`, with the stack
+  growing down from the same RAM. ~600 bytes of headroom. It is 11 008 at `d=64 / f=256`,
+  and `-DTPU_WGT_PREFETCH=0` takes ~4 KB off either.
+- **Its shape and its whole DRAM map come from the generated `infer_config.h`.** There is
+  no `DR_ALIGN` chain in the C any more, and `DR_LAYER0` is wherever the activations end
+  rather than a hardcoded `0x20000`.
 
-### `accel/tpulang/` — four files
+### `accel/test/` — the verification suite
 
 - `iss.py` — bit-exact with the RTL; the instruction decoder is gone, `exec_command` /
   `run_trace` are the way in.
-- `fw_vectors.py` — a kernel's command trace -> golden DRAM images + the expected command
-  stream, plus the **one** definition of each kernel's synthetic operands. It runs the trace
-  binary itself as a co-process (`coexecute`), answering the kernel's scratchpad reads out of
-  the model's memory.
-- `adder_export.py` — checkpoint -> requant table -> trace -> accuracy, teacher-forced.
-- `infer_export.py` — the same checkpoint *generating*, through `fw/infer.c`.
+- `backends.py` — `ISSBackend` (native build + co-execution), `RTLBackend` (RISC-V image
+  through the whole core in Icarus, `uart=True` for the serial load path), `TPUBackend`
+  (the board). All three: `build`, `load` once, `run(patch)` per case.
+- `vector_generator.py` — the `VectorGenerator` / `Case` contract and the packing, requant
+  and `$readmemh` helpers.
+- `program.py` — `TPUProgram(source, backend, generator).run_program()`: build, load,
+  per-case compare, plus the stray-write check.
+- `export.py` — checkpoint -> `infer_config.h` (shape, the whole DRAM map, the requant
+  table) + the static DRAM image. **Python owns the addresses; `infer.c` computes none.**
+- `tests/<name>/` — one kernel's `.c` and its `generate.py`, in one folder.
+- `run_suite.py` — all of them, on one backend.
 
-The directory name is a fossil.
+Three rules the backends depend on: the static image must be **dense over everything the
+kernel reads** (the ISS starts zeroed, the board's SRAM does not); DRAM **carries over**
+between cases and is not reset; and a write outside `check_ranges ∪ writable_ranges` fails
+the case on `iss` and `rtl`.
 
 ### `accel/cuda/`
 
@@ -306,28 +309,28 @@ Legacy. It implements *softmax* attention and the model does ReLU attention; not
 
 ## When touching attention numerics
 
-Keep these in sync: `model/transformer.py` (reference), `fw/infer.c` + `fw/adder.c` +
-`iss.py`, and the RTL.
+Keep these in sync: `model/transformer.py` (reference), `accel/test/tests/infer/infer.c`,
+`accel/test/tests/infer/generate.py`'s integer reference, `accel/test/export.py`'s requant
+derivation, `iss.py`, and the RTL.
 
 ## Long simulations
 
-- **The ISS is where you iterate.** `python accel/tpulang/infer_export.py -n 4` is a ~10 s
-  check that the kernel still computes the model. The RTL run is what proves the *hardware*
-  agrees.
-- `make fw FWPROG=ffn` (or `mha`) is the ~5 s smoke test that dispatch still works at all.
-- `make fw FWPROG=spadwin` is ~1 s and is the only thing exercising the CPU's scratchpad
-  window.
-- `make fw FWPROG=infer` is DMA-bound at ~830 k clocks per generated token — **use `GEN=3`
-  while iterating.** The tb Makefile sizes each kernel's watchdog per kernel.
-- `make fwuart` costs ~6x `make fw` on the same kernel, because at `FWUART_CPB=16` a byte is
-  160 core clocks. `FWUART_CPB=8` halves it; below 8 the receiver's mid-bit sample stops
-  being mid-bit. `RERUN=1` loads and runs twice with no reset in between — a real regression:
-  it is what caught `tpu_top.sv` clearing `cpu_run` against the previous run's stale
-  `cpu_done`.
+- **The ISS is where you iterate.** `python accel/test/run_suite.py` is under a second and
+  covers five kernels; `tests/infer/generate.py -b iss --gen 4 -n 4` is the model. The RTL
+  run is what proves the *hardware* agrees.
+- `run_suite.py -b rtl` is ~20 s for all five and is the smoke test that dispatch still
+  works at all. `spadwin` is the only thing exercising the CPU's scratchpad window.
+- `infer` on the RTL is DMA-bound at ~830 k clocks per generated token — **use `--gen 3`
+  while iterating.** `run_suite.WATCHDOG_NS` sizes each kernel's watchdog.
+- `-b rtl-uart` costs ~6x `-b rtl` on the same kernel, because at `UART_CPB=16` a byte is
+  160 core clocks. `8` halves it; below 8 the receiver's mid-bit sample stops being mid-bit.
+  `RTLBackend(rerun=True)` loads and runs twice with no reset in between — a real
+  regression: it is what caught `tpu_top.sv` clearing `cpu_run` against the previous run's
+  stale `cpu_done`.
 - **A long Icarus run prints nothing until it halts**, which makes "slow" and "deadlocked"
   look identical from outside. Redirect the log to a file rather than piping through
   `tail`/`head`, which buffer the whole stream.
-- `make fwtime FWPROG=<kernel>` adds a per-command timeline; `tb/cmd_timeline.py` reconstructs
+- `vvp <kernel>.vvp +CMDLOG=<path>` adds a per-command timeline; `tb/cmd_timeline.py` reconstructs
   the perf counters from it exactly and checks that on every run.
 
 ## Measured performance
@@ -394,7 +397,7 @@ bridge is still transmitting corrupts the byte in flight — the host's IN reque
 FT2232H's transmit bit timing by roughly half a bit, so the device decodes `sent[k]` **or**
 `sent[k-1]` for every bit `k`, usually `value << 1`.
 
-Fixed in `host/tpu_uart.py`: `TPUUart._send` waits for a frame to clear the wire before
+Fixed in `accel/test/tpu_uart.py`: `TPUUart._send` waits for a frame to clear the wire before
 anything reads. The old code read immediately after `ser.write(frame)`, so the read landed on
 the *header of every command*, where a corrupted length does the most damage.
 
@@ -416,13 +419,14 @@ metastability, crosstalk, timing closure.
 
 **The simulation blind spot.** `tb/uart_memory_cosim_tb.sv`'s host clocks every bit for
 exactly `CPB` clocks, so it has *zero* baud error — a real 115200 host against a 12 MHz
-CPB=104 device runs at 104.1667. `make cosim` could never see this. Worth remembering before
-trusting a green co-simulation about anything analogue or timing-related.
+CPB=104 device runs at 104.1667. No simulation could ever see this — `fw_uart_tb.sv` has
+the same property. Worth remembering before trusting a green simulation about anything
+analogue or timing-related. (`uart_memory_cosim_tb.sv` and its host driver are deleted.)
 
 **Still worth doing.** `UART_RX_TIMEOUT = 0` is what turns one corrupted byte into a
 permanently wedged link. `20 * UART_CPB` in `boards/*/board.tcl` makes it cost one legible
 timeout instead. That is hardening, not the fix.
 
 `docs/uart_selftest.md` has the echo self-test. **Reflash `board=cmod_a7` before running
-`test_uart_link.py` or `run_adder.py`** — they time out against the echo bitstream, and
+anything on `-b board`** — it times out against the echo bitstream, and
 bitstreams under `synth/build/` are not rebuilt by `mode=program`.

@@ -1,58 +1,51 @@
-# Firmware (PicoRV32 command producer)
+# Firmware library (PicoRV32 command producer)
 
-C kernels for the CPU in [`../rtl/cpu_subsys.sv`](../rtl/cpu_subsys.sv) — the **only**
+The C the CPU in [`../rtl/cpu_subsys.sv`](../rtl/cpu_subsys.sv) runs — the **only**
 producer of the 128-bit macro-ops the MXU/VPU/DMA queues consume.
+
+This directory is the **library**. The kernels themselves live with their vectors in
+[`../../test/tests/`](../../test/README.md), because a kernel and the thing that says what
+its answer should be belong in one folder.
 
 | File | Contents |
 | --- | --- |
 | `tpu.h` | The MMIO aperture and one builder per command. No abstraction — fields are packed exactly as `cmd_mxu.sv` / `cmd_vpu.sv` / `cmd_dma.sv` decode them |
 | `tpulib.h` | **The primitives**: matmul, elementwise, transpose and block moves at any size, over operands in either memory |
-| `matmul.c` | `C[8x16] = A[8x32] @ W[32x16]`, DMA in, one `matmul_t`, DMA out |
-| `matmul_loop.c` | The same product with the 4x2 tile grid walked in C — 8 single-tile dispatches, `.acc` across the contraction |
-| `ffn.c` | The feed-forward block, `X@W1 -> relu -> requant -> @W2`. First kernel to issue a VPU command |
-| `mha.c` | One head of ReLU attention: all three DMA modes including the transposing spill, plus the `quant4` pack |
-| `tiled.c` | `tpulib.h` past the scratchpad: three DRAM-to-DRAM problems sized so the row, column and contraction loops all have to run |
-| `spadwin.c` | The **scratchpad window** on its own: the CPU reads a tensor back, writes one, and issues a DMA at an address it computed |
-| `infer.c` | **The whole model, generating**: prefill then decode against a KV cache, argmax and embedding on the device. `d=128`, `f=512`, `T=64` |
-| `adder.c` | The whole model in the **training** shape — every position at once, teacher-forced. Still at the old `d=64` / `f=256` / `T=32` (see below) |
-| `adder_rq.h`, `infer_rq.h` | 16 requant `{m0,n}` words per layer, one header per kernel. The checked-in copies are tuned for synthetic operands; a real checkpoint overrides them |
-| `memops.c` | `memcpy`/`memset`, which gcc emits calls to whatever the flags say. Nothing links it today |
-| `mock/tpu_trace.c` | The host-side `tpu_push`/`tpu_wait`, so `-DTPU_TRACE` turns any kernel into its own trace producer |
+| `memops.c` | `memcpy`/`memset`, which gcc emits calls to whatever the flags say. `--gc-sections` drops it from kernels that make none |
+| `mock/tpu_trace.c` | The host-side `tpu_push`/`tpu_wait`/`tpu_spad_ld`/`tpu_spad_st`, so `-DTPU_TRACE` turns any kernel into its own trace producer |
 | `start.S`, `link.ld` | Reset entry (`gp`/`sp`, zero `.bss`, `main`, raise `done`) and the 16 KB firmware RAM at address 0 |
 | `bin2hex.py` | `.bin` -> one 32-bit word per line, for `'I'` and for `$readmemh` |
+| `Makefile` | Builds any `.c` from anywhere: `PROG=`, `SRC=`, `BUILD=`, `EXTRA_CFLAGS=` |
 
-**Two layers, and which one a kernel uses is a real choice.** `matmul.c`,
-`matmul_loop.c`, `ffn.c`, `mha.c` and `spadwin.c` are written straight against `tpu.h` —
-they are ISA tests, and the point is that every field is visible. `adder.c`, `infer.c` and
-`tiled.c` are written against `tpulib.h`, because they are *programs*.
+The kernels, in `../../test/tests/`:
 
-## ⚠️ `adder.c` has not been migrated
+| Kernel | Contents |
+| --- | --- |
+| `matmul` | `C = requant(A @ W)`, DMA in, a tile grid of `matmul_t`, DMA out |
+| `ffn` | The feed-forward block, `X@W1 -> relu -> @W2`. First kernel to issue a VPU command |
+| `mha` | One head of ReLU attention, and the MXU's transpose flag |
+| `tiled` | `tpulib.h` past the scratchpad: four DRAM-to-DRAM problems sized so the row, column and contraction loops all have to run |
+| `spadwin` | The **scratchpad window** on its own: the CPU reads a tensor back, writes one, and issues a DMA at an address it computed |
+| `infer` | **The whole model, generating**: prefill then decode against a KV cache, argmax and embedding on the device |
 
-`infer.c`, `../../tpulang/fw_vectors.py`, `../../tpulang/adder_export.py` and
-`../host/run_adder.py` all moved to `adder_int4_wide` (`d=128`, `f=512`). **`adder.c` did
-not** — it is still `T=32`, `D=64`, `DFF=256`, with the old DRAM map
-(`DR_LAYER0 = 0x02000`, stride `0x06000`) against the exporters' `0x20000` / `0x18000`.
-
-Consequences until it is migrated:
-
-- `make fw FWPROG=adder` and `adder_export.py` do not line up — the golden operands are
-  staged at the wide map.
-- `infer.c` is the migrated teacher-forcing-free path, and is what to use.
-- `infer.c` is currently compiled with `LAYERS 2`, not the config's 4. `fw_vectors.py`'s
-  `IN_LAYERS` is 4. Set it back before trusting an accuracy number.
+**Two layers, and which one a kernel uses is a real choice.** `matmul`, `ffn`, `mha` and
+`spadwin` are written straight against `tpu.h` — they are ISA tests, and the point is that
+every field is visible. `infer` and `tiled` are written against `tpulib.h`, because they
+are *programs*.
 
 ## Build
 
-Needs a bare-metal RISC-V gcc — `brew install riscv64-elf-gcc`, or the xPack
-`riscv-none-elf-gcc`. The Makefile autodetects the prefix; override with `CROSS=`.
+Needs a bare-metal RISC-V gcc — `brew install riscv64-elf-gcc`, `apt install
+gcc-riscv64-unknown-elf`, or the xPack `riscv-none-elf-gcc`. The Makefile autodetects the
+prefix; override with `CROSS=`.
+
+Normally `accel/test/backends.py` invokes it, into a build directory of its own:
 
 ```bash
-make -C accel/tpu/fw                       # -> matmul.hex (PROG defaults to matmul)
-make -C accel/tpu/fw PROG=infer            # infer.hex
-make -C accel/tpu/fw PROG=infer dis        # disassembly
-make -C accel/tpu/fw PROG=infer size
-make -C accel/tpu/fw PROG=infer trace      # native command trace, host cc only
-make -C accel/tpu/fw PROG=infer run PORT=COM5
+make -C accel/tpu/fw PROG=infer SRC=/abs/path/infer.c BUILD=/abs/build \
+     EXTRA_CFLAGS="-I/abs/generated -DFOO=1"
+make -C accel/tpu/fw PROG=infer BUILD=/abs/build dis     # disassembly
+make -C accel/tpu/fw PROG=infer BUILD=/abs/build size
 ```
 
 `-march=rv32ic_zmmul -mabi=ilp32` matches how `cpu_subsys.sv` parameterizes the core:
@@ -60,17 +53,8 @@ compressed on, fast multiplier on, **divider off** — a `div` or `rem` traps as
 instruction, so plain `rv32imc` is wrong. Nothing is linked (`-nostdlib`, no libgcc). With
 a gcc older than 12 (no `zmmul`), use `-march=rv32ic` and keep multiplication out too.
 
-### Build-time knobs
-
-| | |
-| --- | --- |
-| `M=`, `KTILES=`, `NTILES=` | `matmul.c` / `matmul_loop.c` problem shape |
-| `GEN=n` | `infer.c`: tokens to generate (default `T - PROMPT` = 32) |
-| `BATCH=n` | `infer.c`: independent sequences sharing one weight stream. Costs 48 KB of DRAM per sequence for the cache; the `DR_END` assert is the ceiling |
-| `BLOCK=n` | `infer.c`: prefill rows per sequence per pass (default 32, the array's dispatch limit). Lower it to shrink every activation buffer, at one weight stream per extra pass — this is what makes `BATCH>1` fit |
-| `PHASE=prefill\|decode\|both` | `infer.c`: which half of a generation the image runs. Both is the default and is what the accuracy path builds; the other two are benchmarks, because the counters reset at `'G'` and cannot be read mid-run |
-| `RQ=<path>` | Requant table header, overriding the checked-in one |
-| `TPU_WGT_PREFETCH=0` | Compile the weight prefetch out (the A/B) |
+There are no shape knobs left in this Makefile. A kernel's shape is either `-D` from its
+`VectorGenerator.defines` (`matmul`) or a generated header on the include path (`infer`).
 
 ### Sizes
 
@@ -78,65 +62,49 @@ Against 16 KB of firmware RAM, all text, no `.data`:
 
 | kernel | bytes |
 | --- | --- |
-| `matmul` | 240 |
-| `matmul_loop` | 344 |
-| `ffn` | 408 |
-| `mha` | 648 |
-| `tiled` | 1736 |
-| `adder` (narrow) | 1992 |
-| `infer` (wide, prefetch on) | **15 772** |
+| `matmul` | 284 |
+| `ffn` | ~410 |
+| `mha` | ~650 |
+| `tiled` | ~1740 |
+| `infer`, `d=64 / f=256`, prefetch on | **11 008** |
+| `infer`, `d=128 / f=512`, prefetch on | **~15 800** |
 
-**`infer` is close to the ceiling**: 15 772 of 16 384 bytes, and the stack grows down
-from the top of the same RAM, so there are ~600 bytes of headroom. Roughly 1.2 KB of that
-is the weight prefetch and its pipeline (`-DTPU_WGT_PREFETCH=0` builds at 11 782 on the
-same toolchain); the rest is `infer_block` inlined twice, once for the prefill's M=32 and
-once for a decode step's M=1. If it stops fitting, the knob is `infer_block`'s
-`always_inline`, and giving it up costs runtime rather than correctness.
+**`infer` at the wide shape is close to the ceiling**, and the stack grows down from the
+top of the same RAM. Roughly 1.2 KB of it is the weight prefetch and its pipeline
+(`-DTPU_WGT_PREFETCH=0` builds ~4 KB smaller); the rest is `infer_block` inlined twice,
+once for the prefill's M=BLOCK and once for a decode step's M=1. If it stops fitting, the
+knob is `infer_block`'s `always_inline`, and giving it up costs runtime rather than
+correctness.
 
 Clang builds this code about 4.6x larger than gcc (`zig cc -target
-riscv32-freestanding-none`: `adder` at 9120 bytes against gcc's 1992), so a clang build of
-`infer` will not fit.
+riscv32-freestanding-none`), so a clang build of `infer` will not fit.
 
 ## Simulate it
 
-Two testbenches run any kernel through the whole core against the same ISS golden vectors.
-They differ only in how the bytes get in.
-
-`../tb/fw_matmul_tb.sv` loads the image through `FW_INIT` (`$readmemh`, no UART), seeds
-DRAM by backdoor, releases the CPU and checks the result. This is the fast one:
+`accel/test` runs any kernel through the whole core against golden vectors the same
+kernel's native build produced on the ISS:
 
 ```bash
-cd accel/tpu/tb
-make fw                     # matmul.hex
-make fw FWPROG=matmul_loop  # the software tile loop, same expectations
-make fw FWPROG=tiled        # the block loops, checked against Python  (~20 s)
-make fw FWPROG=spadwin      # the CPU's scratchpad window              (~1 s)
-make fw FWPROG=infer GEN=3  # prefill + 2 decode steps
-make fw FWPROG=infer        # the whole generation, ~16 M clocks
-make fwtime FWPROG=<kernel> # the same run + a per-command timeline
+python accel/test/run_suite.py -b iss              # seconds; where you iterate
+python accel/test/run_suite.py -b rtl              # through the core, ~20 s for all five
+python accel/test/run_suite.py -b rtl -k tiled -v
+python accel/test/run_suite.py -b rtl-uart         # ...loaded over the serial pins
+python accel/test/tests/infer/generate.py -b rtl --synthetic --gen 3 -n 1
 ```
 
-The golden vectors come from the kernel's own native build, and `fw_vectors.py` **runs**
-that build (`-x`) rather than reading a captured trace — see "Tracing a kernel that
-branches" below.
+`-b rtl` uses `../tb/fw_matmul_tb.sv` — the image goes in through `FW_INIT` (`$readmemh`,
+no UART) and DRAM is seeded by backdoor. `-b rtl-uart` uses `../tb/fw_uart_tb.sv`, which
+touches nothing but the two serial pins: `'I'` loads the firmware, `'W'` writes the
+operands including the weights, `'G'` starts the core, `'T'` reads the counters, `'R'`
+reads results back. That is exactly what the board does, so a pass says the board path is
+wired end to end.
 
-`../tb/fw_uart_tb.sv` touches nothing but the two serial pins: `'I'` loads the firmware,
-`'W'` writes the operands including the weights, `'G'` starts the core, `'T'` reads the
-counters, `'R'` reads results back. That is exactly what the board host does, so a pass
-says the board path is wired end to end.
+`RERUN` on the UART testbench is a real regression, not a formality: it caught
+`tpu_top.sv` clearing `cpu_run` against the *previous* run's stale `cpu_done`, so the
+second `'G'` released the core for one cycle and re-reset it.
 
-```bash
-make fwuart FWPROG=ffn          # ~12 s
-make fwuart FWPROG=ffn RERUN=1  # load and run twice, no reset between
-```
-
-`RERUN=1` is a real regression, not a formality: it caught `tpu_top.sv` clearing
-`cpu_run` against the *previous* run's stale `cpu_done`, so the second `'G'` released the
-core for one cycle and re-reset it.
-
-`fwuart` costs ~6x what `fw` does, because at the default `FWUART_CPB=16` a byte is 160
-core clocks. `FWUART_CPB=8` halves it; below 8 the receiver's mid-bit sample stops being
-mid-bit.
+`rtl-uart` costs ~6x what `rtl` does, because at the default `UART_CPB=16` a byte is 160
+core clocks. `8` halves it; below 8 the receiver's mid-bit sample stops being mid-bit.
 
 **A long Icarus run prints nothing until it halts**, which makes "slow" and "deadlocked"
 look identical from outside. Redirect the log to a file rather than piping through
@@ -182,7 +150,8 @@ caller has just fenced — and the PicoRV32 runs 5–9 clocks per instruction wi
 So ~200 instructions of block arithmetic costs more than the array spends on the dispatch
 they produce.
 
-Measured on `adder.c`: routing its matmuls through a helper with runtime `m`/`k`/`n` cost
+Measured on the retired `adder.c`: routing its matmuls through a helper with runtime
+`m`/`k`/`n` cost
 **597 936 clocks** against **453 778** for the same commands from constant shapes — and
 the image was *larger*, 6420 bytes against 1992. `always_inline` on `tpu_matmul`,
 `tpu_gemm_blocks` and `tpu_gemm_arena_bytes` is what lets gcc fold the chooser, the block
@@ -232,7 +201,8 @@ that gets the contraction split instead.
 
 Caveat: at `M = 1` — every decode step, which is most of a run — the array work per block
 is a few hundred clocks against a 2 KB fill, so there is little to hide and the int32 pass
-may cost more than the overlap saves. `make fwtime FWPROG=infer GEN=3` and read `idlec`.
+may cost more than the overlap saves. Run the RTL backend with `+CMDLOG=` and read
+`idlec`.
 
 ### `tiled.c` — the paths the model kernels do not take
 
@@ -240,14 +210,14 @@ Three DRAM-to-DRAM problems with a deliberately undersized arena, so the row loo
 column loop, the contraction split and the DRAM-streaming elementwise path all have to run.
 
 ```bash
-cd accel/tpu/tb && make fw FWPROG=tiled     # 80 404 clocks, 525 474 checks, 0 errors
+python accel/test/run_suite.py -b rtl -k tiled   # 80 404 clocks, 0 errors
 ```
 
 It is also one of two kernels with an **independent** reference. The golden DRAM image is
 whatever `iss.py` computed, which checks the RTL against the ISS and nothing else — the
 right check for a kernel driving the datapath, and not enough for one driving a *loop*,
 because a mis-tiled matmul is something the ISS reproduces as faithfully as the hardware.
-So `fw_vectors.py` carries `reference_tiled`, a plain Python matmul, and checks the ISS
+So `tests/tiled/generate.py` carries a plain Python matmul, and checks the ISS
 against it before any vector file is written.
 
 ---
@@ -258,9 +228,9 @@ against it before any vector file is written.
 bias — over a `T=64` sequence: a 32-token prompt and the answer after it.
 
 ```bash
-cd accel/tpu/tb && make fw FWPROG=infer GEN=3    # 3 tokens, for iterating
-python accel/tpulang/infer_export.py -n 256      # accuracy, generating, on the ISS
-python accel/tpu/host/run_adder.py -p COM5 -n 64 # ...on the board
+python accel/test/tests/infer/generate.py -b rtl --synthetic --gen 3 -n 1
+python accel/test/tests/infer/generate.py -b iss -n 256        # accuracy, on the ISS
+python accel/test/tests/infer/generate.py -b board -p COM5 -n 64
 ```
 
 ```
@@ -360,7 +330,7 @@ weights the same layer-step streams, and the alternative does not exist: the nib
 hold whatever the last problem left there and reach S as garbage — but S is int4 and the
 mask is `-8`, so a masked score is at most `-1` and ReLU takes it to exactly zero. The
 mask that makes attention causal is what makes an uninitialized cache safe. That is why
-`infer_export.py` and `run_adder.py` run every problem through one instance rather than a
+`ISSBackend` and `TPUBackend` run every problem through one instance rather than a
 fresh one: the test, not a shortcut.
 
 ### The argmax and the gather are on the device
@@ -386,14 +356,14 @@ in the *address* of the next gather. So a producer with no model of the machine 
 emit this kernel's trace, and `make trace PROG=infer` gives a structurally-right,
 numerically-meaningless one (a read with no driver attached returns 0).
 
-The real trace comes from co-execution: `fw_vectors.py -x` runs the `-DTPU_TRACE` binary
+The real trace comes from co-execution: `ISSBackend` runs the `-DTPU_TRACE` binary
 as a **co-process**, executing each command on `iss.py` as it arrives and answering the
 kernel's scratchpad reads out of the model's own memory. That is what `make fw
-FWPROG=infer` does, and it makes the golden command stream a real forward pass's — so if
+`ISSBackend` does, and it makes the golden command stream a real forward pass's — so if
 the RTL picks a different token anywhere, the run fails at *that command* rather than
 merely producing a different answer.
 
-`fw_vectors.py` also carries `reference_infer`, which recomputes the whole model from
+`tests/infer/generate.py` also carries an integer reference, which recomputes the model from
 scratch at every step, in integer numpy, with **no cache at all**, and checks every
 generated token and every logit. A cache column written at the wrong offset, the mask row
 of the wrong position, an argmax over the wrong words — the ISS reproduces all of those
@@ -423,13 +393,14 @@ whole generation        26650766 2220.897   45.5%   16.0%   2.8%   54.1%   17.5%
 
 ---
 
-## `adder.c` — the training shape
+## Historical: `adder.c`, the training shape
 
-One forward pass over the whole sequence: every position at once, against a causal mask,
-teacher-forced. Same layers as `infer.c`, no cache.
+A retired kernel — one forward pass over the whole sequence, every position at once against
+a causal mask, teacher-forced, no cache. Deleted with the rest of the teacher-forced path;
+`infer` covers the same layers. Its numbers are kept because they are the cleanest
+measurement of what the CPU costs as a command producer.
 
-**Still at `d=64`, `f=256`, `T=32`, four layers** — see the warning at the top. What it
-measured at that shape:
+At `d=64`, `f=256`, `T=32`, four layers:
 
 ```
 534 commands, 1992 bytes of firmware, 453 778 clocks, 526 959 checks, 0 errors
@@ -441,7 +412,7 @@ counters: run=453778 mxu=206361 mload=33440 vpu=84352 dma=131200
 command producer on a real workload. `ovlap` was 0: it fences after every cross-unit
 dependency.
 
-Where those clocks went (`make fwtime FWPROG=adder`):
+Where those clocks went (the per-command timeline, `+CMDLOG=`):
 
 | phase | MXU | VPU | DMA | CPU | share |
 | --- | ---: | ---: | ---: | ---: | ---: |
@@ -498,26 +469,27 @@ Other layout notes:
 ## The requant table is a compile-time input
 
 The `{m0,n}` word is a literal in the macro-op, so there is no path by which the device
-could fetch it from memory — the 16 words per layer have to be in the image.
+could fetch it from memory — the words have to be in the image.
 
-- `adder_rq.h` / `infer_rq.h` are the checked-in defaults, tuned for the **synthetic**
-  operands `../../tpulang/fw_vectors.py` stages. That makes `make fw FWPROG=<kernel>` a
-  self-contained datapath regression with no `.pt` involved.
+- There is no checked-in table any more. `accel/test/export.py` writes `infer_config.h`,
+  which carries the shape, the DRAM map and 14 `{m0,n}` words per layer, and the kernel
+  includes it. `tests/infer/generate.py --synthetic` produces the same header with a
+  hand-picked table over mixed-hash weights, which makes the kernel a self-contained
+  datapath regression with no `.pt` involved.
 - Tuning them matters: too small and every tensor pins at the clip; too large and the model
   collapses to zeros — and a golden answer of all zeros passes against any datapath at all,
-  which is why `fw_vectors.py` warns when the generated sequence is constant.
+  which is why the test warns when every generated token is the same.
 - Each shift is one bit per doubling of the contraction that feeds it.
-- The two kernels keep **separate** headers because they are not the same sequence length,
-  and `RQ_A`'s shift is set by the contraction over keys.
-- A real checkpoint overrides the file wholesale:
+- A real checkpoint:
 
 ```bash
-python accel/tpulang/infer_export.py --model-path model/saved/int4_d128_f512_l4.pt
-python accel/tpulang/adder_export.py --dump-rq -n 0     # just the 16 words per layer
+python accel/test/tests/infer/generate.py --model-path model/saved/int4_d128_f512_l4.pt
+python -m accel.test.export --model-path model/saved/int4_d128_f512_l4.pt --dump-rq
 ```
 
-Both derive the table from the model's learned `ActQuant` scales and `Int4Linear` weight
-scales, write the same `ADDER_RQ_INIT` macro, and build against it with `-DADDER_RQ_H`.
+The table comes from the model's learned `ActQuant` scales and `Int4Linear` weight scales.
+`export.derive` refuses rather than exporting something wrong when a checkpoint needs a
+scale this ISA cannot express — see `pipeline.md`.
 
 ## Three things that are software's problem now
 

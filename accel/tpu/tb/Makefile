@@ -1,4 +1,4 @@
-# Generic testbench driver for accel/tpu (Icarus Verilog, -g2012).
+# Unit testbenches for accel/tpu's RTL blocks (Icarus Verilog, -g2012).
 #
 # Each test <name> pairs tb/<name>_tb.sv with rtl/<name>.sv. Pick one with TEST:
 #
@@ -7,34 +7,25 @@
 #   make TEST=mxu wave      run and remind you where the VCD is (tb/mxu_tb.vcd)
 #   make list               show every test that has a tb/<name>_tb.sv
 #   make all                run every discovered test in turn
-#   make clean               remove all *_tb.vvp / *_tb.vcd
+#   make clean              remove all *_tb.vvp / *_tb.vcd
 #
 # Multi-file tests: override RTL to pass extra sources, e.g.
 #   make TEST=mxu RTL="../rtl/mxu.sv ../rtl/requant.sv"
 #
-# UART echo self-test (docs/uart_selftest.md) — the block-loopback core that goes
-# into the cmod_a7_echo bitstream: 64 bytes in, the same 64 bytes back:
-#   make echo
+# Three aliases for the board-image cores:
+#   make echo    the UART block loopback (docs/uart_selftest.md)
+#   make mem     UART + external SRAM, no TPU core
+#   make bram    the same protocol against on-chip block RAM
 #
-# UART + external SRAM, no TPU core — the cmod_a7_mem bitstream's core, driven
-# with real 'W'/'R' command frames against a behavioral SRAM chip model:
-#   make mem
+# WHOLE-CORE tests are not here. fw_matmul_tb.sv and fw_uart_tb.sv run a
+# firmware kernel through the entire core against golden vectors, and both are
+# driven by accel/test (RTLBackend), which builds the image, generates the
+# vectors and invokes iverilog itself:
 #
-# The same protocol with the external memory removed as well — the cmod_a7_bram
-# bitstream's core, backed by on-chip block RAM (rtl/bram.sv):
-#   make bram
+#   python accel/test/run_suite.py -b rtl
+#   python accel/test/tests/matmul/generate.py -b rtl
 #
-# A firmware kernel through the whole core: built from ../fw/<name>.c, checked
-# against the ISS. `fw` backdoors the image and the operands in; `fwuart` loads
-# both over the simulated serial link exactly as the board host does:
-#   make fw     FWPROG=adder
-#   make fwuart FWPROG=adder
-#
-# The cmod_a7_mem image again, but driven by host/test_uart_link.py itself
-# instead of by hand-written stimulus — the real host driver, the real RTL, no
-# board (tb/uart_memory_cosim_tb.sv + host/sim_link.py):
-#   make cosim
-#   make cosim COSIM_ARGS="--only sram_roundtrip --sim-fsm"
+# core.f is the file list for the whole core, shared with that driver.
 
 TEST ?= mxu
 
@@ -57,215 +48,36 @@ RTL_dma := ../rtl/dma.sv ../rtl/scratchpad.sv
 # The command front ends share one FIFO module.
 RTL_cmd_queue := ../rtl/cmd_queue.sv
 RTL_cmd_plane := ../rtl/cmd_queue.sv ../rtl/cmd_mxu.sv ../rtl/cmd_vpu.sv ../rtl/cmd_dma.sv
+# cpu_smoke and tpu_top need the whole core; core.f is that list.
+RTL_cpu_smoke := -f core.f
+RTL_tpu_top   := -f core.f
 
 RTL ?= $(if $(RTL_$(TEST)),$(RTL_$(TEST)),../rtl/$(TEST).sv)
 
 # Extra iverilog flags, for tests that take a -D switch:
 #   make TEST=sram IVFLAGS=-DCPA=2      the SRAM controller's slower beat
-#   make TEST=tpu_top IVFLAGS="-DWATCHDOG_NS=400000000 -DNO_VCD"
 IVFLAGS  ?=
 IVERILOG := iverilog -g2012 -Wall $(IVFLAGS)
 VVP      := vvp
 
-# --- UART end-to-end wiring ---------------------------------------------------
-TPULANG  := ../../tpulang
-UART_TOP := tpu_top_uart_tb
-UART_RTL := ../rtl/tpu_top.sv ../rtl/mxu.sv ../rtl/vpu.sv \
-            ../rtl/scratchpad.sv ../rtl/dma.sv \
-            ../rtl/uart_interface.sv ../rtl/uart_receiver.sv ../rtl/uart_transmitter.sv \
-            ../rtl/perf_counters.sv \
-            ../rtl/cmd_queue.sv ../rtl/cmd_mxu.sv ../rtl/cmd_vpu.sv ../rtl/cmd_dma.sv \
-            ../rtl/cpu_subsys.sv ../rtl/vendor/picorv32.v
+# fw_matmul / fw_uart are excluded: they need a firmware image and golden
+# vectors, which accel/test builds. `make all` would only fail on them.
+TESTS := $(filter-out fw_matmul fw_uart,$(patsubst %_tb.sv,%,$(wildcard *_tb.sv)))
 
-# Both tpu_top testbenches need the whole core. Declared here (rather than up with
-# the other RTL_<name> lines) so the file list is written once: the backdoor TB
-# does not drive the UART, but tpu_top instantiates the UART blocks either way and
-# will not elaborate without them.
-RTL_cpu_smoke    := $(UART_RTL)
-RTL_tpu_top      := $(UART_RTL)
-RTL_tpu_top_uart := $(UART_RTL)
-RTL_fw_matmul    := $(UART_RTL)
-RTL_fw_uart      := $(UART_RTL)
+.PHONY: sim wave list all clean echo mem bram
 
-# Every test discoverable from the *_tb.sv files present. Three are excluded:
-# uart_memory_cosim has no rtl/<name>.sv and cannot run without host/sim_link.py
-# driving it (use `make cosim`), and fw_matmul / fw_uart need a firmware image
-# built by a RISC-V cross gcc (use `make fw` / `make fwuart`). `make all` would
-# only fail on any of them.
-TESTS := $(filter-out uart_memory_cosim fw_matmul fw_uart,$(patsubst %_tb.sv,%,$(wildcard *_tb.sv)))
-
-.PHONY: sim wave list all clean uart echo mem bram cosim fw fwuart fwtime fwsweep
-
-sim: $(TB) $(RTL)
+sim: $(TB)
 	$(IVERILOG) -o $(TOP).vvp $(RTL) $(TB)
 	$(VVP) $(TOP).vvp
 
-
-# `examples` and `model` are gone. They drove the scalar unit through
-# tpu_top_tb.sv over assembled .tpu programs, all of which were deleted with the
-# tpulang toolchain; `make fw FWPROG=<kernel>` is what covers the dispatch plane
-# now, and it checks strictly more (the command stream as well as the DRAM
-# image). `make fw FWPROG=adder` is the successor to `make model`.
-
-
-# The C firmware through the whole core: cpu_subsys.sv loads ../fw/$(FWPROG).hex
-# through FW_INIT and the PicoRV32 pushes the commands itself. Build the image
-# first (`make -C ../fw [PROG=...]`) -- that needs a RISC-V cross gcc, which is
-# why this is not in `make all`.
-#
-#   make fw                     ../fw/matmul.hex
-#   make fw FWPROG=matmul_loop  the software tile loop, same expectations
-#   make fw FWPROG=ffn          the feed-forward block (first VPU commands)
-#   make fw FWPROG=mha          one head of ReLU attention
-#   make fw FWPROG=tiled        fw/tpulib.h's block loops, DRAM to DRAM
-#   make fw FWPROG=adder        the whole int4 adder model, ~454 k clocks / ~3 min
-#   make fw M=8 KTILES=16 NTILES=16   a different shape -- the firmware, the
-#                                     native trace and the golden operands are
-#                                     all rebuilt at it (see FWSHAPEARGS)
-#   make fw FWPROG=infer        prefill + decode with a KV cache, d=128 / T=64
-#   make fw FWPROG=infer GEN=3  ...generating 3 tokens instead of 32, for speed
-FWPROG ?= matmul
-M      ?=
-KTILES ?=
-NTILES ?=
-GEN    ?=
-FWSHAPE := $(if $(M),-DFW_M=$(M)) $(if $(KTILES),-DFW_KT=$(KTILES)) \
-           $(if $(NTILES),-DFW_NT=$(NTILES))
-
-# The testbench's 2 ms watchdog is sized for the small kernels; the adder model
-# runs ~440 k clocks (4.4 ms) and would trip it while working perfectly. Per
-# kernel rather than globally, because a watchdog that never fires on a hang is
-# worth nothing -- and skipped entirely if IVFLAGS already sets one.
-FW_WATCHDOG_adder := 60000000
-# infer is a prefill plus 31 decode steps in one run, and every step re-streams
-# all 384 KB of the weights plus 48 KB of KV cache -- an estimated ~460 k clocks
-# per generated token, so ~16 M for the whole run. Use GEN= while iterating.
-FW_WATCHDOG_infer := 1000000000
-FW_WATCHDOG := $(if $(findstring WATCHDOG,$(IVFLAGS)),,\
-                 $(if $(FW_WATCHDOG_$(FWPROG)),-DWATCHDOG_NS=$(FW_WATCHDOG_$(FWPROG))))
-
-# Golden vectors now come from the kernel's own command trace: the same .c is
-# compiled natively (-DTPU_TRACE, no cross toolchain needed), its trace is run
-# through iss.py, and the testbench checks both the DRAM image and the command
-# stream the real CPU issued. docs/picorv32_migration.md §8.1.
-#
-# fw_vectors.py *runs* that native binary (-x) rather than being handed a trace
-# captured by a shell redirect, because `infer` reads its own logits back over
-# the scratchpad window and puts the token it chose into the address of a later
-# command. Its trace exists only if something answers those reads, and the ISS
-# is the only thing that can. Kernels that read nothing are unaffected: same
-# trace, one less redirect.
-FWVEC := vectors_fw
-
-# The shape now has to agree in THREE places — the RISC-V image, the native
-# trace, and the testbench's -D defines — and ../fw/Makefile cannot see a changed
-# -D, so a stale .hex from an earlier shape silently issues a differently sized
-# problem. (That is not hypothetical: it is what the sweep leaves behind, and the
-# only thing that catches it is the "nothing past C" guard.) So `fw` rebuilds
-# both firmware artifacts from clean at the requested shape every time. The
-# images are a few hundred bytes; correctness is worth the second.
-# The names here are M/KTILES/NTILES, not FW_M/FW_KT/FW_NT. Those are the -D
-# spellings the *testbench* takes, and they are not make variables — spelling
-# them here made both this and the fw_vectors.py line below silently fall back
-# to the default shape while the TB was built for the requested one. It did not
-# fail loudly: the firmware ran the right shape, read operands staged for the
-# small one, and the ISS read the same zeros, so both agreed and the run passed
-# having tested almost nothing. run_fw_sweep.sh always passed the shape properly
-# and is unaffected.
-FWSHAPEARGS = $(if $(M),M=$(M)) $(if $(KTILES),KTILES=$(KTILES)) \
-              $(if $(NTILES),NTILES=$(NTILES)) $(if $(GEN),GEN=$(GEN))
-
-.PHONY: fwvec
-fwvec: | $(FWVEC)
-	@$(MAKE) --no-print-directory -C ../fw clean
-	@$(MAKE) --no-print-directory -C ../fw $(FWPROG).hex $(FWPROG).trace \
-	         PROG=$(FWPROG) $(FWSHAPEARGS)
-	python $(TPULANG)/fw_vectors.py -x ../fw/$(FWPROG).trace -o $(FWVEC) \
-	       -k $(FWPROG) \
-	       -M $(or $(M),8) --ktiles $(or $(KTILES),4) --ntiles $(or $(NTILES),2)
-
-FWBUILD = $(IVERILOG) -DFW_HEX='"../fw/$(FWPROG).hex"' -DFW_VEC_DIR='"$(FWVEC)"' \
-	          $(FWSHAPE) $(FW_WATCHDOG) -o fw_matmul_tb.vvp $(UART_RTL) fw_matmul_tb.sv
-
-fw: $(UART_RTL) fw_matmul_tb.sv
-	@$(MAKE) --no-print-directory fwvec
-	$(FWBUILD)
-	$(VVP) fw_matmul_tb.vvp
-
-# The same kernel, but nothing is backdoored: fw_uart_tb.sv loads the image with
-# 'I', writes the operands (weights included) with 'W', starts the core with 'G'
-# and reads the results back with 'R', over the two serial pins only. Same ISS
-# golden vectors as `fw`, so any kernel in ../fw/ runs here unchanged:
-#
-#   make fwuart FWPROG=ffn            ~12 s
-#   make fwuart FWPROG=adder          the whole model, weights over the wire
-#   make fwuart FWPROG=ffn RERUN=1    load + run a second time, no reset between
-#   make fwuart FWPROG=matmul VCD=1   dump fw_uart_tb.vcd (big; off by default)
-#   make fwuart FWPROG=ffn FWUART_CPB=8   half the clocks per bit, half the run
-#
-# FWUART_CPB is what the DUT's serial blocks are built with. It is a simulation
-# speed knob and the whole cost of this target: at 16 clocks/bit a byte costs 160
-# core clocks, so the adder's 102 KB of operands are ~16 M clocks of link traffic
-# against 454 k clocks of compute. Do not go below 8 -- the receiver's mid-bit
-# sample sits at CPB/2 clocks past a two-flop synchroniser and stops being
-# mid-bit. See fw_uart_tb.sv's header.
-FWUART_CPB  ?= 16
-RERUN       ?=
-VCD         ?=
-FWUARTFLAGS ?=
-
-FWUARTBUILD = $(IVERILOG) -DFW_HEX='"../fw/$(FWPROG).hex"' -DFW_NAME='"$(FWPROG)"' \
-	          -DFW_VEC_DIR='"$(FWVEC)"' -DUART_CPB=$(FWUART_CPB) \
-	          $(FWUARTFLAGS) -o fw_uart_tb.vvp $(UART_RTL) fw_uart_tb.sv
-
-fwuart: $(UART_RTL) fw_uart_tb.sv
-	@$(MAKE) --no-print-directory fwvec
-	$(FWUARTBUILD)
-	$(VVP) fw_uart_tb.vvp $(if $(RERUN),+RERUN) $(if $(VCD),+VCD)
-
-# Where the run's clocks go: the same simulation, plus the testbench's optional
-# per-command timeline and the analysis that turns it into tables. This is the
-# CPU-overhead / unit-activity benchmark -- `idlec` says how much the CPU costs,
-# this says which phase it costs it in.
-#
-#   make fwtime FWPROG=adder
-#   make fwtime FWPROG=adder TLARGS=--per-command
-TIMELINE = $(FWVEC)/$(FWPROG).timeline.csv
-TLARGS  ?=
-
-fwtime: $(UART_RTL) fw_matmul_tb.sv cmd_timeline.py
-	@$(MAKE) --no-print-directory fwvec
-	$(FWBUILD)
-	$(VVP) fw_matmul_tb.vvp +CMDLOG=$(TIMELINE)
-	python cmd_timeline.py $(TIMELINE) -k $(FWPROG) \
-	       -t $(FWVEC)/$(FWPROG).trace.txt $(TLARGS)
-
-$(FWVEC):
-	mkdir -p $@
-
-# Both kernels over a range of shapes, tabulating what each costs the CPU.
-# Rebuilds the firmware per shape, so it needs the cross gcc like `make fw`.
-fwsweep: $(UART_RTL) fw_matmul_tb.sv run_fw_sweep.sh
-	sh ./run_fw_sweep.sh
-
-# Alias for `make TEST=uart_echo sim` (RTL_uart_echo above supplies the sources).
 echo:
 	@$(MAKE) --no-print-directory TEST=uart_echo sim
 
-# Alias for `make TEST=uart_memory sim`.
 mem:
 	@$(MAKE) --no-print-directory TEST=uart_memory sim
 
-# Alias for `make TEST=uart_bram sim`.
 bram:
 	@$(MAKE) --no-print-directory TEST=uart_bram sim
-
-# The Python host driving the RTL directly. sim_link.py compiles the testbench
-# itself (it has to pass +plusargs and own the process), so there is no iverilog
-# line here -- this target only exists so the entry point is where the others are.
-COSIM_ARGS ?=
-cosim:
-	python ../host/test_uart_link.py --sim $(COSIM_ARGS)
 
 wave: sim
 	@echo "open $(TOP).vcd in gtkwave"
@@ -273,11 +85,7 @@ wave: sim
 list:
 	@echo "available tests:"
 	@for t in $(TESTS); do echo "  make TEST=$$t"; done
-	@echo "firmware kernels (not in \`make all\` -- they need a RISC-V cross gcc):"
-	@for k in $(patsubst ../fw/%.c,%,$(wildcard ../fw/*.c)); do \
-		case $$k in memops) continue;; esac; \
-		printf "  make fw FWPROG=%-12s |  make fwuart FWPROG=%s\n" $$k $$k; \
-	done
+	@echo "whole-core kernels: python accel/test/run_suite.py -b rtl"
 
 all:
 	@for t in $(TESTS); do \
@@ -286,6 +94,4 @@ all:
 	done
 
 clean:
-	rm -f *_tb.vvp *_tb.vcd ex_*.vvp
-	rm -rf vec_*
-	rm -f model*.vvp
+	rm -f *_tb.vvp *_tb.vcd

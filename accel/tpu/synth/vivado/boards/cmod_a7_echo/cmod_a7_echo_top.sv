@@ -36,7 +36,7 @@ module cmod_a7_echo_top #(
     parameter int UART_CPB = 104,
 
     // Bytes per exchange: the device buffers this many, then sends them back.
-    // The host (host/uart_echo.py --block) must use the same number — there is
+    // The host must use the same number — there is
     // no framing on the wire to negotiate it with.
     parameter int BLOCK_LEN = 64,
 

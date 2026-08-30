@@ -91,6 +91,16 @@ start the fill for block *n+1*, then wait only for the fill that staged block *n
 automatic; queues do not. `tpulib.h`'s primitives are all self-fencing for that reason, and
 the one place two units deliberately run at once is its weight prefetch.
 
+### `cmd_queue.sv` implementation notes
+
+Storage is a plain 2-D array indexed by two wrapping pointers, which infers LUTRAM
+(distributed) at depth 8 rather than a block RAM. `head` is a combinational read of the
+storage, so a pop and the next command's decode are back to back with no bubble.
+
+A dropped write ($display in sim) means the producer pushed through `full` instead of
+stalling on it — that should never happen given the AXI-level stall above, so seeing the
+message means the flow-control assumption broke somewhere.
+
 ## Address map
 
 | Base | Size | Contents |
@@ -146,11 +156,11 @@ geometry. `0x22` is `quant4`; **new ops go at `0x23`+**.
 | Piece | Where | Test |
 | --- | --- | --- |
 | Per-run performance counters | `rtl/perf_counters.sv` | decoded from the `'T'` reply, checked per kernel |
-| MXU config strides | `mxu.sv` `a_row` / `c_row` / `w_row` | `make fw FWPROG=tiled` |
+| MXU config strides | `mxu.sv` `a_row` / `c_row` / `w_row` | `run_suite.py -b rtl -k tiled` |
 | `matmul_t` hardware tile loop | `mxu.sv` | `make fw`, `make fwsweep` |
 | 128-bit commands + per-unit queues | `cmd_queue.sv`, `cmd_{mxu,vpu,dma}.sv` | `make TEST=cmd_queue` |
 | PicoRV32 producer | `cpu_subsys.sv` + `rtl/vendor/picorv32.v` | `make TEST=cpu_smoke`, every `make fw` |
-| CPU scratchpad window | `cpu_subsys.sv` | `make fw FWPROG=spadwin` |
+| CPU scratchpad window | `cpu_subsys.sv` | `run_suite.py -b rtl -k spadwin` |
 
 Not built, and not planned:
 

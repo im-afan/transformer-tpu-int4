@@ -118,7 +118,7 @@ window reaches. That's the only fixed allocation — the rest is arena.
 ## ffn.c / mha.c / matmul.c — datapath smoke tests
 
 Small, fixed-shape kernels that exercise one piece of the pipeline each, with
-operands supplied by `accel/tpulang/fw_vectors.py` (which runs the kernel's own
+operands supplied by each kernel's `generate.py` (and the ISS, which runs the kernel's own
 command trace through `iss.py` for the golden result).
 
 - `matmul.c` — `C = requant(A @ W)`, the block grid walked in firmware; shape
@@ -148,7 +148,7 @@ Every other kernel drives the compute units; this one drives the memory they
 share, from the CPU — because `infer.c` depends on a path nothing else
 exercises: the CPU reading what the array computed and writing what no unit
 produced. `cpu_smoke_tb` proves the command aperture; this is the same kind of
-proof for the data window (`cd accel/tpu/tb && make fw FWPROG=spadwin`, ~1s).
+proof for the data window (`python accel/test/run_suite.py -b rtl -k spadwin`).
 
 Three things, none of which a DMA can do alone:
 - **Read** — a block fills from DRAM and the CPU reads all 16 words back,
@@ -187,7 +187,7 @@ Four problems, chosen for what they force rather than for what they compute:
 
 This is the one kernel that alone wouldn't test anything, because a tiling bug
 is something the ISS would reproduce as faithfully as the RTL. So
-`fw_vectors.py` also carries an independent `reference_tiled` and checks the
+`tests/tiled/generate.py` also carries an independent Python matmul and checks the
 ISS against a plain Python matmul before any vectors are written.
 
 ## memops.c — memcpy/memset for a freestanding build
@@ -206,38 +206,92 @@ and `--gc-sections` drops the file. It stays because that's a property of
 these kernels, not of the library: a kernel with genuinely runtime shapes gets
 the general path, gets a descriptor in memory, and needs this.
 
-## infer_rq.h — infer.c's default requant table
+## infer_config.h — the whole configuration, generated
 
-16 `{m0,n}` words per layer, in the block order `infer.c`'s enum declares. The
-word is `m0` in the low 12 bits and `n` above; the op computes
+`accel/test/export.py` writes it and `infer.c` includes it. Three things in one
+file: the shape, every DRAM address, and 14 `{m0,n}` requant words per layer in
+the block order `infer.c`'s enum declares (`INFER_RQ_SITES` is what catches the
+two lists drifting; the old `KP`/`VP` holes are gone with the `quant4` passes
+the MXU's int4 store replaced).
+
+A requant word is `m0` in the low 12 bits and `n` above; the op computes
 `clip((acc*m0 + 2**(n-1)) >> n)` — `[-8,7]` for every op but DYT, which clips
-to `[-7,7]`. `KP`/`VP` are retired holes from the `quant4` passes the MXU's
-int4 store replaced.
+to `[-7,7]`.
 
-**These are not a checkpoint's scales.** They're tuned for the synthetic
-operands `accel/tpulang/fw_vectors.py` stages, so `make fw FWPROG=infer` is a
-self-contained datapath regression with no model file involved. Too small and
-every tensor pins at the clip; too large and the model collapses to zeros — and
-an all-zero golden answer passes against any datapath at all, which is why
-`fw_vectors.py`'s reference warns when the generated sequence is constant.
-
-**Why this isn't `adder_rq.h`.** The two kernels shared one table while they
-were the same model. Both are `adder_int4_wide` now (`d=128, f=512`), but
-`adder.c` runs the whole `T=128` sequence and `infer.c` runs `T=64`, so `RQ_A`
-(set by the contraction over keys) differs; the rest of the row is the same
-arithmetic. A separate header stops a later shape change to one kernel from
-silently moving the other's table. Each shift here is one bit per doubling of
-the contraction that feeds it — how these carried over from the old d=64/T=32
-table: Q/K/V/O/H gained one (D 64->128), S gained one (head_dim 16->32), A
-gained one (T 32->64), F gained one (DFF 256->512).
-
-A real run overrides this file wholesale:
+**There is no checked-in default any more.** `tests/infer/generate.py` produces
+the header either way:
 
 ```
-python accel/tpulang/infer_export.py --model-path model/saved/int4_d128_f512_l4.pt
+python accel/test/tests/infer/generate.py --synthetic --gen 3 -n 1   # no checkpoint
+python accel/test/tests/infer/generate.py --model-path model/saved/int4_d128_f512_l4.pt
 ```
 
-which writes the same `ADDER_RQ_INIT` macro from the checkpoint's learned
-`ActQuant` scales and `Int4Linear` weight scales, and builds against it with
-`-DADDER_RQ_H`.
+`--synthetic` uses a hand-picked table over mixed-hash weights, which makes the
+kernel a self-contained datapath regression with no model file involved. Too
+small a shift and every tensor pins at the clip; too large and the model
+collapses to zeros — and an all-zero golden passes against any datapath at all,
+which is why the test warns when every generated token is the same.
+
+Each shift is one bit per doubling of the contraction that feeds it. At
+`d=64 / f=256 / T=64`: `Q`/`K`/`V`/`O`/`H` contract over `D`, `S` over
+`head_dim`, `A` over `T`, `F` over `DFF`; `X1`/`X2` add two int4 tensors and are
+bounded by 16.
+
+`INFER_RQ_LOGIT` is the output head's shift, not per-layer. The MXU requantizes
+on store, so the logits are int4 and this decides whether an argmax over them
+can separate anything: too small a shift pins every logit at the clip and the
+answer is token 0 every time. On the synthetic operands the raw head
+accumulator spans about ±40, so a shift of 3 lands it across the grid.
+
+A checkpoint's head accumulator is nowhere near ±40, so a real run derives the
+word instead. `export.logit_rq_word` takes it from the head weights alone, no
+calibration data: the residual stream reaching the head is a DyT output, so its
+codes are bounded by 7, and the largest accumulator column `j` can reach is
+`7 * sum_d |w[d][j]|`. Mapping that bound onto the top of the int4 grid is a
+multiplier that cannot clip. On `int4_d64_f256_l4.pt` the bound is 1071 against
+a measured span of ±734, so the word is `{m0=214, n=15}` — about 1/153, where
+the synthetic shift of 3 clipped 78% of the logits and preserved only 68% of
+the reference argmaxes.
+
+## mock/tpu_trace.c — the host-side implementation of tpu.h's four primitives
+
+Link this against any firmware kernel with `-DTPU_TRACE` and the host
+compiler, and running the result prints the kernel's command trace instead of
+executing it. The kernel source is unmodified:
+
+```
+cc -DTPU_TRACE -I.. mock/tpu_trace.c matmul.c -o matmul.trace
+./matmul.trace > trace.txt
+```
+
+Format, one record per line, all hex, consumed by `accel/test/backends.py`:
+
+```
+CMD  <unit> <w0> <w1> <w2> <w3>     one 128-bit macro-op
+WAIT <unit>                         a producer barrier on that unit
+SRD  <addr>                         the CPU read a scratchpad word
+SWR  <addr> <val>                   the CPU wrote one
+```
+
+`WAIT` has no hardware effect — it is a spin on the retired counter — but it
+is recorded because cross-unit ordering is software's job, so a missing
+barrier is a real firmware bug and the trace is where it shows. The ISS
+executes commands in trace order, which is the strongest ordering any correct
+barrier placement can produce, so a trace missing a barrier still yields
+correct golden images here and diverges on the RTL. That asymmetry is
+deliberate: the images stay a statement of intent, and the RTL run is what
+tests ordering.
+
+**Co-execution.** `SRD` is the one record that needs an answer: a kernel that
+argmaxes a tensor (`fw/infer.c`) issues commands whose addresses depend on
+what the array computed, so its trace cannot be produced by a program with no
+model of the machine. So this one asks instead of modelling. After printing
+`SRD` it blocks on stdin for a line of hex, and the driver on the other end of
+the pipe (`ISSBackend._coexecute`) is the ISS: it executes each `CMD` as it
+arrives and answers the read out of its own scratchpad.
+
+With no driver — a plain `make trace`, stdin at EOF — a read returns 0 and
+warns once. The command sequence is then still the right shape but the
+numbers in it are meaningless, which is all `make trace` can give for a
+kernel that branches on its own results.
 </content>

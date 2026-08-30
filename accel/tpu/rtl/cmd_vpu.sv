@@ -1,28 +1,6 @@
 `timescale 1ns/1ps
-// -----------------------------------------------------------------------------
-// cmd_vpu.sv — VPU macro-op front end: command queue + decode + sequencing
-//
-// Same shape as cmd_mxu.sv (read that one first — the reasoning about why a
-// GEOM command is not the config register file coming back applies verbatim).
-//
-//   VPU_OP    one vector pass: the VOP_* selector, dst/src0/src1, `vlen`, and
-//             the requant {m0,n} as a literal. It is the only command this
-//             unit has.
-//
-// There used to be a second, VPU_GEOM (0x02), carrying vecmatmul's row/column
-// counts and the four row strides. VOP_VECMATMUL was the only op that read the
-// geometry and it is gone (rtl/vpu.sv header), so the command, the sticky
-// registers behind it and the five outputs they drove went with it. **0x02 is
-// a retired hole**: a stale stream carrying a GEOM hits the unknown-command
-// path below and is discarded with a `$display`, rather than decoding as
-// something else.
-//
-// `src1` and the requant word occupy different fields even though no op uses
-// both: requant/dyt/quant4 used to pass the {m0,n} *address* in the src1 slot
-// (scalar_unit.sv's `vpu_scalar = r_src1`). Now that the word is a literal there
-// is no reason to overlap them, and keeping them apart means the decode does not
-// depend on the opcode.
-// -----------------------------------------------------------------------------
+// VPU macro-op front end: command queue + decode. Same shape as cmd_mxu.sv.
+// See docs/vpu.md for the retired VPU_GEOM (0x02) / VECMATMUL history.
 
 module cmd_vpu #(
     parameter int ADDR_W = 16,

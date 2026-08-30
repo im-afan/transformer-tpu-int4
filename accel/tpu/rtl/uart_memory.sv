@@ -1,44 +1,5 @@
-// -----------------------------------------------------------------------------
-// uart_memory.sv — UART command link + external SRAM, with the TPU removed.
-//
-// tpu_top minus the machine: scalar unit, MXU, VPU, scratchpad and the DMA
-// engine are gone, and with them the SRAM arbitration mux (there is only one
-// requester left, so `mem_* = uart_mem_*` unconditionally). What remains is
-// exactly the path host/test_uart_link.py exercises — uart_receiver ->
-// uart_interface -> sram_controller -> the chip pins, and back — instantiated
-// from the same unmodified files the production image uses, at the same pinout.
-//
-// This is the middle rung of the ladder in docs/uart_selftest.md:
-//
-//   cmod_a7        everything. The image that fails.
-//   cmod_a7_mem    this one: the protocol and the memory, no core.
-//   cmod_a7_bram   the protocol only — same FSM, on-chip block RAM behind it.
-//   cmod_a7_echo   neither. Just the wire framing. Runs clean for 5 minutes.
-//
-// So it splits the remaining search space in half. If test_uart_link.py still
-// corrupts against this image, the fault is in uart_interface or
-// sram_controller — nothing else is left. If it runs clean, the fault needs the
-// core present, which points at the arbitration mux, `core_busy`, or the DMA
-// engine's half of the shared controller, none of which the echo image could
-// say anything about.
-//
-// rtl/uart_bram.sv is the next cut after this one, and the only one that
-// separates the two suspects this image leaves: identical protocol, identical
-// uart_interface, bram_controller in place of sram_controller.
-//
-// Two things behave differently to tpu_top, both deliberate and both visible
-// only to commands this rig is not meant to be driven with:
-//
-//   * 'I' (write IMEM) and 'G' (go) are still decoded, still range-checked and
-//     still ACK'd, because uart_interface is instantiated unmodified — but
-//     there is no instruction memory and no core, so the write lands nowhere
-//     and the run never starts. Use 'R'/'W' only.
-//   * `core_busy` is tied low, so nothing is ever NAK'd for arbitration. That
-//     is the point: it removes the core's claim on the controller from the
-//     experiment entirely.
-//
-// The status outputs are instrumentation, not decoration — see `collision`.
-// -----------------------------------------------------------------------------
+// UART command link + external SRAM, with the TPU core removed. See
+// docs/uart_selftest.md.
 
 module uart_memory #(
     // ---- UART host link ------------------------------------------------------
@@ -222,36 +183,10 @@ module uart_memory #(
         .rx_overrun (uart_rx_overrun)
     );
 
-    // =========================================================================
-    // Instrumentation.
-    //
-    // `rx_byte` is derived exactly as uart_interface.sv:116 derives it — the
-    // rising edge of the receiver's `valid`, which is a level held from STOP
-    // until half way through the next start bit. Counting it here means the
-    // status logic sees precisely the bytes the command FSM sees, no more.
-    //
-    // `collision` is the one output worth watching. It sets on either of two
-    // things, both of which mean "the host got ahead of the device":
-    //
-    //   * a byte landed while the device was mid-transmit. On this link the host
-    //     is the sole master and waits for each reply before sending the next
-    //     command, so it should never happen. Since uart_interface grew its RX
-    //     holding register this is survivable rather than fatal — the byte is
-    //     kept, not dropped — so it is now information about the *host*, not a
-    //     device fault on its own.
-    //   * uart_interface's `rx_overrun`: a byte arrived with the holding
-    //     register still full, so one really was lost. That is the fault.
-    //
-    // Either way the evidence is a one-clock event that a 4 kB block will have
-    // buried by the time the host notices, so it is caught here, on an LED, with
-    // no host involvement.
-    //
-    // Sticky until reset, like uart_echo's `overflow`: the interesting event is
-    // "did this ever happen", and a one-clock pulse 40 minutes into a soak is
-    // not something anyone is watching for.
-    // =========================================================================
+    // Instrumentation. See docs/uart_selftest.md for `collision`'s two trigger
+    // conditions.
     logic uart_rx_valid_prev;
-    wire  rx_byte = uart_rx_valid & ~uart_rx_valid_prev;
+    wire  rx_byte = uart_rx_valid & ~uart_rx_valid_prev;   // rising edge of receiver valid
 
     // The transmitter asserts `busy` the cycle *after* it accepts `start`, so
     // the strobe has to be OR'd in or the first cycle of every frame would look

@@ -1,41 +1,6 @@
 `timescale 1ns/1ps
-// -----------------------------------------------------------------------------
-// cpu_subsys.sv — PicoRV32 + AXI4-Lite fabric + the macro-op MMIO aperture
-//
-// The second command producer. `scalar_unit.sv` packs the 32-bit tpulang ISA
-// into commands; this packs whatever the firmware stores into the command ports.
-// Both push into the same cmd_mxu/cmd_vpu/cmd_dma queues, and tpu_top arbitrates
-// (docs/picorv32_migration.md §11 phase 4 — both live at once so the existing
-// .tpu suite stays a regression while the C path is brought up).
-//
-//     picorv32_axi ──AXI4-Lite──► [ decode ] ──► firmware RAM   0x0000_0000
-//                                            ├─► MMIO / cmd     0x8000_0000
-//                                            └─► scratchpad     0x9000_0000
-//
-// ONE SLAVE, NOT AN INTERCONNECT. PicoRV32 has a single outstanding transaction,
-// so the three regions are decoded inside one AXI4-Lite slave FSM rather than
-// behind a crossbar. That is the whole "fabric": ~120 lines, no arbitration, no
-// outstanding-transaction tracking.
-//
-// TOPOLOGY A of the migration doc §6: everything, instruction fetch included,
-// goes over AXI4-Lite. It is the simple one and it costs about 1.4% of total
-// runtime against tightly coupling the RAM to the core's native port, which is
-// affordable at the adder model's arithmetic intensity and measurable with the
-// `starved` counters if it ever stops being. Topology B is a later swap of this
-// file's insides, not of its interface.
-//
-// COMMAND PORTS ARE 4-WORD APERTURES, COMMIT ON THE LAST WORD. Writes to +0x0,
-// +0x4, +0x8 stage into a register; the write to +0xC assembles the 128 bits and
-// pushes. Four stores are therefore atomic with respect to the queue with no
-// separate trigger store, and a torn command cannot be enqueued. If the target
-// queue is full the +0xC write does not complete — `bvalid` is withheld, the CPU
-// stalls inside the store, and flow control needs no software at all. Only data
-// dependencies are the program's problem (§4).
-//
-// HALT. The firmware writes MMIO_DONE and then spins; `ebreak` traps and does
-// the same thing. Either raises `cpu_done`, which tpu_top reports to the host
-// exactly where the scalar unit's HALT used to.
-// -----------------------------------------------------------------------------
+// PicoRV32 + AXI4-Lite fabric + the macro-op MMIO aperture: the second command
+// producer, alongside scalar_unit.sv. See docs/picorv32_migration.md.
 
 module cpu_subsys #(
     parameter int ADDR_W     = 16,   // scratchpad byte address
@@ -144,14 +109,10 @@ module cpu_subsys #(
 
     initial if (FW_INIT != "") $readmemh(FW_INIT, fw_mem);
 
-    // The array is driven from its own reset-free process, below. Writing it
-    // from the AXI FSM's `always_ff @(posedge clk or negedge rst_n)` instead
-    // puts the memory in a block with an asynchronous reset, and Vivado will
-    // not infer a block RAM from that -- it falls back to registers, and
-    // 4096x32 bits is far past the limit at which that is even attempted
-    // ("Unable to infer a block/distributed RAM for 'fw_mem_reg'", Synth
-    // 8-3391). The two write sources are mutually exclusive: the host load
-    // runs only while the core is held in reset.
+    // fw_mem is written from its own reset-free process below: an asynchronously
+    // reset always_ff blocks Vivado's block-RAM inference here (Synth 8-3391).
+    // The two write sources are mutually exclusive: the host load runs only
+    // while the core is held in reset.
     logic [FW_AW-1:0] fw_wr_addr;
     logic [3:0]       fw_wr_strb;
     logic [31:0]      fw_wr_data;

@@ -3,7 +3,7 @@
 // cpu_smoke_tb.sv — PicoRV32 as the command producer, end to end
 //
 // The scalar unit's path is covered by tpu_top_tb / tpu_top_uart_tb, which run
-// real tpulang programs against golden vectors. This test covers the *other*
+// real programs against golden vectors. This test covers the *other*
 // producer: boot the CPU out of firmware RAM and check that a store to a command
 // port actually moves bytes.
 //

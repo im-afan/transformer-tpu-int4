@@ -4,7 +4,7 @@
 //
 // Third board target on the same physical board, sitting between the other two:
 //
-//   cmod_a7        the full TPU. The image test_uart_link.py corrupts against.
+//   cmod_a7        the full TPU.
 //   cmod_a7_mem    this one: uart_receiver/interface/transmitter + the real
 //                  sram_controller driving the real chip. No core.
 //   cmod_a7_echo   receiver and transmitter only, wired back to back.
@@ -23,11 +23,11 @@
 //   vivado -mode batch -source build.tcl -tclargs board=cmod_a7_mem mode=deploy
 //
 // Output lands in synth/build/cmod_a7_mem/, so the three bitstreams cannot be
-// mistaken for one another. host/test_uart_link.py drives this image unchanged
+// mistaken for one another. A host driver reaches this image unchanged
 // as long as it is restricted to the SRAM tests — 'I' and 'G' are decoded and
 // ACK'd here but do nothing, there being no instruction memory and no core:
 //
-//   python accel/tpu/host/test_uart_link.py -p COM5 --only sram_roundtrip
+//   accel/test/tpu_uart.py's write_mem / read_mem, against this bitstream
 //
 // LEDs:
 //   led[0]  ~1.4 Hz heartbeat normally; a fast blink if a host byte ever arrived

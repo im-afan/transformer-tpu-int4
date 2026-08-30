@@ -87,7 +87,7 @@ Defaults live in `boards/cmod_a7/board.tcl`:
 | `mem_addr_w` | 19 | Cmod A7 cellular SRAM is 512K x 8 |
 | `clk_mhz` | 12 | The board's only oscillator |
 | `cpb` | derived | `clk_mhz * 1e6 / baud` = **104** |
-| `uart_rx_timeout` | 0 | Disabled — see the hardening note in `../host/README.md` |
+| `uart_rx_timeout` | 0 | Disabled — see the hardening note in `uart_host.md` |
 
 **Why 8x8.** Every kernel and golden vector is written against it. It is also the only size
 in the right order of magnitude for this part: a 128x128 array is 16 384 PEs each holding a
@@ -200,11 +200,10 @@ The wrapper exposes no parallel host port, so everything happens over the serial
 
 ```bash
 # link and SRAM first
-python accel/tpu/host/test_uart_link.py -p COM5
+python accel/test/run_suite.py -b board -p COM5 -k matmul
 
 # then a kernel, then the model
-python accel/tpu/host/run_fw_matmul.py -p COM5
-python accel/tpu/host/run_adder.py -p COM5 -n 8
+python accel/test/tests/infer/generate.py -b board -p COM5 -n 8
 ```
 
 Known functional gap, matching simulation: `nb_*` (the inter-TPU link) is stubbed in

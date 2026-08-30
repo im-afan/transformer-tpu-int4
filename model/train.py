@@ -38,10 +38,7 @@ def train(
     batch_steps = 0
     saved_models = []
 
-    # Gradient-norm bookkeeping, reported alongside the loss. clip_grad_norm_
-    # returns the norm *before* clipping, which is the diagnostic that matters
-    # when chasing a blow-up: the mean says whether the run is drifting, the max
-    # says whether a single batch spiked.
+    # Gradient-norm bookkeeping, reported alongside the loss (pre-clip).
     gnorm_sum = 0.0
     gnorm_max = 0.0
     gnorm_count = 0
@@ -69,9 +66,7 @@ def train(
             steps += 1
             batch_steps += 1
             if batch_steps % steps_per_batch == 0:
-                # Clip the fully accumulated gradient, i.e. immediately before the
-                # step. Clipping each micro-batch instead would bound the partial
-                # sums separately and give a different (smaller) effective bound.
+                # Clip the fully accumulated gradient, not each micro-batch.
                 if grad_clip:
                     gnorm = torch.nn.utils.clip_grad_norm_(
                         model.parameters(), grad_clip

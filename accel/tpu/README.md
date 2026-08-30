@@ -9,35 +9,32 @@ against vectors produced from that reference.
 
 ## Current state
 
-- **One command producer.** PicoRV32 firmware in [`fw/`](fw/README.md) pushes 128-bit
-  macro-ops through an MMIO aperture into per-unit queues. The scalar unit, the `.tpu`
-  language and the assembler are deleted.
-- **The whole model runs on it.** [`fw/infer.c`](fw/infer.c) is prefill + KV-cached decode
-  with the argmax and the embedding gather on the device; the host tokenizes and nothing
-  else.
+- **One command producer.** PicoRV32 firmware built out of [`fw/`](fw/README.md) pushes
+  128-bit macro-ops through an MMIO aperture into per-unit queues. The scalar unit, the
+  `.tpu` language and the assembler are deleted.
+- **The whole model runs on it.** [`../test/tests/infer/infer.c`](../test/tests/infer/infer.c)
+  is prefill + KV-cached decode with the argmax and the embedding gather on the device; the
+  host tokenizes and nothing else.
 - **It fits.** Last `make bit`: **17 606 LUTs of 20 800 (85%)**, 10 903 FFs, 4 RAMB36 +
   64 RAMB18, 46 DSPs, WNS **+34.98 ns**, all constraints met. That bitstream predates the
   last few RTL edits — re-synthesize before quoting it. See [`docs/synth.md`](docs/synth.md).
 - Board geometry is an **8x8 array**, 64 KB scratchpad (`ADDR_W=16`), 512 KB external SRAM
   (`MEM_ADDR_W=19`), 12 MHz core clock.
 
-### Known mismatch, as of this writing
+### One shape, in one place
 
-`fw/adder.c` is still compiled at the **old narrow shape** (`T=32, D=64, DFF=256`) with
-the old DRAM map, while `tpulang/fw_vectors.py` and `tpulang/adder_export.py` have both
-moved to `d=128 / f=512 / T=128` at a different map. Until `adder.c` is migrated, the
-teacher-forced path (`make fw FWPROG=adder`, `adder_export.py`) does not line up.
-`fw/infer.c` is the migrated one, and is currently built with `LAYERS 2` rather than the
-config's 4.
+`infer.c` computes no addresses of its own. `accel/test/export.py` derives the shape from
+the checkpoint, computes the whole DRAM map, and writes `infer_config.h`; the kernel
+includes it. There is nothing left to keep in step by hand, and no shape `-D` knobs in
+`fw/Makefile`.
 
 ## Directory layout
 
 | Path | Contents |
 | --- | --- |
 | `rtl/` | Synthesizable SystemVerilog: `mxu.sv`, `vpu.sv`, `scratchpad.sv`, `dma.sv` + `sram.sv`, `cpu_subsys.sv` (PicoRV32 + AXI4-Lite), the `cmd_*.sv` queues, the UART blocks, and `tpu_top.sv`. No `rtl/luts/` — the activation ROMs went with the removed VPU ops, so the design reads no `$readmemh` file by default. |
-| `fw/` | C firmware: `tpu.h` (MMIO + one builder per command), `tpulib.h` (size-independent primitives), one `.c` per kernel, `start.S`, linker script, Makefile. Needs a RISC-V cross gcc. |
-| `tb/` | Icarus testbenches, one per block, plus two that run any C kernel through the whole core: `fw_matmul_tb.sv` (`make fw`) backdoors the image in; `fw_uart_tb.sv` (`make fwuart`) loads it over the simulated serial link exactly as the board host does. `vectors_fw/` holds golden vectors regenerated per run. |
-| `host/` | Python host: `tpu_uart.py` (the protocol), `run_adder.py` (the model generating on the board), `run_fw_matmul.py` (a kernel vs. the ISS), link self-tests. |
+| `fw/` | The firmware **library**: `tpu.h` (MMIO + one builder per command), `tpulib.h` (size-independent primitives), `start.S`, `memops.c`, linker script, `bin2hex.py`, Makefile. The kernels themselves live with their vectors in `../test/tests/`. Needs a RISC-V cross gcc. |
+| `tb/` | Icarus testbenches, one per block (`make TEST=mxu`, `make all`), plus two that run any C kernel through the whole core: `fw_matmul_tb.sv` backdoors the image in, `fw_uart_tb.sv` loads it over the simulated serial link. Both are driven by `accel/test`'s `RTLBackend`, not by this Makefile. `core.f` is the whole-core file list they share. |
 | `synth/` | Vivado non-project build (`synth/vivado/build.tcl`), per-board definitions under `synth/vivado/boards/<board>/`. Output in `synth/build/` (gitignored). |
 | `constraints/` | One `.xdc` per target board. |
 | `docs/` | Per-block design notes. Start at [`docs/README.md`](docs/README.md). |
@@ -45,8 +42,8 @@ config's 4.
 
 Four board targets under `synth/vivado/boards/`: `cmod_a7` (the real design), `cmod_a7_mem`
 and `cmod_a7_bram` (memory-path bring-up), `cmod_a7_echo` (the UART self-test image).
-**Reflash `board=cmod_a7` before running `host/test_uart_link.py` or `host/run_adder.py`** —
-they time out against the echo bitstream.
+**Reflash `board=cmod_a7` before running anything on `-b board`** — it times out against
+the echo bitstream, and `synth/build/` is not rebuilt by `mode=program`.
 
 ## The software layers
 
@@ -56,8 +53,8 @@ they time out against the echo bitstream.
   blocks in rows, columns and the contraction and stages whatever is in DRAM; chunked
   elementwise pairs; transposes and 2-D block moves. Every primitive is self-fencing, so
   composing two is always safe.
-- [`../tpulang`](../tpulang) — the bit-exact ISS, the golden-vector generator that drives
-  it from a kernel's own command trace, and the checkpoint exporters.
+- [`../test`](../test/README.md) — the bit-exact ISS, the three backends that run a kernel
+  (native/ISS, RTL, board), the per-kernel vector generators, and the checkpoint exporter.
 
 ## Known gaps
 
@@ -65,7 +62,7 @@ they time out against the echo bitstream.
 - `UART_RX_TIMEOUT` is 0 in every board definition, so a corrupted frame wedges the
   receive FSM until reflash. Setting it to `20 * UART_CPB` makes a corrupted frame cost
   one legible timeout instead. That is hardening — the actual corruption bug was on the
-  host and is fixed (see [`host/README.md`](host/README.md)).
+  host and is fixed (see [`docs/uart_host.md`](docs/uart_host.md)).
 - Nothing overlaps except the weight prefetch in `tpu_matmul`: every other primitive
   fences after each cross-unit dependency. `docs/scheduler_plan.md` is the sketch for
   doing better in hardware.

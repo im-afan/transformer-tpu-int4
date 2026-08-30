@@ -17,6 +17,12 @@ every `examples/*.tpu` are deleted. PicoRV32 firmware is the only command produc
 | 3 | **done** — `-DTPU_TRACE` mock `tpu.h`, `iss.py` re-fronted onto command traces, RTL command-trace monitor, `fw_vectors.py` |
 | 4 | **done** — `cpu_subsys.sv`, then `tpu.h`, `tpulib.h` and the model kernels |
 | 5 | **done** — scalar unit and the whole tpulang toolchain deleted |
+
+> **The commands in this record no longer exist.** `make fw`, `make fwuart`, `make fwtime`
+> and `make cosim` were replaced by `accel/test`'s three backends
+> (`python accel/test/run_suite.py -b iss|rtl|rtl-uart|board`), and `fw_vectors.py` by
+> `vector_generator.py` + `ISSBackend`. The measurements below still stand; the way to
+> reproduce them changed. See [`../../test/README.md`](../../test/README.md).
 | 6 | **done** — a second architecture (`infer.c`, KV-cached decode) as a new `.c` file, no RTL change |
 
 ### What passes today
@@ -193,6 +199,14 @@ at `-Os`, so the three entry points that see the shape are `always_inline`. That
 image **smaller** — 1 992 B against 6 420 B without the fold — because the general paths
 become dead code at every site.
 
+The firmware now builds at `-O2` (`OPT` in `fw/Makefile`) rather than `-Os`, and that is not
+a tuning choice. `tpulib.h` sizes its arena slots by dividing the spare bytes by the shape,
+and the divisors — `depth_bytes + c_slot_row` and friends — are not powers of two. At `-Os`
+gcc emits a `__udivsi3` call for each of them instead of folding or expanding them inline;
+`rv32ic_zmmul` has no divider, the link is `-nostdlib`, and this toolchain ships no rv32
+libgcc, so `infer.c` does not link at all. At `-O2` every one of them folds. `always_inline`
+is still doing the work described above — `-O2` alone does not inline the entry points.
+
 What remains against the hand-written kernel is **+3.2%**: 16 more commands (`Wq`/`Wk`/`Wv`
 are three dense blocks rather than one fused `[D][3D]` one, because a column slice of a
 fused block is strided) and 36 more barriers, half of them the drain at the end of every
@@ -294,6 +308,39 @@ as faithfully as the hardware.
 So `fw_vectors.py` carries `reference_tiled` (a plain Python matmul) and `reference_infer`
 (the whole model recomputed in integer numpy at every step, with no cache at all), and checks
 the ISS against them before any vector file is written.
+
+## `cpu_subsys.sv`: PicoRV32 + AXI4-Lite fabric
+
+The second command producer, alongside `scalar_unit.sv`'s tpulang path — both push into the
+same `cmd_mxu`/`cmd_vpu`/`cmd_dma` queues, and `tpu_top` arbitrates, so the two can coexist
+while the C path comes up.
+
+```
+picorv32_axi ──AXI4-Lite──► [ decode ] ──► firmware RAM   0x0000_0000
+                                       ├─► MMIO / cmd     0x8000_0000
+                                       └─► scratchpad     0x9000_0000
+```
+
+**One slave, not an interconnect.** PicoRV32 has a single outstanding transaction, so the
+three regions are decoded inside one AXI4-Lite slave FSM rather than behind a crossbar —
+the whole "fabric" is ~120 lines, no arbitration, no outstanding-transaction tracking.
+
+**Topology A**: everything, instruction fetch included, goes over AXI4-Lite. The simple
+option; it costs about 1.4% of total runtime against tightly coupling the RAM to the core's
+native port, affordable at the adder model's arithmetic intensity and measurable with the
+`starved` counters if that stops being true. Topology B would swap this file's insides, not
+its interface.
+
+**Command ports are 4-word apertures that commit on the last word.** Writes to +0x0, +0x4,
++0x8 stage into a register; the write to +0xC assembles the 128 bits and pushes. Four stores
+are therefore atomic with respect to the queue with no separate trigger store, and a torn
+command cannot be enqueued. If the target queue is full the +0xC write does not complete —
+`bvalid` is withheld, the CPU stalls inside the store, and flow control needs no software at
+all. Only data dependencies are the program's problem.
+
+**Halt.** The firmware writes `MMIO_DONE` and then spins; `ebreak` traps and does the same
+thing. Either raises `cpu_done`, which `tpu_top` reports to the host exactly where the scalar
+unit's `HALT` used to.
 
 ## Area
 

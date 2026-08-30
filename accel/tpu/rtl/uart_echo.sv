@@ -1,38 +1,5 @@
-// -----------------------------------------------------------------------------
-// uart_echo.sv — UART block-loopback self-test core.
-//
-// Receives BLOCK_LEN bytes into a register file, then sends those BLOCK_LEN
-// bytes back, then repeats. No commands, no addresses, no modes: the block
-// length is the whole protocol, fixed at synthesis, and the core runs from reset
-// until power-off.
-//
-// This exists to shrink the search space behind the intermittent corruption on
-// the real link (docs/uart_selftest.md). A bad byte there could come from
-// uart_receiver, uart_transmitter, uart_interface, the SRAM controller, the
-// arbitration mux, the cable or the host; built into cmod_a7_echo_top this
-// deletes four of those. It deliberately instantiates the *same* receiver and
-// transmitter the production image uses, unmodified — an instrument that alters
-// the thing it measures is worthless.
-//
-// Store-and-forward rather than a streaming echo, and that is a real change of
-// what is measured, stated up front:
-//
-//   * The link is now half duplex by construction. The device never transmits
-//     while it is receiving, so TX→RX crosstalk and the receiver's behaviour
-//     under simultaneous transmit are no longer exercised. A streaming echo
-//     covered those; this does not.
-//   * In exchange it reproduces the *turnaround* the production protocol has:
-//     a burst in, a gap, a burst out, then the host's next byte arriving right
-//     after the reply ends. That gap is where uart_interface's blind
-//     SEND_STATUS window sat, so this is the shape of the real traffic.
-//   * A byte that arrives while the reply is going out has nowhere to go. It is
-//     dropped and flagged on `overrun` (sticky), so the host outrunning the
-//     turnaround is a visible event rather than a silent corruption.
-//
-// And the limitation an echo of any shape carries: it cannot separate "the
-// receiver read the byte wrong" from "the transmitter sent it back wrong". A
-// mismatch here implicates both blocks, which is still a large narrowing.
-// -----------------------------------------------------------------------------
+// UART block-loopback self-test core: receives BLOCK_LEN bytes, sends them
+// back, repeats. See docs/uart_selftest.md.
 
 module uart_echo #(
     parameter int CLK_PER_BIT = 104,  // 12 MHz / 115200 baud
@@ -87,28 +54,12 @@ module uart_echo #(
         .busy    (tx_busy)
     );
 
-    // `rx_valid` is a level, not a pulse: uart_receiver raises it entering STOP
-    // and only clears it half way through the *next* start bit. So one new byte
-    // is one rising edge — the same thing uart_interface.sv derives as `rx_byte`.
-    // Matching it matters: this core should see exactly what the real consumer
-    // sees, including any byte the receiver merges or invents.
+    // rx_valid is a level (STOP through half the next start bit), so this is
+    // the rising edge — one pulse per byte, matching uart_interface's rx_byte.
     logic rx_valid_prev;
     wire  rx_byte = rx_valid & ~rx_valid_prev;
 
-    // =========================================================================
-    // Block buffer and sequencer.
-    //
-    // One counter serves both phases — it can, because they never overlap: RECV
-    // fills 0..BLOCK_LEN-1 and hands over to SEND, which drains the same indices
-    // and hands back. That is the whole state: `state` plus `cnt`.
-    //
-    // SEND returns to RECV when the *last* byte is handed to the transmitter,
-    // not when it has finished leaving the pin, so the final frame is still on
-    // the wire for ~10 bit periods afterwards. That is deliberate: a host which
-    // waits for all BLOCK_LEN bytes before sending again is unaffected, and one
-    // which starts early gets its byte accepted instead of counted as an
-    // overrun.
-    // =========================================================================
+    // RECV/SEND sequencer; see docs/uart_selftest.md "Design notes".
     logic [7:0]       block_mem [0:BLOCK_LEN-1];
     logic [CNT_W-1:0] cnt;
 
@@ -157,17 +108,10 @@ module uart_echo #(
                 end
 
                 SEND: begin
-                    // Nothing is listening this phase. Record it rather than
-                    // dropping it quietly — the host outrunning the turnaround
-                    // and the link corrupting a byte look identical from the
-                    // other end otherwise.
+                    // Nothing is listening this phase; flag it rather than drop it silently.
                     if (rx_byte) overrun <= 1'b1;
 
-                    // Same shape as uart_interface's RD_TX ("if not busy, strobe
-                    // start and hand over the byte"), so the transmitter is
-                    // driven exactly as it is in the production design. The
-                    // !tx_start guard covers the cycle after the strobe, before
-                    // the transmitter has had time to assert `busy`.
+                    // !tx_start covers the cycle after the strobe, before `busy` asserts.
                     if (!tx_start && !tx_busy) begin
                         tx_data  <= block_mem[cnt];
                         tx_start <= 1'b1;

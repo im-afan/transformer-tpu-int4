@@ -1,41 +1,5 @@
-/*
-On-chip block-RAM controller — a drop-in stand-in for sram_controller (rtl/sram.sv).
-
-Same user-side contract, clock for clock: a range request (start/we/addr/len/
-stride) latched on `start`, `busy` high from the accept cycle, a `dout_valid`
-pulse per byte read, a ready/valid stream for the bytes written, and a one-cycle
-`done` at the end. The FSM below is sram_controller's FSM with the chip pins
-removed and the storage moved inside the FPGA; CLOCKS_PER_ACCESS is honoured even
-though nothing here needs the wait, because the *point* is that the two behave
-identically.
-
-That is not decoration. This block exists so boards/cmod_a7_bram can run the UART
-command protocol with the external memory taken out of the picture (see
-rtl/uart_bram.sv). If it completed a transfer in one clock instead of the
-controller's beat, every turnaround in uart_interface would shift and the image
-would no longer be a controlled comparison against boards/cmod_a7_mem — it would
-just be a different design that also happens to work. Keep the latency equal.
-
-Two things genuinely differ from the SRAM, both unavoidable:
-
-  * Capacity. ADDR_W is the *protocol* address width (19 bits, 512 KiB) and
-    DEPTH_W is what is actually built. 2**19 bytes will not fit in an
-    Artix-7 35T (1800 Kb of block RAM total), so addresses above 2**DEPTH_W
-    alias down onto the implemented window — addr[DEPTH_W-1:0] is the index and
-    the high bits are discarded. Deterministic, so a write and a read of the same
-    address still agree, but two addresses 2**DEPTH_W apart are the same byte.
-    `aliased` goes sticky-high the first time it happens so this is a visible
-    event rather than a silent one; see rtl/uart_bram.sv for what it drives.
-  * There is no bidirectional bus, no output enable and no chip select, so
-    nothing here can be defeated by bus contention, drive strength, or the 30
-    bank-14 pins switching. Removing exactly that is the reason the image exists.
-    The write pulse goes with them: sram_controller's two-clock write beat exists
-    to place a WE# edge safely inside it, and a synchronous BRAM has no such
-    edge — but the beat length is kept anyway, for the reason above.
-
-Storage comes up all-zero, matching a configured BRAM (the simulation-only
-initial block below makes the two agree; hardware needs no help).
-*/
+// On-chip block-RAM controller — a drop-in stand-in for sram_controller
+// (rtl/sram.sv), same user-side contract and beat timing. See docs/uart_selftest.md.
 
 module bram_controller #(
     parameter integer CLOCKS_PER_ACCESS = 0,   // held equal to sram_controller's
@@ -113,16 +77,9 @@ module bram_controller #(
         end
     endgenerate
 
-    // =========================================================================
-    // The memory. One address, mutually exclusive read/write enables — the
-    // single-port no-change template Vivado infers as a RAMB. DEPTH_W = 16 is
-    // 16 RAMB36 tiles (4 KiB each in x9 mode) of the 35T's 50.
-    //
-    // Both enables land on the beat's last clock, which is where sram_controller
-    // samples the asynchronous chip bus and where its WE# pulse has just ended.
-    // `q` is therefore loaded on the same edge as the SRAM's `dout` register,
-    // and is driven out directly rather than re-registered.
-    // =========================================================================
+    // Single-port no-change template Vivado infers as a RAMB. Both enables land
+    // on the beat's last clock, matching when sram_controller's WE# pulse ends,
+    // so `q` loads on the same edge as the SRAM's `dout` register.
     (* ram_style = "block" *) logic [DATA_W-1:0] mem [0:DEPTH-1];
     logic [DATA_W-1:0] q;
 
@@ -147,9 +104,7 @@ module bram_controller #(
     end
 // synthesis translate_on
 
-    // =========================================================================
     // FSM — sram_controller's, unchanged apart from the chip pins.
-    // =========================================================================
     always_ff @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
             state      <= IDLE;

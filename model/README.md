@@ -10,8 +10,6 @@ model/
   numbers_data.py           synthetic addition dataset + tokenizer
   train.py                  training loop
   make_dummy_checkpoint.py  an UNTRAINED checkpoint, for exercising accel/ plumbing
-  quant.py                  hardware-exact int8 benchmark  (legacy, ternary-era)
-  calibrate.py              PTQ activation calibration     (legacy, ternary-era)
   tests/test_inference.py   load a checkpoint, decode a batch, eyeball it
   saved/                    checkpoints (gitignored)
 ```
@@ -68,7 +66,8 @@ token   3  2  1  +  5  4  N..N  N  =  8  6  1  N.. N
   before the `=`. `generate_addition_expression` raises if they do not.
 - `train.py` and `test_inference.py` slice with the constant rather than searching for
   `=`. Logits at `EQUALS_POS - 1` predict the digit at `EQUALS_POS`.
-- `equals_pos` is a per-call argument. `accel/tpulang/infer_export.py` pins it to 32,
+- `equals_pos` is a per-call argument. `accel/test/export.py` pins it to the kernel's
+  `PROMPT`,
   because `fw/infer.c` is compiled at `T=64` with a 32-token prompt.
 - `MAX_INTEGER = 99999` is vestigial — `_sample_number` bounds by digit count.
 
@@ -159,8 +158,8 @@ reimplementation must reproduce it.
 - `make_linear(..., use_int4)` selects it, **including `Model.fc`**. A float config gets
   an `nn.Linear` head, which is the only thing `quantize_head` / `dynamic_fake_quant`
   still reach.
-- `TernaryLinear` is retained but **no config builds one**. It is what `quant.py` and
-  `calibrate.py` import.
+- `TernaryLinear` is retained but **no config builds one**, and nothing in `accel/`
+  reads one.
 
 ### int4 activations are QAT, not post-hoc
 
@@ -174,8 +173,8 @@ reimplementation must reproduce it.
   analytically, and it is symmetric because hardtanh is odd.
 - `set_quant_enabled(model, False)` turns them all off. **Needed for a real float
   baseline**, since they are live by default.
-- `TernaryLinear.act_scale` is the old PTQ buffer and is vestigial; `calibrate.py` drives
-  that dead path.
+- `TernaryLinear.act_scale` is the old PTQ buffer and is vestigial; the deleted
+  `calibrate.py` was the only thing that ever drove it.
 - MoE is gone.
 
 ### Named configs
@@ -230,18 +229,14 @@ python -m model.train --arch int4_wide --mini_batch_size 256 --batch_size 512
   removal of the positional encoding, the int4 head and `layers=4`, and there is no
   ternary config left to rebuild them with.
 
-## 5. Legacy: `quant.py` and `calibrate.py`
+## 5. Why the model is QAT
 
-Both still describe the **ternary weight / int8 activation** model and fail on the
-missing `adder_ternary_vanilla` factory rather than exporting something wrong.
+`quant.py` (the hardware-exact int8 benchmark) and `calibrate.py` (the fake-quant PTQ
+path) are **deleted**. They still described the ternary weight / int8 activation model and
+failed on the missing `adder_ternary_vanilla` factory. What they established is worth
+keeping:
 
-- `quant.py` was the hardware-exact int8 benchmark: integers end to end, one
-  `clip_int8((acc*m0 + 2**(n-1)) >> n)` per requant site.
-- `calibrate.py` is the fake-quant PTQ path (float32 throughout) and answers a weaker
-  question.
-
-Why they are legacy: the model is **not int8-quantizable post-hoc**, and QAT is what
-fixed it. The short version:
+**The model is not int8-quantizable post-hoc, and QAT is what fixed it.**
 
 - Quantization error is *absolute*, and a per-tensor scale is pinned by the maximum, so
   what matters is `median/max`. With no normalization that collapses with depth — 1.3%
@@ -249,8 +244,8 @@ fixed it. The short version:
 - The usual outlier check misses it: the *top* of the distribution is well behaved
   (`max/p99.9` was 1.1–2.5).
 - DyT fixed that mechanism and still scored 0%, because what it exposed was the residual
-  *addend* — `vecadd` puts `X` and `O = Wo(A)` on one scale while they differed by up to
-  7259x.
+  *addend* — a vector add puts `X` and `O = Wo(A)` on one scale while they differed by up
+  to 7259x.
 - Per-channel scales would fix it but the ISA cannot express them: `requant` takes one
   `{m0,n}` per dispatch.
 - QAT needs no hardware change: instead of finding scales the trained weights tolerate,
@@ -263,7 +258,8 @@ Consequences worth knowing:
 - **Saturation rates stopped being a health check.** A layer can learn to use the requant
   as a `sign()` and clip 99.88% of a tensor deliberately.
 - **Scales come from the checkpoint, not from calibration.** Re-deriving by absmax moves
-  every rounding grid the weights were fitted against.
+  every rounding grid the weights were fitted against. `accel/test/export.py` reads them
+  off the checkpoint's `ActQuant` sites for exactly this reason.
 
 ## 6. Caveats
 

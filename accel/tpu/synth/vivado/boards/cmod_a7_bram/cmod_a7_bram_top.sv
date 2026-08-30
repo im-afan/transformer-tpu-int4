@@ -4,7 +4,7 @@
 //
 // Fourth board target on the same physical board, one rung below cmod_a7_mem:
 //
-//   cmod_a7        the full TPU. The image test_uart_link.py corrupts against.
+//   cmod_a7        the full TPU.
 //   cmod_a7_mem    uart_receiver/interface/transmitter + the real sram_controller
 //                  driving the real chip. No core.
 //   cmod_a7_bram   this one: the same protocol, backed by on-chip block RAM.
@@ -12,7 +12,7 @@
 //   cmod_a7_echo   receiver and transmitter only, wired back to back.
 //
 // The command protocol on the wire is byte-for-byte what cmod_a7_mem speaks, so
-// host/test_uart_link.py drives this image unchanged (see below for the two
+// A host driver reaches this image unchanged (see below for the two
 // tests that do not apply). What is gone is the memory: run the same soak
 // against both images and the difference is `sram_controller` and the 30 bank-14
 // pins it switches, and nothing else. See rtl/uart_bram.sv.
@@ -27,8 +27,7 @@
 // Output lands in synth/build/cmod_a7_bram/, so the four bitstreams cannot be
 // mistaken for one another.
 //
-//   python accel/tpu/host/test_uart_link.py -p COM5 --only sram_roundtrip
-//   python accel/tpu/host/test_uart_link.py -p COM5 --only sram_write
+//   accel/test/tpu_uart.py's write_mem / read_mem, against this bitstream
 //
 // `sram_isolation` and `sram_address_bus` are expected to FAIL here and are not
 // evidence of anything: both probe the top of the 19-bit space to check the

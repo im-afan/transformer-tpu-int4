@@ -90,6 +90,11 @@ There is no geometry on this interface and no `vpu_mm_busy` — both existed onl
 `VECMATMUL`. `tpu_top.sv`'s counter 6 (`vmm`) is tied low and kept as a retired slot so
 the UART `'T'` reply does not renumber.
 
+`src1` and `rq_word` occupy separate command fields even though no op uses both, so decode
+does not depend on the opcode. Older hardware (`scalar_unit.sv`) passed the `{m0,n}` table
+*address* through the `src1` slot instead of the literal itself; that overlap is gone now
+that the word is a literal.
+
 ### The `V_rw` scratchpad port
 
 `LANES = SCRATCHPAD_W * 2` int4 elements per access, where `SCRATCHPAD_W` is the port
@@ -134,7 +139,7 @@ model; the current model is ReLU attention, DyT and a ReLU feed-forward.
 
 | Removed | Was for | Went with it |
 | --- | --- | --- |
-| `GELU` (4), `EXP` (6) | GELU FFN; softmax's `exp` | both 256-entry int8 ROMs, `rtl/luts/`, `accel/tpulang/luts.py`, the `GELU_INIT`/`EXP_INIT` parameters |
+| `GELU` (4), `EXP` (6) | GELU FFN; softmax's `exp` | both 256-entry int8 ROMs, `rtl/luts/`, `accel/tpulang/luts.py` (deleted with the directory), the `GELU_INIT`/`EXP_INIT` parameters |
 | `SQUARE` (5) | LayerNorm variance | — |
 | `ELEMENT_MUL` (9), `SCALAR_MUL` (2), `SCALAR_ADD` (11) | LayerNorm/softmax broadcasts | — |
 | `SCALAR_DIV` (12) | softmax's `sum(exp)`, LayerNorm variance | the restoring divider and its state |

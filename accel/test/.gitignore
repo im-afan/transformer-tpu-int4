@@ -1,0 +1,3 @@
+# Everything the backends build: native binaries, RISC-V images, .vvp files,
+# generated config headers, DRAM dumps.
+build/

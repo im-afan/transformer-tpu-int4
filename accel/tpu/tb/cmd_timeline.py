@@ -24,7 +24,7 @@ rather than derived from start/end here, and they reconstruct `tpu_top`'s own
 perf counters exactly — which is the check that the attribution is real. The
 tool verifies that on every run and says so.
 
-    make fwtime FWPROG=adder
+    vvp <kernel>.vvp +CMDLOG=timeline.csv && python cmd_timeline.py timeline.csv -k infer
     python cmd_timeline.py vectors_fw/adder.timeline.csv -k adder
 """
 from __future__ import annotations
@@ -108,7 +108,7 @@ class Cmd:
 # stream itself rather than from a hand-kept list of command indices that a
 # kernel edit would silently invalidate.
 # =============================================================================
-ADDER_ARENA = 0x2000               # fw/adder.c's staging arena, [0, ARENA)
+ADDER_ARENA = 0x2000               # a kernel's staging arena, [0, ARENA)
 ADDER_SP = {                       # ...and its resident tensors, above it
     0x2000: "X", 0x2800: "Q", 0x3000: "K", 0x3800: "V",
     0x4000: "KT", 0x4800: "KTP", 0x4C00: "VP", 0x5000: "MASK", 0x5400: "S",

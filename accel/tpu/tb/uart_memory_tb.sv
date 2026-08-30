@@ -4,7 +4,7 @@
 //
 //   make mem
 //
-// Drives the DUT the way host/test_uart_link.py drives the board: 'W' a block of
+// Drives the DUT the way a host drives the board: 'W' a block of
 // external SRAM, 'R' it back, compare. Nothing is poked by backdoor — the only
 // path in or out is the serial pins and the behavioral async-SRAM chip model on
 // the external memory bus, so a pass here means the whole

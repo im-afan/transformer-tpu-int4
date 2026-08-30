@@ -24,6 +24,8 @@
 - weight prefetch landed in tpulib.h (contraction split only, opt-in per call site)
 - still to do:
     - adder.c not migrated to the wide shape; fw_vectors/adder_export already moved
+      (resolved: adder.c, fw_vectors.py and adder_export.py are all deleted; the
+       shape now comes from accel/test/export.py's generated header)
     - infer.c is building at LAYERS=2, put it back to 4
     - no trained wide checkpoint — make_dummy_checkpoint is plumbing only
     - infer.hex is 15772 of 16384 bytes; watch the firmware RAM

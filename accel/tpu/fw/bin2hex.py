@@ -3,7 +3,7 @@
 
 The firmware RAM (``rtl/cpu_subsys.sv``) is 32 bits wide and word-addressed, and
 both of its loaders want words rather than bytes: the UART ``'I'`` command
-(``host/tpu_uart.py`` ``load_program``) and ``$readmemh`` through the ``FW_INIT``
+(``accel/test/tpu_uart.py`` ``load_program``) and ``$readmemh`` through the ``FW_INIT``
 parameter. ``//`` comments are accepted by both, so the header line is safe.
 
     python bin2hex.py matmul.bin matmul.hex

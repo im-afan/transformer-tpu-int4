@@ -1,39 +1,6 @@
-"""make_dummy_checkpoint.py — an UNTRAINED `adder_int4_wide` checkpoint.
+"""Write an UNTRAINED `adder_int4_wide` checkpoint (see model/docs/notes.md).
 
     python -m model.make_dummy_checkpoint
-
-There is no trained checkpoint at the wide shape (d=128, f=512, layers=4,
-q_heads=kv_heads=4) yet, and every host-side path below `accel/` needs one
-before it can run at all: `adder_export.py`, `infer_export.py` and
-`accel/tpu/host/run_adder.py` all start by loading a `.pt`, deriving the 16
-requant `{m0,n}` words per layer from its scales, and compiling a kernel against
-them. This writes a checkpoint that satisfies every one of those steps and
-computes addition no better than chance.
-
-**It measures the plumbing, not the model.** A run against it exercises the
-staging, the DRAM map, the kernel's command stream and the ISS/RTL agreement;
-the accuracy number it produces is noise, and the sequence it generates is
-whatever random int4 weights happen to argmax to.
-
-WHY IT IS NOT JUST `torch.save(adder_int4_wide().state_dict())`. Every learned
-`ActQuant` scale is seeded lazily, by the first tensor that flows through it
-(`ActQuant.init_scale_from`), and a freshly constructed model has `initialized`
-clear and `scale` at exactly 1.0 everywhere. Exporting that gives a requant
-table derived from a scale nothing chose, and `quant.QATCalibration` would fall
-back to a calibration set rather than reading the checkpoint. So this runs one
-forward pass over real batches with the quantizers live, which is what seeds
-them, and then checks that every site actually came up.
-
-The sites the hardware *pins* to one another — `q_o`/`q_xo` to the residual
-stream, `q_hr` to `q_h`, `q_p` to `q_s` — share an `ActQuant` **instance**, so
-they are seeded together and `adder_export.derive`'s equality checks hold by
-construction. `q_x1`, `q_f` and `q_x2` are pinned to `1/7` analytically and are
-never seeded at all.
-
-Nothing here depends on the sequence length: the model has no positional
-encoding, so `--max-tokens` and `--equals-pos` only shape the batches the scales
-are seeded from. The defaults are `numbers_data`'s, i.e. what `model/train.py`
-would train against.
 """
 import argparse
 import os
@@ -49,12 +16,8 @@ DEFAULT_OUT = os.path.join(os.path.dirname(os.path.abspath(__file__)),
 
 
 def learned_sites(model):
-    """Every `ActQuant` whose scale is learned rather than pinned.
-
-    A pinned site holds its scale in a buffer and is born initialized; only the
-    `nn.Parameter` ones need a tensor to flow through them. Instances are
-    deduplicated by identity, because the shared ones are the whole point.
-    """
+    """Every ActQuant whose scale is learned rather than pinned, deduplicated
+    by identity (shared instances count once)."""
     seen, out = set(), []
     for name, mod in model.named_modules():
         if isinstance(mod, transformer.ActQuant) and id(mod) not in seen:
@@ -68,9 +31,7 @@ def seed_scales(model, batches: int, batch_size: int, max_tokens: int,
                 equals_pos: int) -> None:
     """Run forward passes until every learned site has a scale.
 
-    `eval()`, so the two dropouts are off: a scale seeded from a tensor 10% of
-    which was zeroed is a scale seeded from a tensor the deployed model never
-    produces. `no_grad`, because nothing here is being trained.
+    eval() so dropout is off; the deployed model never sees a dropped tensor.
     """
     max_digits = (equals_pos - 2) // 2
     model.eval()

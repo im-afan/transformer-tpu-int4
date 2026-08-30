@@ -1,55 +1,7 @@
-// UART host <-> TPU bridge (command FSM).
-//
-// Device side of docs/uart_host.md, extended past the v1 memory-only scope with
-// two control commands. The host PC is the sole master over a single UART; the
-// FSM decodes fixed-header command frames and drives the external SRAM, the
-// scalar unit's instruction memory, and the scalar unit's run trigger.
-//
-// Commands (byte 0 of every frame):
-//   'R' 0x52  read  SRAM : hdr = CMD + A2 A1 A0 + L1 L0            -> len data bytes
-//   'W' 0x57  write SRAM : hdr = CMD + A2 A1 A0 + L1 L0 + data[len]-> ACK/NAK
-//   'I' 0x49  write IMEM : hdr = CMD + A2 A1 A0 + L1 L0 + data[len]-> ACK/NAK
-//   'G' 0x47  go / run   : hdr = CMD + A2 A1 A0                    -> ACK/NAK
-//   'T' 0x54  read timers: hdr = CMD                       -> TIMER_WORDS*4 bytes
-//
-//   * Addresses are 3 bytes, big-endian. For 'R'/'W' this is a 19-bit SRAM byte
-//     address; for 'I' it is an instruction-word index; for 'G' it is the boot PC.
-//   * Length is 2 bytes, big-endian, in BYTES. For 'I' it must be a multiple of 4
-//     (one 32-bit instruction word per 4 bytes, MSB first); words are written at
-//     ascending instruction addresses.
-//   * 'G' pulses `run_start` with `run_pc = addr` — no length, no data.
-//   * 'T' is the whole frame: no address, no length, nothing to validate. It
-//     replies with `cycle_count` as TIMER_WORDS 32-bit words, MSB first both
-//     within and across words, and no status byte — header-less like a read,
-//     because the length is fixed at build time and both ends know it.
-//     TIMER_WORDS defaults to 1 (the run-length counter alone, the historical
-//     reply); tpu_top raises it to expose the per-unit counters in
-//     perf_counters.sv, keeping the run length in the first word so a short
-//     reader still decodes it correctly.
-//
-// Arbitration (core priority): the scalar unit owns the machine. Any command that
-// arrives while `core_busy` is high is rejected with NAK and touches nothing —
-// the SRAM mux in tpu_top hands the controller to the DMA engine while a program
-// runs, so the host and the core never contend. The host regains access once the
-// program halts (`core_busy` low).
-//
-// **'T' is exempt from that rule**, and is the only command that is. It reads a
-// counter and nothing else: no SRAM access, no IMEM write, no run trigger, so
-// there is nothing for it to contend over and no state for it to corrupt
-// mid-run. Answering it while the core runs is also the useful case — it is how
-// a host watches a long program make progress, since a rising count is the one
-// piece of live evidence this link can give that the core is still working
-// rather than wedged. (The count freezing is not by itself proof the run
-// finished: it also stops if the core never started.)
-//
+// UART host <-> TPU bridge (command FSM). Device side of docs/uart_host.md.
 // The UART receiver/transmitter live outside this module (instantiated in
-// tpu_top); this block consumes decoded bytes (data_in/receiver_valid), emits
-// bytes (transmitter_start/data_out/transmitter_busy), and drives the SRAM
-// user-side port, the IMEM write port, and the run trigger.
-//
-// Received bytes land in a one-byte holding register (docs/uart_host.md §5:
-// "a single holding byte in each direction suffices"), captured unconditionally
-// in every state. See the comment on `rx_hold` for why that is not optional.
+// tpu_top); this block consumes decoded bytes, emits reply bytes, and drives
+// the SRAM user-side port, the IMEM write port, and the run trigger.
 module uart_interface #(
     parameter integer ADDR_W     = 19,   // external SRAM byte-address width
     parameter integer LENGTH_W   = 16,   // transfer length field width
@@ -67,15 +19,8 @@ module uart_interface #(
     input  logic core_busy,
 
     // Run counters (perf_counters.sv), reported verbatim by the 'T' command.
-    // Free-running relative to this FSM: sampled once, at the clock the command
-    // byte is decoded, so the bytes that go out are one coherent reading and not
-    // values that moved between them — which also means the whole block is a
-    // consistent snapshot of a single run, so ratios between counters are
-    // meaningful. Tie to '0 in an image with no scalar unit behind it.
-    //
-    // Wire order is high word first: bits [TIMER_WORDS*32-1 -: 32] are sent
-    // before bits [31:0]. tpu_top places the run-length counter in the high word
-    // so a 'T' reply stays prefix-compatible with the single-word version.
+    // Sampled once, at the clock the command byte is decoded. See docs/uart_host.md.
+    // Wire order is high word first. Tie to '0 in an image with no scalar unit behind it.
     input  logic [TIMER_WORDS*32-1:0] cycle_count,
 
     // receiver interface (from uart_receiver)
@@ -171,36 +116,10 @@ module uart_interface #(
     wire  rx_strobe = receiver_valid & ~receiver_valid_prev;
     wire  tx_done   = transmitter_busy_prev & ~transmitter_busy;
 
-    // ---- one-byte receive holding register ----------------------------------
-    //
-    // `rx_strobe` is a single clock wide. Consuming it directly inside the state
-    // case — which is what this FSM used to do — makes every state that is not
-    // IDLE / RX_ADDR / RX_LEN / WR_RX / IMEM_RX a window in which an arriving
-    // byte is destroyed with no error, no retry and no trace.
-    //
-    // The windows are not theoretical:
-    //
-    //   SEND_STATUS + SEND_STATUS_WAIT   ~10*CLK_PER_BIT clocks — a full byte
-    //       time, sitting exactly at the command turnaround. The device starts
-    //       the ACK about one bit *before* the host has finished the last
-    //       payload byte's stop bit, so this window opens straight into where
-    //       the host's next command byte goes.
-    //   WR_ISSUE + WR_WAIT               a few clocks between every pair of
-    //       payload bytes, inside a streaming write.
-    //   VALIDATE, IMEM_WR                one clock each.
-    //   RD_ISSUE .. RD_TX_WAIT           the whole read reply.
-    //
-    // One dropped byte is not one bad command: the FSM re-enters IDLE one byte
-    // out of phase and every subsequent payload byte decodes as an unknown
-    // command and draws a NAK (IDLE's `default` branch below), so the host sees
-    // a flood of bytes it never asked for. With RX_TIMEOUT = 0 — what both board
-    // targets build (synth/vivado/boards/*/board.tcl) — the mid-frame abort is
-    // compiled out and nothing ever recovers.
-    //
-    // So the capture below runs every cycle in every state, ahead of the FSM,
-    // and the FSM reads the register instead of the wire. That is the "single
-    // holding byte in each direction" docs/uart_host.md §5 specifies and the
-    // implementation never had.
+    // One-byte receive holding register, captured every cycle in every state
+    // ahead of the FSM. See docs/uart_host.md "Why the receive holding register
+    // is unconditional" — consuming rx_strobe directly used to drop bytes that
+    // arrived during SEND_STATUS and other non-receiving states.
     logic [7:0] rx_hold;
     logic       rx_pending;   // rx_hold holds a byte the FSM has not taken yet
 
@@ -463,20 +382,12 @@ module uart_interface #(
             endcase
 
             // ---- receive capture --------------------------------------------
-            // Runs in every state, and after the case so that a byte arriving on
-            // the same cycle the FSM takes the previous one still lands: the
-            // `rx_strobe` branch overrides the `rx_consume` clear. That pair of
-            // events is the normal steady state of a streaming write, not a
-            // corner case.
+            // After the case so a byte arriving the same cycle the FSM takes the
+            // previous one still lands (rx_strobe overrides the rx_consume clear).
             if (rx_consume) rx_pending <= 1'b0;
             if (rx_strobe) begin
                 if (rx_pending & ~rx_consume) begin
-                    // Genuinely out of room. Keep the older byte so the stream
-                    // stays in order and lose the new one, but say so: on this
-                    // link the host waits for every reply, so an overrun means
-                    // either the host got ahead of the protocol or the FSM is
-                    // already desynced. Sticky — a one-clock event forty minutes
-                    // into a soak is not something anyone is watching for.
+                    // Out of room: keep the older byte, drop the new one, flag it. Sticky.
                     rx_overrun <= 1'b1;
                 end else begin
                     rx_hold    <= data_in;
@@ -484,10 +395,9 @@ module uart_interface #(
                 end
             end
 
-            // Inter-byte timeout: if we sit mid-frame waiting on the host for
-            // longer than RX_TIMEOUT clocks, abort silently back to IDLE so a
-            // stalled/aborted frame can't wedge the link (docs/uart_host.md §7).
-            // This runs after the case, so an abort overrides the state above.
+            // Inter-byte timeout (docs/uart_host.md): abort mid-frame back to IDLE
+            // after RX_TIMEOUT clocks of silence. Runs after the case, so an abort
+            // overrides the state above.
             if (RX_TIMEOUT != 0) begin
                 if (rx_waiting) begin
                     if (rx_strobe)                   to_cnt <= 32'b0;

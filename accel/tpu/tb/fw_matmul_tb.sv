@@ -3,32 +3,24 @@
 // fw_matmul_tb.sv — the C firmware matmul through the whole core.
 //
 // cpu_smoke_tb proves the CPU can push a DMA command. This proves it can drive
-// the array: ../fw/matmul.c stages A and W in, issues one `matmul_t` over a 4x2
-// tile grid, and spills the int32 C back — the first exercise of the CPU -> MXU
-// path, and the simulation half of host/run_fw_matmul.py.
+// the whole core: any kernel in accel/test/tests/ runs here, against goldens
+// the same kernel's native build produced on the ISS.
+//
+// Not run from this directory's Makefile. accel/test's RTLBackend builds the
+// image, writes the three vector files, invokes iverilog and reads the result:
+//
+//   python accel/test/run_suite.py -b rtl
+//   python accel/test/tests/matmul/generate.py -b rtl --ktiles 16
 //
 // The firmware is loaded through cpu_subsys.sv's FW_INIT ($readmemh), not over
-// the UART, so this is a backdoor test in the same shape as tpu_top_tb: seed
-// DRAM directly, pulse host_run with the producer bit set, wait for `done`,
-// check DRAM. Nothing drives the serial pins.
+// the UART, so this is a backdoor test: seed DRAM directly, pulse host_run with
+// the producer bit set, wait for `done`, check DRAM. Nothing drives the serial
+// pins — fw_uart_tb.sv is the one that does.
 //
-//   make fw                     ../fw/matmul.hex
-//   make fw FWPROG=matmul_loop  ../fw/matmul_loop.hex — same product, tile grid
-//                               walked in C, so the same expectations apply
-//
-// It needs a built image, which needs a RISC-V cross gcc, which is why it is not
-// part of `make all` — the same reason tb/fw_smoke.hex is hand-encoded.
-//
-// Operands and reference are NOT generated here any more. They come from
-// ../../tpulang/fw_vectors.py, which runs the kernel's own command trace — the
-// one its natively-compiled build emitted — through iss.py. That removes the
-// third copy of the operand formulas (this file, host/run_fw_matmul.py and the
-// ISS all used to carry one) and makes the golden numbers come from the same
-// model the .tpu flow is checked against. See docs/picorv32_migration.md §8.
-//
-//   vectors_fw/fw_dram_in.hex    operands to seed DRAM with
-//   vectors_fw/fw_dram_exp.hex   every DRAM byte the run should write
-//   vectors_fw/fw_cmds.hex       the command trace the firmware should produce
+//   <vecdir>/fw_dram_in.hex    operands to seed DRAM with
+//   <vecdir>/fw_dram_exp.hex   every DRAM byte the run should write
+//   <vecdir>/fw_cmds.hex       the command trace the firmware should produce
+//   +DRAMOUT=<path>            dump the final SRAM for the Python driver
 //
 // Two things are therefore checked, not one:
 //
@@ -101,7 +93,7 @@ module fw_matmul_tb;
 
     // Golden images, $readmemh'd from vectors_fw/. `x` means "not written by
     // this run", which is how the expected image stays sparse without needing a
-    // separate mask: only the bytes fw_vectors.py recorded are compared.
+    // separate mask: only the bytes the ISS run recorded are compared.
     // matmul_loop issues 1 + KTILES*NTILES matmuls plus 3 DMAs, so the sweep's
     // largest shape (16x16 tiles) needs 260; `adder` is 534 and `infer` — a
     // whole prefill plus 16 decode steps in one run — is 4606. Overflow is
@@ -164,7 +156,7 @@ module fw_matmul_tb;
         $readmemh({`FW_VEC_DIR, "/fw_cmds.hex"},     cmd_exp);
 
         if (dram_in[A_ADDR] === 8'hxx) begin
-            $display("FW_MATMUL: no vectors in %s - run fw_vectors.py first", `FW_VEC_DIR);
+            $display("FW_MATMUL: no vectors in %s - run this through accel/test", `FW_VEC_DIR);
             $fatal(1);
         end
 
@@ -383,6 +375,20 @@ module fw_matmul_tb;
         $display("command trace: %0d commands, %0d expected", n_cmd_got, n_cmd_exp);
     endtask
 
+    // ---- +DRAMOUT=<path>: the final SRAM, for the Python driver ---------------
+    //
+    // The checks above are self-contained, but accel/test's Backend contract is
+    // "run the kernel, hand back DRAM" — and reading it out of the simulation
+    // rather than trusting the golden is what makes the RTL an independent
+    // backend rather than a second opinion from the same model.
+    task automatic dump_dram();
+        string path;
+        if ($value$plusargs("DRAMOUT=%s", path)) begin
+            $writememh(path, sram_mem);
+            $display("dram: %0d bytes -> %0s", SRAM_SZ, path);
+        end
+    endtask
+
     // ---- stimulus ------------------------------------------------------------
     initial begin
         $display("==== firmware matmul: %s ====", `FW_HEX);
@@ -439,6 +445,7 @@ module fw_matmul_tb;
         check_dram();
         check_cmds();
         if (tl_f != 0) write_timeline();
+        dump_dram();
 
         $display("==== done: %0d checks, %0d errors ====", checks, errors);
         if (errors == 0) $display("FW_MATMUL: ALL TESTS PASSED");

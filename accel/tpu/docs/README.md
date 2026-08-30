@@ -1,6 +1,7 @@
 # TPU design docs
 
-Per-block notes. Where one of these disagrees with the RTL, the RTL wins.
+Per-block notes. Where one of these disagrees with the RTL, the RTL wins. Start with [pipeline.md](pipeline.md) if you want the end-to-end path: a trained
+checkpoint -> the ISS -> the board.
 
 | Doc | Component |
 | --- | --- |
@@ -10,6 +11,8 @@ Per-block notes. Where one of these disagrees with the RTL, the RTL wins.
 | [dma.md](dma.md) | DMA engine and the external SRAM controller ("DRAM") |
 | [macro_ops.md](macro_ops.md) | The macro-op ISA: what each command carries |
 | [picorv32_migration.md](picorv32_migration.md) | The dispatch plane and the CPU producer — design record + measurements |
+| [iss.md](iss.md) | The bit-exact model of the three units, and what it deliberately does not model |
+| [pipeline.md](pipeline.md) | End to end: exporting a checkpoint, verifying it on the ISS, running it on the board |
 | [uart_host.md](uart_host.md) | The host link: frame format, the five commands, arbitration |
 | [uart_selftest.md](uart_selftest.md) | The `cmod_a7_echo` bring-up image |
 | [synth.md](synth.md) | Vivado build flow, Cmod A7-35T deployment, sizing |
@@ -17,8 +20,9 @@ Per-block notes. Where one of these disagrees with the RTL, the RTL wins.
 | [scheduler_plan.md](scheduler_plan.md) | Sketch for overlapping DMA and compute in hardware — **not built** |
 | [development_notes.md](development_notes.md) | Dated working notes |
 
-Firmware is documented in [`../fw/README.md`](../fw/README.md); the host driver in
-[`../host/README.md`](../host/README.md).
+Firmware is documented in [`../fw/README.md`](../fw/README.md) and [fw.md](fw.md); the
+verification suite, the three backends and the host link driver in
+[`../../test/README.md`](../../test/README.md).
 
 ## The machine in one page
 

@@ -5,40 +5,17 @@ import torch
 VOCAB = {str(i): i for i in range(10)}
 PAD_TOKEN = 'N'
 PAD_ID = 12
-VOCAB.update({'+': 10, '=': 11, 'N': PAD_ID})
-# After the update, not before it: built from the ten digits alone, `detokenize`
-# raised KeyError on every '+', '=' and 'N' it was handed.
+VOCAB.update({'+': 10, '=': 11, 'N': PAD_ID})  # after the digits, or detokenize KeyErrors
 INV_VOCAB = {v: k for k, v in VOCAB.items()}
 MAX_INTEGER = 99999
 MIN_TOKEN_LENGTH = 5  # e.g. "0+0=0"
-# The first ANSWER position, i.e. the prompt length: '=' sits at EQUALS_POS-1
-# and every operand is padded so this holds whatever the operands' lengths are.
-# It bounds the operands at `max_digits <= (EQUALS_POS - 2) // 2` — 31 here,
-# since "left + right" has to fit in EQUALS_POS-1 characters — and the sequence
-# at EQUALS_POS + max_digits + 1 tokens.
+# First answer position; '=' sits at EQUALS_POS-1. Bounds operands at
+# max_digits <= (EQUALS_POS - 2) // 2, see model/docs/notes.md.
 EQUALS_POS = 64
 MAX_TOKENS = 128
 
-# Every number in a generated expression is written least-significant digit
-# first: "123+45=168" is emitted as "321+54=861".
-#
-# This is for learnability, and the answer is the half that matters. Addition
-# carries propagate from the ones digit upward, which is the direction an
-# autoregressive model *cannot* look: emitting the answer most-significant
-# first asks the model to know every carry before it writes the first digit.
-# Reversed, answer digit k depends only on operand digits 0..k and the carry
-# out of digit k-1 — the token it just emitted.
-#
-# The second, smaller win is positional. The answer is left-aligned at
-# EQUALS_POS and padded on the right, so with the digits reversed, position
-# EQUALS_POS+k is *always* the 10^k place. Unreversed it is a different place
-# value for every answer length, so the model has to learn the alignment
-# separately at each magnitude.
-#
-# Operands are reversed for the same alignment reason (position 0 is now always
-# the left operand's ones digit). The right operand still begins at a
-# length-dependent offset after '+'; fixing that would mean padding the
-# operands to a fixed width, which moves '+' and is a larger change.
+# Digits are written least-significant first: "123+45=168" -> "321+54=861".
+# See model/docs/notes.md for why (carry direction + fixed place value).
 REVERSE_DIGITS = True
 
 
@@ -64,19 +41,15 @@ def tokenize(expression: str, max_tokens: int = None):
 
 
 def detokenize(token_ids: List[int]) -> str:
-    """Convert token ids back into a string expression, in generator order.
-
-    Digits stay least-significant first — this is the inverse of ``tokenize``,
-    not a display function. Use :func:`unreverse_expression` to read it.
-    """
+    """Inverse of tokenize; digits stay least-significant first. Use
+    unreverse_expression for display order."""
     return ''.join(INV_VOCAB[token_id] for token_id in token_ids if token_id != PAD_ID)
 
 
 def unreverse_expression(expr: str) -> str:
-    """Restore human digit order for display: ``321+54=861`` -> ``123+45=168``.
+    """Restore human digit order for display: 321+54=861 -> 123+45=168.
 
-    Tolerant of malformed input, because model samples are not guaranteed to
-    parse: anything that is not a run of digits is passed through untouched.
+    Tolerant of malformed input: anything not a run of digits passes through.
     """
     if not REVERSE_DIGITS:
         return expr
@@ -104,16 +77,10 @@ def _sample_number(max_digits: int) -> int:
 
 def generate_addition_expression(max_digits: int = 31, max_length: int = MAX_TOKENS,
                                  equals_pos: int = EQUALS_POS) -> str:
-    """Generate a random addition expression where each operand length is equally likely.
+    """Random addition expression, each operand length equally likely.
 
-    Digits are least-significant first (see REVERSE_DIGITS): 123+45=168 is
-    generated as ``321+54NNNNNNNN861NN...``. Lengths are unchanged, so the
-    answer starts at `equals_pos` and the ``max_digits <= (equals_pos-2)//2``
-    limit holds.
-
-    `equals_pos` is the module's EQUALS_POS unless a caller pins it. The one
-    caller that does is `accel/tpulang/infer_export.py`, whose kernel is frozen
-    at the older 32-token / 15-token-prompt shape.
+    equals_pos defaults to EQUALS_POS; accel/test/export.py pins it
+    to the older 32-token kernel shape instead.
     """
     left = _sample_number(max_digits)
     right = _sample_number(max_digits)

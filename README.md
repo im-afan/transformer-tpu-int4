@@ -17,20 +17,22 @@ model/            PyTorch golden reference
   transformer.py    architecture + named configs
   numbers_data.py   synthetic addition dataset + tokenizer
   train.py          training loop (gradient accumulation)
-  quant.py          hardware-exact int8 benchmark (legacy, ternary-era)
-  calibrate.py      PTQ activation calibration (legacy, ternary-era)
   make_dummy_checkpoint.py  untrained checkpoint for plumbing tests
   saved/            checkpoints (gitignored)
 
 accel/
   cuda/             legacy CUDA MHA kernel (out of sync with the model)
   tpu/              the TPU
-    rtl/ tb/          design + Icarus testbenches
-    fw/               C firmware for the on-chip PicoRV32 — the only command producer
-    host/             UART driver and board runners
+    rtl/ tb/          design + Icarus block testbenches
+    fw/               the firmware library for the on-chip PicoRV32 — the only
+                      command producer: tpu.h, tpulib.h, start.S, link.ld
     synth/ constraints/  Vivado build, per-board definitions
     docs/             per-block design notes
-  tpulang/          ISS (bit-exact with the RTL), golden vectors, checkpoint exporters
+  test/             the verification suite
+    iss.py            bit-exact model of the three units
+    backends.py       ISS / RTL / board — three ways to run a kernel
+    export.py         checkpoint -> config header + DRAM image
+    tests/<name>/     one kernel and its vectors per folder
 ```
 
 ## Running
@@ -46,11 +48,14 @@ python -m model.make_dummy_checkpoint          # untrained .pt, for plumbing onl
 TPU stack (also from the repo root):
 
 ```bash
-make -C accel/tpu/fw PROG=infer                # build a kernel (needs RISC-V gcc)
-cd accel/tpu/tb && make fw FWPROG=infer GEN=3  # run it through the RTL
-python accel/tpulang/infer_export.py -n 16     # score it on the ISS
-python accel/tpu/host/run_adder.py -p COM5     # run it on the board
+python accel/test/run_suite.py                 # every kernel, on the ISS (seconds)
+python accel/test/run_suite.py -b rtl          # ...through the whole core in Icarus
+python accel/test/tests/infer/generate.py -b iss -n 16     # the model, on the ISS
+python accel/test/tests/infer/generate.py -b board -p COM5 # ...on the board
 ```
+
+`-b rtl` and `-b board` need a bare-metal RISC-V gcc; `-b rtl` also needs Icarus.
+`-b iss` needs only a host C compiler.
 
 ## Where to read next
 
@@ -60,5 +65,6 @@ python accel/tpu/host/run_adder.py -p COM5     # run it on the board
 | [`accel/README.md`](accel/README.md) | How the backends relate |
 | [`accel/tpu/README.md`](accel/tpu/README.md) | The hardware: layout and current state |
 | [`accel/tpu/fw/README.md`](accel/tpu/fw/README.md) | The kernels and the primitive library |
-| [`accel/tpu/host/README.md`](accel/tpu/host/README.md) | The UART link and the board runners |
+| [`accel/test/README.md`](accel/test/README.md) | The verification suite: the three backends and the vector contract |
+| [`accel/tpu/docs/pipeline.md`](accel/tpu/docs/pipeline.md) | Checkpoint to board, end to end |
 | [`accel/tpu/docs/README.md`](accel/tpu/docs/README.md) | Per-block microarchitecture notes |

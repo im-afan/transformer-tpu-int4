@@ -1,58 +1,5 @@
-// -----------------------------------------------------------------------------
-// uart_bram.sv — UART command link + on-chip block RAM. rtl/uart_memory.sv with
-// the external memory taken out.
-//
-// One substitution and nothing else: sram_controller becomes bram_controller
-// (rtl/bram.sv), which presents the identical user-side handshake with the same
-// cycle counts, so uart_interface is driven exactly as it is in the other two
-// images and is again instantiated **unmodified**. What leaves the design with
-// the SRAM is the 30 switching bank-14 pins, the bidirectional data bus, the
-// output-enable/chip-select timing and the chip itself.
-//
-// That makes it the next rung down the ladder in docs/uart_selftest.md:
-//
-//   cmod_a7        everything. The image that fails.
-//   cmod_a7_mem    the protocol and the external memory, no core.
-//   cmod_a7_bram   this one: the protocol only. Memory is on-chip block RAM.
-//   cmod_a7_echo   neither. Just the wire framing.
-//
-// cmod_a7_mem already narrowed the fault to `uart_interface` or
-// `sram_controller` (CLAUDE.md). This image is the cut between those two, and it
-// is a cut the echo image cannot make: the echo has no command FSM, no address
-// phase and no ACK, so a clean echo run says nothing about `uart_interface`.
-// Here the protocol is intact byte for byte on the wire — same command set, same
-// 3-byte addresses, same 19-bit range checks, same turnaround — and only the
-// storage behind it has changed. So:
-//
-//   * still corrupts  =>  the fault is in uart_interface (or the host), and
-//                         sram_controller and the memory bus are cleared.
-//   * runs clean      =>  the fault needs the external memory present:
-//                         sram_controller, the bus, or the pins it switches.
-//
-// Differences a driver can observe, all of them consequences of on-chip storage:
-//
-//   * Capacity. The protocol address space is still the full 19 bits, because
-//     the range checks in uart_interface are part of what is under test, but
-//     only 2**BRAM_AW bytes exist. Addresses above that alias down onto the
-//     window (see rtl/bram.sv). With the default 64 KiB, `host/test_uart_link.py`
-//     passes everything except the two tests that deliberately probe the top of
-//     the 19-bit space — `sram_isolation` and `sram_address_bus`, both of which
-//     are testing the physical address lines of a chip that is not in this
-//     image. `sram_long_transfer` (--slow) needs bram_aw=17. Every access that
-//     aliases sets the sticky `aliased` output, so this is never silent.
-//   * Memory comes up zeroed at configuration rather than holding whatever the
-//     SRAM was left with, so a read before the first write returns 0x00 instead
-//     of stale data.
-//
-// Everything else is uart_memory verbatim, including the two deliberate
-// departures from tpu_top:
-//
-//   * 'I' (write IMEM) and 'G' (go) are decoded, range-checked and ACK'd,
-//     because uart_interface is unmodified — but there is no instruction memory
-//     and no core, so the write lands nowhere and the run never starts. Use
-//     'R'/'W' only.
-//   * `core_busy` is tied low, so nothing is ever NAK'd for arbitration.
-// -----------------------------------------------------------------------------
+// UART command link + on-chip block RAM. uart_memory.sv with the external
+// memory swapped for bram_controller. See docs/uart_selftest.md.
 
 module uart_bram #(
     // ---- UART host link ------------------------------------------------------
@@ -223,31 +170,10 @@ module uart_bram #(
         .rx_overrun (uart_rx_overrun)
     );
 
-    // =========================================================================
-    // Instrumentation — identical to uart_memory.sv, so the two images report
-    // the same events on the same LEDs and a soak run can be compared directly.
-    //
-    // `rx_byte` is derived exactly as uart_interface.sv derives it: the rising
-    // edge of the receiver's `valid`, a level held from STOP until half way
-    // through the next start bit. Counting it here means the status logic sees
-    // precisely the bytes the command FSM sees, no more.
-    //
-    // `collision` sets on either of two things, both meaning "the host got ahead
-    // of the device":
-    //
-    //   * a byte landed while the device was mid-transmit. The host is the sole
-    //     master and waits for each reply, so it should never happen. Survivable
-    //     since uart_interface grew its RX holding register — the byte is kept —
-    //     so it is information about the *host*, not a device fault on its own.
-    //   * uart_interface's `rx_overrun`: a byte arrived with the holding register
-    //     still full, so one really was lost. That is the fault.
-    //
-    // Sticky until reset: the interesting question is "did this ever happen",
-    // and a one-clock pulse 40 minutes into a soak is not something anyone is
-    // watching for.
-    // =========================================================================
+    // Instrumentation, identical to uart_memory.sv. See docs/uart_selftest.md
+    // for `collision`'s two trigger conditions.
     logic uart_rx_valid_prev;
-    wire  rx_byte = uart_rx_valid & ~uart_rx_valid_prev;
+    wire  rx_byte = uart_rx_valid & ~uart_rx_valid_prev;   // rising edge of receiver valid
 
     // The transmitter asserts `busy` the cycle *after* it accepts `start`, so
     // the strobe has to be OR'd in or the first cycle of every frame would look
