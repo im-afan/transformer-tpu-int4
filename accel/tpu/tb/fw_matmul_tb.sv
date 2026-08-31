@@ -433,14 +433,20 @@ module fw_matmul_tb;
         $display("            idlec=%0d qfull=%0d ovlap=%0d",
                  dut.u_perf.counts[7*32 +: 32], dut.u_perf.counts[8*32 +: 32],
                  dut.u_perf.counts[9*32 +: 32]);
-        // One machine-readable line for run_fw_sweep.sh. The command counts come
-        // from the queues' own `issued`, so "how many dispatches did this shape
-        // cost the CPU" is measured rather than assumed.
-        $display("SWEEP m=%0d kt=%0d nt=%0d run=%0d mxu=%0d dma=%0d idlec=%0d qfull=%0d mxucmd=%0d dmacmd=%0d",
-                 M, KTILES, NTILES,
+        // One machine-readable line for accel/test, all ten counters in
+        // tpu_top.sv's PERF_* order — the same order the board's 'T' reply uses,
+        // so a benchmark taken here and one taken on hardware are the same
+        // measurement. The two command counts come from the queues' own
+        // `issued`, so "how many dispatches did this shape cost the CPU" is
+        // measured rather than assumed.
+        $display("PERF run=%0d mxu=%0d mload=%0d vpu=%0d dma=%0d swait=%0d vmm=%0d idlec=%0d qfull=%0d ovlap=%0d",
                  dut.u_perf.counts[0*32 +: 32], dut.u_perf.counts[1*32 +: 32],
-                 dut.u_perf.counts[4*32 +: 32], dut.u_perf.counts[7*32 +: 32],
-                 dut.u_perf.counts[8*32 +: 32], dut.mxu_issued, dut.dma_issued);
+                 dut.u_perf.counts[2*32 +: 32], dut.u_perf.counts[3*32 +: 32],
+                 dut.u_perf.counts[4*32 +: 32], dut.u_perf.counts[5*32 +: 32],
+                 dut.u_perf.counts[6*32 +: 32], dut.u_perf.counts[7*32 +: 32],
+                 dut.u_perf.counts[8*32 +: 32], dut.u_perf.counts[9*32 +: 32]);
+        $display("PERFCMD mxucmd=%0d dmacmd=%0d wallclk=%0d",
+                 dut.mxu_issued, dut.dma_issued, run_clk);
 
         check_dram();
         check_cmds();

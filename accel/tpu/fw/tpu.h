@@ -11,6 +11,14 @@
 #endif
 #define TPU_WORD_BYTES (TPU_N / 2)
 
+/* vpu_vlen is a 10-bit field in the VPU macro-op and must be even, so a longer
+ * elementwise pass is several commands. A chunk of a whole number of array
+ * words keeps its byte count a whole number of scratchpad words too. This is a
+ * property of the encoding, not of tpulib.h — a kernel writing raw commands has
+ * to chunk as well, and a `vlen` past this truncates silently. */
+#define TPU_VLEN_MAX   1023u
+#define TPU_VCHUNK_MAX ((TPU_VLEN_MAX / TPU_N) * TPU_N)
+
 #define TPU_MMIO     0x80000000u
 #define TPU_SPAD_WIN 0x90000000u   /* the scratchpad, as CPU memory */
 

@@ -316,7 +316,7 @@ def main() -> int:
                    problems, args.model_path, args.seed)
     prog.run_program()
     score(prog.generator)
-    return report(prog)
+    return report(prog, args.clk_mhz)
 
 
 if __name__ == "__main__":

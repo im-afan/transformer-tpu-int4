@@ -25,11 +25,14 @@ from program import backend_from_args                    # noqa: E402
 
 # Ordered cheapest first, so a broken dispatch plane fails in seconds rather
 # than after the block loops have run.
-DEFAULT_ORDER = ["matmul", "ffn", "mha", "spadwin", "tiled"]
+DEFAULT_ORDER = ["matmul", "ffn", "mha", "spadwin", "dma_roundtrip",
+                 "tiled_simple", "tiled"]
 SLOW = {"infer"}
 
 WATCHDOG_NS = {"matmul": 2_000_000, "ffn": 2_000_000, "mha": 2_000_000,
-               "spadwin": 4_000_000, "tiled": 60_000_000,
+               "spadwin": 4_000_000, "dma_roundtrip": 20_000_000,
+               "tiled_simple": 20_000_000,
+               "tiled": 60_000_000,
                "infer": 1_000_000_000}
 
 
@@ -59,10 +62,16 @@ def main() -> int:
     ap.add_argument("-p", "--port", default=None, help="serial port (board only)")
     ap.add_argument("-v", "--verbose", action="store_true")
     ap.add_argument("--cases", type=int, default=None)
+    ap.add_argument("--clk-mhz", type=float, default=12.0,
+                    help="core clock the benchmark's milliseconds are quoted at "
+                         "(default 12, the Cmod A7's)")
+    ap.add_argument("--bench", action="store_true",
+                    help="print each kernel's full counter breakdown, not just "
+                         "its clocks")
     args = ap.parse_args()
 
     names = args.kernel or [n for n in discover() if n not in SLOW]
-    failed, timings = [], []
+    failed, rows = [], []
 
     for name in names:
         print(f"==== {name} on {args.backend} ====")
@@ -73,17 +82,37 @@ def main() -> int:
             prog = mod.program(backend)
             prog.run_program(limit=args.cases)
             ok = prog.passed()
+            bench = prog.benchmark(args.clk_mhz)
+            if args.bench and bench:
+                print(prog.format_benchmark(args.clk_mhz))
         finally:
             backend.close()
-        timings.append((name, time.monotonic() - t0))
+        rows.append((name, time.monotonic() - t0, bench))
         if not ok:
             failed.append(name)
         print()
 
+    # The device's own counters, not the wall clock: the wall clock is dominated
+    # by iverilog or by USB latency and says nothing about the hardware.
+    timed = [r for r in rows if r[2]]
     print("==== summary ====")
-    for name, secs in timings:
+    if timed:
+        print(f"  {'':4} {'kernel':<10} {'wall':>7}  {'clocks':>12} "
+              f"{'ms @ ' + format(args.clk_mhz, 'g') + ' MHz':>14}  "
+              f"{'mxu':>6} {'dma':>6} {'idle':>6}")
+    for name, secs, bench in rows:
         mark = "FAIL" if name in failed else "ok  "
-        print(f"  {mark} {name:<10} {secs:6.1f}s")
+        if not bench:
+            print(f"  {mark} {name:<10} {secs:6.1f}s")
+            continue
+        share = bench["share"]
+        print(f"  {mark} {name:<10} {secs:6.1f}s  {bench['clocks']:>12} "
+              f"{bench['ms']:>14.3f}  "
+              f"{100 * share.get('mxu', 0):5.1f}% {100 * share.get('dma', 0):5.1f}% "
+              f"{100 * share.get('idlec', 0):5.1f}%")
+    if timed and not args.bench:
+        print("  (--bench for the full counter breakdown; the shares overlap "
+              "and do not sum to 100%)")
     if failed:
         print(f"\n{len(failed)} of {len(names)} kernels FAILED: "
               f"{', '.join(failed)}")

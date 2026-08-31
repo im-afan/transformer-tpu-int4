@@ -1,0 +1,16 @@
+python accel/test/tests/tiled_simple/generate.py -b board -M 128 -N 512 -K 128
+  ok   128x128 @ 128x512, tiled: 32768 bytes match
+moved 40960.0 to spad, 32768.0 to DRAM
+expected DMA clocks: 106496.0
+
+tiled_simple on board, 1 case(s):
+  run                                      997146 clocks  83.096 ms @ 12 MHz
+  MXU busy                                 156672   15.7%
+    of which weight load                        0    0.0%
+  VPU busy                                      0    0.0%
+  DMA busy                                 601088   60.3%
+  no unit busy (issue overhead)            239386   24.0%
+  producer stalled on a full queue              0    0.0%
+  two or more units busy                        0    0.0%
+
+tiled_simple: 1 case(s) PASSED on board

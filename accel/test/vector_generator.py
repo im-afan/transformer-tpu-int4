@@ -12,6 +12,17 @@ from dataclasses import dataclass, field
 
 Q4_MIN, Q4_MAX = -8, 7
 
+# The machine, mirroring tpu.h / tpulib.h. A kernel that maps a tensor to the
+# same address in DRAM and in the scratchpad is bounded by the scratchpad, and
+# wants its operands in different banks — scratchpad.sv serves one reader per
+# bank per clock, so A, B and C sharing one is a stall per beat.
+TPU_N = 8
+TPU_WORD_BYTES = TPU_N // 2
+TPU_BANK_BYTES = 1024 * TPU_WORD_BYTES          # 4 KB
+TPU_SPAD_BYTES = 1 << 16                        # ADDR_W = 16
+
+M0_W, N_W = 12, 4                               # the requant word's two fields
+
 
 # =============================================================================
 # Images.
@@ -92,7 +103,55 @@ def w_hash(r: int, c: int, salt: int) -> int:
 # =============================================================================
 def rq_word(m0: int, n: int) -> int:
     """The {m0,n} literal a command carries: m0 in the low 12 bits, n above."""
-    return (n << 12) | m0
+    return (n << M0_W) | m0
+
+
+RQ_ONE = rq_word(1, 0)              # an identity pass: the input is already
+                                    # on the output's grid and scale
+
+
+def fixed_point(mult: float, what: str = "") -> tuple:
+    """The {m0, n} pair closest to real multiplier `mult`.
+
+    The op computes a multiplier of `m0/2**n` with `m0 < 4096` and `n <= 15`, so
+    this takes the largest `n` that keeps `m0` in range — every extra shift is
+    another bit of precision on a multiplier usually much smaller than 1.
+    """
+    import sys
+
+    if not mult > 0:
+        raise SystemExit(f"{what or 'requant'}: multiplier {mult} is not "
+                         f"positive — m0 is unsigned")
+    best = None
+    for n in range(1 << N_W):
+        m0 = int(mult * (1 << n) + 0.5)          # round-half-up, like the RTL
+        if 0 < m0 < (1 << M0_W):
+            best = (m0, n)
+    if best is None:
+        if mult >= 1:
+            print(f"  WARNING {what}: m = {mult:.4g} exceeds the representable "
+                  f"4095, clamping", file=sys.stderr)
+            return ((1 << M0_W) - 1, 0)
+        print(f"  WARNING {what}: m = {mult:.4g} underflows m0 = 0 at n = 15; "
+              f"this tensor will be all zeros", file=sys.stderr)
+        return (0, 0)
+    return best
+
+
+def fit_rq(accumulators, what: str = "") -> int:
+    """The {m0,n} that lands the largest of `accumulators` on the top of the
+    int4 grid — the multiplier that uses the range without clipping.
+
+    This is what makes a kernel's shape a knob. A requant word tuned by hand for
+    one contraction length saturates or collapses at another, and an all-zero
+    golden passes against any datapath at all; deriving it from the accumulators
+    the golden just produced cannot drift from the shape. Same rule
+    `export.logit_rq_word` uses for the output head.
+    """
+    peak = max((abs(int(a)) for a in accumulators), default=0)
+    if peak == 0:
+        return RQ_ONE
+    return rq_word(*fixed_point(Q4_MAX / peak, what or "fit_rq"))
 
 
 def narrow(acc: int, word: int, lo: int = Q4_MIN) -> int:
@@ -104,6 +163,53 @@ def narrow(acc: int, word: int, lo: int = Q4_MIN) -> int:
 def dyt(acc: int, word: int) -> int:
     """`narrow` clipped symmetrically to +-7, which is what DyT's hardtanh is."""
     return narrow(acc, word, lo=-Q4_MAX)
+
+
+# =============================================================================
+# The address map. A kernel's operands are laid out here, in Python, and handed
+# to the compiler as -D — so the C carries defaults for a bare build and the
+# generator's numbers are the ones that ran.
+# =============================================================================
+class AddressMap:
+    """A sequential allocator at bank granularity.
+
+    These kernels give a tensor the **same** address in DRAM and in the
+    scratchpad, so one map covers both and the scratchpad is the tighter bound.
+    Allocating a whole bank per tensor is why the small kernels' operands sit
+    0x1000 apart: a bank serves one reader per clock, and a matmul reads A, B
+    and C at once.
+    """
+
+    def __init__(self, align: int = TPU_BANK_BYTES, base: int = 0,
+                 limit: int = TPU_SPAD_BYTES, what: str = "kernel"):
+        self.align, self.limit, self.what = align, limit, what
+        self.next = base
+        self.slots: dict = {}
+
+    def alloc(self, name: str, nbytes: int) -> int:
+        """Place `name` and return its address. Zero-length allocations still
+        take a slot, so a shape that degenerates does not alias two tensors."""
+        addr = self.next
+        step = max(nbytes, 1)
+        self.next = (addr + step + self.align - 1) // self.align * self.align
+        if self.next > self.limit:
+            raise SystemExit(
+                f"{self.what}: the operand map needs {self.next} bytes of a "
+                f"{self.limit}-byte scratchpad — this shape does not fit. "
+                f"Lower it, or give the kernel a staging arena instead of "
+                f"mapping every tensor.")
+        self.slots[name] = addr
+        return addr
+
+    def __getitem__(self, name: str) -> int:
+        return self.slots[name]
+
+    def defines(self) -> dict:
+        """`{NAME: "0x....u"}`, ready to be handed to the compiler."""
+        return {name: f"0x{addr:05x}u" for name, addr in self.slots.items()}
+
+    def summary(self) -> str:
+        return ", ".join(f"{n}=0x{a:05x}" for n, a in self.slots.items())
 
 
 # =============================================================================

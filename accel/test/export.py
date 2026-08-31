@@ -27,9 +27,9 @@ for _p in (HERE, REPO):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
-from vector_generator import Q4_MAX, Q4_MIN, i4_row, put_rowmajor_i4, zero_range  # noqa: E402
+from vector_generator import (M0_W, N_W, Q4_MAX, Q4_MIN, RQ_ONE,  # noqa: E402
+                              fixed_point, i4_row, put_rowmajor_i4, zero_range)
 
-M0_W, N_W = 12, 4
 DRAM_BYTES = 1 << 19
 ALIGN = 64
 
@@ -162,40 +162,17 @@ def logit_addr(s: Shape, m: dict, seq: int, pos: int) -> int:
 
 
 # =============================================================================
-# Fixed point.
+# Fixed point. `fixed_point` lives in vector_generator so the kernel tests and
+# the exporter cannot disagree about what a requant word means.
 # =============================================================================
-def fixed_point(mult: float, what: str) -> tuple:
-    """The {m0, n} pair closest to real multiplier `mult`.
+def rq_for_scale(mult: float, what: str) -> int:
+    """A requant word from a real multiplier `s_in * s_weight / s_out`.
 
-    `requant` computes clip((acc*m0 + 2**(n-1)) >> n) with m0 < 4096 and
-    n <= 15, so this takes the largest n that keeps m0 in range.
+    Distinct from `vector_generator.rq_word`, which takes the two fields
+    directly — this one is the scale arithmetic that produces them.
     """
-    if not mult > 0:
-        raise SystemExit(f"{what}: multiplier {mult} is not positive — m0 is "
-                         f"unsigned, so a negative scale (or a negative DyT "
-                         f"alpha) cannot be represented")
-    best = None
-    for n in range(1 << N_W):
-        m0 = math.floor(mult * (1 << n) + 0.5)      # round-half-up, like the RTL
-        if 0 < m0 < (1 << M0_W):
-            best = (m0, n)
-    if best is None:
-        if mult >= 1:
-            print(f"  WARNING {what}: m = {mult:.4g} exceeds the representable "
-                  f"4095, clamping", file=sys.stderr)
-            return ((1 << M0_W) - 1, 0)
-        print(f"  WARNING {what}: m = {mult:.4g} underflows m0 = 0 at n = 15; "
-              f"this tensor will be all zeros", file=sys.stderr)
-        return (0, 0)
-    return best
-
-
-def rq_word(mult: float, what: str) -> int:
     m0, n = fixed_point(mult, what)
     return (n << M0_W) | m0
-
-
-RQ_ONE = 1                                  # {m0 = 1, n = 0}: an identity pass
 
 # The requant sites, in the order tests/infer/infer.c's enum declares them.
 # Changing this list changes that enum; INFER_RQ_SITES is what keeps them honest.
@@ -297,20 +274,20 @@ def derive(net) -> tuple:
 
         head_dim = net.d // net.q_heads
         row = [0] * RQ_N
-        row[RQ_IDX["Q"]] = rq_word(s_x * scales["q"] / s_q, f"L{L} RQ_Q")
-        row[RQ_IDX["K"]] = rq_word(s_x * scales["k"] / s_k, f"L{L} RQ_K")
-        row[RQ_IDX["V"]] = rq_word(s_x * scales["v"] / s_v, f"L{L} RQ_V")
-        row[RQ_IDX["S"]] = rq_word(s_q * s_k / (math.sqrt(head_dim) * s_s),
+        row[RQ_IDX["Q"]] = rq_for_scale(s_x * scales["q"] / s_q, f"L{L} RQ_Q")
+        row[RQ_IDX["K"]] = rq_for_scale(s_x * scales["k"] / s_k, f"L{L} RQ_K")
+        row[RQ_IDX["V"]] = rq_for_scale(s_x * scales["v"] / s_v, f"L{L} RQ_V")
+        row[RQ_IDX["S"]] = rq_for_scale(s_q * s_k / (math.sqrt(head_dim) * s_s),
                                    f"L{L} RQ_S")
         row[RQ_IDX["ID"]] = row[RQ_IDX["P"]] = RQ_ONE
-        row[RQ_IDX["A"]] = rq_word(s_s * s_v / s_a, f"L{L} RQ_A")
-        row[RQ_IDX["O"]] = rq_word(s_a * scales["o"] / s_x, f"L{L} RQ_O")
+        row[RQ_IDX["A"]] = rq_for_scale(s_s * s_v / s_a, f"L{L} RQ_A")
+        row[RQ_IDX["O"]] = rq_for_scale(s_a * scales["o"] / s_x, f"L{L} RQ_O")
         row[RQ_IDX["XO"]] = RQ_ONE
-        row[RQ_IDX["X1"]] = rq_word(alpha1 * s_x / s_x1, f"L{L} RQ_X1")
-        row[RQ_IDX["H"]] = rq_word(s_x1 * scales["w1"] / s_h, f"L{L} RQ_H")
+        row[RQ_IDX["X1"]] = rq_for_scale(alpha1 * s_x / s_x1, f"L{L} RQ_X1")
+        row[RQ_IDX["H"]] = rq_for_scale(s_x1 * scales["w1"] / s_h, f"L{L} RQ_H")
         row[RQ_IDX["HR"]] = RQ_ONE
-        row[RQ_IDX["F"]] = rq_word(s_h * scales["w2"] / s_x1, f"L{L} RQ_F")
-        row[RQ_IDX["X2"]] = rq_word(alpha2 * s_x1 / s_x2, f"L{L} RQ_X2")
+        row[RQ_IDX["F"]] = rq_for_scale(s_h * scales["w2"] / s_x1, f"L{L} RQ_F")
+        row[RQ_IDX["X2"]] = rq_for_scale(alpha2 * s_x1 / s_x2, f"L{L} RQ_X2")
         rq_table.append(row)
 
         s_x = s_x2      # every later layer enters on the previous DyT
@@ -330,7 +307,7 @@ def logit_rq_word(fc_codes) -> int:
     cannot clip.
     """
     largest = int(Q4_MAX * fc_codes.abs().sum(dim=0).max())
-    return rq_word(Q4_MAX / largest, "RQ_LOGIT")
+    return rq_for_scale(Q4_MAX / largest, "RQ_LOGIT")
 
 
 # =============================================================================

@@ -12,6 +12,7 @@ and the RTL know the command stream. See accel/test/README.md.
 """
 from __future__ import annotations
 
+import hashlib
 import os
 import re
 import shlex
@@ -71,6 +72,19 @@ def _flags(defines: dict) -> list:
     for key, val in sorted(defines.items()):
         out.append(f"-D{key}" if val is None else f"-D{key}={val}")
     return out
+
+
+def _build_key(source: str, defines: dict, include_dirs) -> str:
+    """A short digest of everything that changes the image.
+
+    `make` compares timestamps and cannot see a changed `-D`, so a build
+    directory per shape is what stops a sweep from running the previous shape's
+    image against this shape's golden. That failure is not hypothetical — it is
+    silent when the two shapes happen to touch the same addresses.
+    """
+    material = repr((os.path.abspath(source), sorted(defines.items()),
+                     [os.path.abspath(d) for d in include_dirs]))
+    return hashlib.sha1(material.encode()).hexdigest()[:8]
 
 
 def _slice(image, ranges: list) -> dict:
@@ -173,9 +187,12 @@ def build_firmware(source: str, defines: dict, include_dirs=(),
     different shapes cannot share a stale object.
     """
     stem = os.path.splitext(os.path.basename(source))[0]
-    build = os.path.join(BUILD_ROOT, "fw", stem)
+    key = _build_key(source, defines, include_dirs)
+    build = os.path.join(BUILD_ROOT, "fw", f"{stem}-{key}")
     os.makedirs(build, exist_ok=True)
     extra = " ".join([*[f"-I{d}" for d in include_dirs], *_flags(defines)])
+    with open(os.path.join(build, "flags.txt"), "w") as f:
+        f.write(f"{os.path.abspath(source)}\n{extra}\n")
     cmd = ["make", "-C", FW_DIR, "--no-print-directory",
            f"PROG={stem}", f"SRC={os.path.abspath(source)}",
            f"BUILD={os.path.abspath(build)}", f"EXTRA_CFLAGS={extra}"]
@@ -235,7 +252,11 @@ class RTLBackend(Backend):
         if shutil.which("iverilog") is None:
             raise SystemExit("iverilog is not on PATH")
         tb = "fw_uart_tb" if self.uart else "fw_matmul_tb"
-        self.vvp = os.path.join(self.workdir, f"{self.stem}_{tb}.vvp")
+        # The image path is compiled into the .vvp, so it is keyed the same way.
+        key = _build_key(source, defines, include_dirs)
+        self.workdir = os.path.join(BUILD_ROOT, "rtl", f"{self.stem}-{key}")
+        os.makedirs(self.workdir, exist_ok=True)
+        self.vvp = os.path.join(self.workdir, f"{tb}.vvp")
         # iverilog runs from tb/, which is what core.f's relative paths assume.
         cmd = ["iverilog", "-g2012", "-Wall", "-f", "core.f",
                f'-DFW_HEX="{self.hex}"', f'-DFW_NAME="{self.stem}"',

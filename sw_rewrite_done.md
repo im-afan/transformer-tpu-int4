@@ -28,7 +28,7 @@ accel/test/tests/<name>/generate.py     its VectorGenerator + its CLI
       native cc + iss.py    riscv gcc + Icarus    riscv gcc + UART
 ```
 
-## The five decisions
+## The seven decisions
 
 ### 1. RTL is a third backend, not a separate Makefile
 
@@ -95,7 +95,67 @@ whatever the last run left; a kernel reading an unwritten byte passed in simulat
 failed on hardware, intermittently. `zero_range()` is how a region gets into the image, and
 `infer`'s KV cache (~32 KB) is the real case.
 
-### 5. Shape-flexible, not architecture-flexible
+### 5. `run_program()` carries the counters back
+
+Every case's `Result` holds the device's own performance counters, keyed and ordered like
+the board's `'T'` reply, on every backend that has them. `prog.benchmark()` aggregates;
+`prog.format_benchmark()` renders; `report()` and `run_suite.py` print it.
+
+Both whole-core testbenches gained one machine-readable `PERF` line carrying all ten
+counters in `tpu_top.sv`'s `PERF_*` order — the same order the link's `'T'` reply uses. The
+first cut scraped the human-readable `$display` lines instead, which was a trap:
+`fw_matmul_tb`'s `SWEEP` line carries `m=`/`kt=`/`nt=`/`mxucmd=`/`dmacmd=` and matched the
+same regex. `SWEEP` is gone (its consumer, `run_fw_sweep.sh`, was deleted) and `PERFCMD`
+carries the two dispatch counts and the wall clocks in its place.
+
+On `ffn`, `-b rtl` (a backdoor probe of `u_perf.counts`) and `-b rtl-uart` (the counters
+read back over the simulated serial link) both report `run = 1038` — the same measurement
+by two different paths, which is the point of keying them the same way.
+
+`'T'` is newer than the other four commands, so `TPUBackend` warns once and reports no
+counters rather than failing the run against an older bitstream.
+
+### 6. A kernel's shape is its generator's, and reaches the compiler as -D
+
+Every shape, every operand address and every requant word now comes from
+`generate.py` and is handed to the compiler as `-D`; the `.c` keeps `#ifndef`
+defaults for a bare `make`. The numbers that ran are the numbers the golden was
+computed from, so they cannot disagree.
+
+- **`AddressMap`** allocates the operands, at one scratchpad bank each by
+  default — a bank serves one reader per clock and a matmul reads A, B and C at
+  once. It raises when a shape stops fitting instead of aliasing two tensors.
+- **`fit_rq(accumulators)`** derives each requant word from the accumulators the
+  golden just produced. A word tuned by hand for one contraction length
+  saturates or collapses at another, and an all-zero golden passes against any
+  datapath at all. Identity passes stay `RQ_ONE`. `fixed_point` moved into
+  `vector_generator.py` so the tests and the exporter share one definition;
+  `export.rq_word` became `rq_for_scale`, which is the scale arithmetic rather
+  than the two fields.
+- **Build directories are keyed on a hash of the flags.** `make` compares
+  timestamps and cannot see a changed `-D` — the old `tb/Makefile` worked around
+  this by cleaning every time. Without it a sweep silently runs the previous
+  shape's image against this shape's golden, which is exactly what the first cut
+  did.
+
+Three kernel bugs the sweep found, all of them latent before because the shape
+had never moved:
+
+- **`ffn.c` and `mha.c` only ever wrote one 8x8 output block.** The array's
+  output block is `TPU_N x TPU_N` whatever the live extent, so both extents have
+  to be walked; they walked neither (`ffn`) or only the columns. Fixed with the
+  row/column loops `matmul.c` already had.
+- **`vlen` is a 10-bit field and both kernels' relu passes exceeded it**, which
+  truncates silently: `T*DFF` at `32x256` is 8192, and `8192 & 0x3FF` is 0, so
+  the relu did nothing. Both now chunk at `TPU_VCHUNK_MAX`, and
+  `TPU_VLEN_MAX`/`TPU_VCHUNK_MAX` moved from `tpulib.h` to `tpu.h` — the limit
+  is a property of the command encoding, not of the primitive library, and a
+  kernel writing raw commands has to respect it too.
+- **`spadwin.c`'s table was 13 rows against a 16-entry scan**, so a winning index
+  above 12 would have gathered past it. The generator sizes the table to the
+  vector.
+
+### 7. Shape-flexible, not architecture-flexible
 
 `L / d / d_ff / heads / T / prompt / batch / block` are free. The block structure — ReLU
 attention, DyT, the double residual, 14 requant sites — is not. A structurally different
@@ -148,8 +208,8 @@ What went: `UartTrace` / `_TracedSerial` / `_hexdump` (~250 lines), the argparse
   dirs) and `EXTRA_CFLAGS=`. The `HOSTCC` / `%.trace` machinery went with it: the native
   build is `ISSBackend`'s job now.
 - `tb/Makefile` — block testbenches only; `core.f` added.
-- `tb/fw_matmul_tb.sv`, `tb/fw_uart_tb.sv` — `+DRAMOUT=<path>`, and headers pointing at the
-  new driver.
+- `tb/fw_matmul_tb.sv`, `tb/fw_uart_tb.sv` — `+DRAMOUT=<path>`, one `PERF` line each
+  (replacing `SWEEP` in the first), and headers pointing at the new driver.
 - `tests/infer/infer.c` — the shape block and the whole `DR_*` chain replaced by
   `#include "infer_config.h"`; ~40 lines out, the body untouched.
 - Docs: `accel/README.md`, `accel/tpu/README.md`, `fw/README.md`, `docs/README.md`,
@@ -163,7 +223,7 @@ What went: `UartTrace` / `_TracedSerial` / `_hexdump` (~250 lines), the argparse
 ```
 python accel/test/run_suite.py -b iss        5/5 pass, 0.6 s total
 python accel/test/run_suite.py -b rtl        5/5 pass, 19 s total
-tests/ffn/generate.py -b rtl-uart            pass
+tests/ffn/generate.py -b rtl-uart            pass, run=1038 (== -b rtl)
 tests/tiled/generate.py -b rtl-uart          pass
 infer.c natively + on the ISS                5610 commands, tokens out, at d=64/f=256/gen=3
 infer.c cross-compiled                       11 008 bytes of the 16 KB firmware RAM

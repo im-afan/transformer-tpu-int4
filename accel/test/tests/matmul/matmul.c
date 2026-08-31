@@ -3,8 +3,10 @@
  * same three numbers. See accel/tpu/docs/fw.md. */
 #include "tpu.h"
 
-/* Shape, supplied as -D by generate.py's VectorGenerator.defines. There is no
- * hardware row limit any more. */
+/* Shape, the address map and the requant word all come from generate.py as -D.
+ * The defaults below are only for a bare `make`; the numbers that ran are the
+ * generator's, which is also what computed the golden. There is no hardware row
+ * limit any more. */
 #ifndef M
 #define M      8                /* token rows */
 #endif
@@ -22,13 +24,21 @@
 #define W_ROW (N / 2)
 #define C_ROW (N / 2)
 
-#define RQ_C ((uint32_t)(4u << 12) | 1u)   /* {m0,n}: the store is int4 */
+#ifndef RQ_C                    /* {m0,n}: the store is int4 */
+#define RQ_C ((uint32_t)(4u << 12) | 1u)
+#endif
 
 /* Same address in DRAM and in the scratchpad, and one bank apart so A, B and C
  * never contend (scratchpad.sv: a bank serves one reader per clock). */
+#ifndef A_ADDR
 #define A_ADDR 0x0000u
+#endif
+#ifndef W_ADDR
 #define W_ADDR 0x2000u
+#endif
+#ifndef C_ADDR
 #define C_ADDR 0x4000u
+#endif
 
 int main(void)
 {

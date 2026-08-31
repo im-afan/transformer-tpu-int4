@@ -98,9 +98,22 @@ matching trace with a wrong image names the datapath.
 ## Stage 4 — the board
 
 `TPUBackend` loads the image with `'I'`, the static image with `'W'`, presses
-`'G'`, waits for the core to stop NAK'ing, and reads the result with `'R'`.
-There is no completion signal on this link; the idle probe is it. The `'T'`
-counters come back with every run.
+`'G'`, waits for the core to stop NAK'ing, reads the `'T'` counters, and reads
+the result with `'R'`. There is no completion signal on this link; the idle
+probe is it.
+
+`'T'` is read before the result so the number does not depend on how long the
+readback took, and non-fatally: it is newer than the other four commands, so a
+bitstream flashed before it existed NAKs the byte and the run reports no
+counters rather than failing.
+
+## Benchmarking
+
+The same counters come back from `rtl` and `rtl-uart`, keyed and ordered the
+same way (`tpu_uart.TIMER_COUNTERS`), so the three are one measurement rather
+than three that resemble each other. `run_program()` puts them on every
+`Result`; `prog.benchmark()` and `run_suite.py --bench` are the readouts. See
+[`../../test/README.md`](../../test/README.md#benchmarking).
 
 ## Where a failure means what
 

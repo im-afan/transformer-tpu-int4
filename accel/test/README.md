@@ -26,12 +26,12 @@ tests/<name>/generate.py     its VectorGenerator + its CLI
 
 ### The three backends
 
-| | builds | runs on | sees all of DRAM | command trace | cycle counters |
+| | builds | runs on | sees all of DRAM | command trace | perf counters |
 | --- | --- | --- | --- | --- | --- |
-| `iss` | host `cc`, `-DTPU_TRACE` | `iss.py` | yes | yes | no |
-| `rtl` | RISC-V gcc | Icarus, whole core | yes | yes | yes |
-| `rtl-uart` | RISC-V gcc | Icarus, loaded over the simulated link | yes | yes | yes |
-| `board` | RISC-V gcc | the Cmod A7 | no | no | yes |
+| `iss` | host `cc`, `-DTPU_TRACE` | `iss.py` | yes | yes | no cycle model |
+| `rtl` | RISC-V gcc | Icarus, whole core | yes | yes | yes, + dispatch counts |
+| `rtl-uart` | RISC-V gcc | Icarus, loaded over the simulated link | yes | yes | yes, read back over `'T'` |
+| `board` | RISC-V gcc | the Cmod A7 | no | no | yes, over `'T'` |
 
 - **`iss` is where you iterate.** Seconds. It is the native build of the same `.c`, with
   `tpu.h`'s two MMIO primitives swapped for a trace emitter, so nothing but those two
@@ -50,7 +50,8 @@ tests/<name>/generate.py     its VectorGenerator + its CLI
 
 ```python
 class VectorGenerator:
-    defines: dict                  # -D flags the kernel is compiled with
+    defines: dict                  # -D the kernel is compiled with: its shape,
+                                   # its address map, its requant words
     def static(self) -> dict                  # {addr: byte}, loaded once
     def cases(self) -> Iterable[Case]         # Case(name, patch, golden, check_ranges)
     def writable_ranges(self) -> list         # DRAM the kernel may scribble on
@@ -65,8 +66,108 @@ class Backend:
 the backend has them.
 
 `TPUProgram(source, backend, generator).run_program()` builds, loads the static image once,
-then per case writes the patch, runs, and compares. `read_timers()` gives the per-case
-counters; `passed()` is the verdict.
+then per case writes the patch, runs, and compares. It returns one `Result` per case;
+`passed()` is the verdict.
+
+## Benchmarking
+
+`run_program()` carries the device's own performance counters back on every case, for the
+backends that have them:
+
+```python
+results  = prog.run_program()
+results[0].counters        # {'run': 42225, 'mxu': 4730, 'dma': 31501, ...}
+prog.read_timers()         # one dict per case
+prog.timer_totals()        # them summed
+prog.benchmark(clk_mhz=12) # clocks, ms, per-counter share, min/mean/max per case
+print(prog.format_benchmark())
+```
+
+```
+  run                                       42225 clocks  3.519 ms @ 12 MHz
+  MXU busy                                   4730   11.2%
+    of which weight load                        0    0.0%
+  VPU busy                                   1665    3.9%
+  DMA busy                                  31501   74.6%
+  no unit busy (issue overhead)              4329   10.3%
+  producer stalled on a full queue              0    0.0%
+  two or more units busy                        0    0.0%
+  MXU dispatches                               12
+  DMA dispatches                               24
+```
+
+From the CLI: every test prints this after its verdict, and `run_suite.py` tabulates one
+line per kernel (`--bench` for the full breakdown, `--clk-mhz` to quote the milliseconds at
+a different core clock).
+
+Three things to know before reading a number off it:
+
+- **The keys are the board's `'T'` reply**, in wire order (`tpu_uart.TIMER_COUNTERS`), on
+  every backend that reports any. So a simulated run and a hardware run are the same
+  measurement, not two things that resemble each other. On `ffn`, `-b rtl` (a backdoor probe
+  of `u_perf.counts`) and `-b rtl-uart` (the counters read back over the simulated link)
+  both give `run = 1038`.
+- **The counters overlap and do not partition the run.** `run` is the denominator; `mload`
+  is a subset of `mxu`, `ovlap` of the three unit counters. The shares sum past 100% on
+  purpose. `swait` and `vmm` are retired slots and always read 0.
+- **The wall clock is not the measurement.** It is dominated by iverilog or by USB latency.
+  `run` is the core's own busy interval, `'G'` to `done` and nothing else.
+
+Simulation adds `mxucmd` / `dmacmd` (each queue's own `issued`, so "how many dispatches did
+this shape cost the CPU" is measured rather than assumed) and `wallclk` (`host_run` to
+`done`, against the counter block's own `run`). The link has no way to report those.
+
+The ISS has no cycle model: `read_timers()` there is empty and `benchmark()` is `None`.
+`'T'` is also newer than the other four commands, so a board flashed with a bitstream that
+predates it warns once and reports no counters rather than failing the run.
+
+## Shapes are a knob
+
+A kernel's shape, its address map and its requant words all come from its
+generator and reach the compiler as `-D`. The `.c` carries `#ifndef` defaults so
+a bare `make` still works, but the numbers that *ran* are the generator's — which
+are also the numbers the golden was computed from, so the two cannot disagree.
+
+```bash
+python accel/test/tests/matmul/generate.py  -b rtl -M 32 --ktiles 8 --ntiles 4
+python accel/test/tests/ffn/generate.py     -b rtl -T 32 -d 64 -f 256
+python accel/test/tests/mha/generate.py     -b rtl -T 32 -d 32 --head-dim 16
+python accel/test/tests/tiled/generate.py   -b iss --depth1 2048 --vec 4000 --arena-banks 6
+python accel/test/tests/spadwin/generate.py -b rtl -w 64 --row-bytes 32
+```
+
+Three pieces make that work:
+
+- **`AddressMap`** allocates the operands instead of hardcoding them. Default
+  granularity is one scratchpad bank, which is why the small kernels' tensors
+  sit `0x1000` apart: a bank serves one reader per clock and a matmul reads A, B
+  and C at once. It raises when a shape no longer fits rather than aliasing two
+  tensors.
+- **`fit_rq(accumulators)`** derives each requant word from the accumulators the
+  golden just produced, so it lands the largest of them on the top of the int4
+  grid. A word tuned by hand for one contraction length saturates or collapses
+  at another, and an all-zero golden passes against any datapath at all. Same
+  rule `export.logit_rq_word` uses for the output head. Identity passes stay
+  `RQ_ONE`.
+- **The build directory is keyed on the flags.** `make` compares timestamps and
+  cannot see a changed `-D`, so without this a sweep silently runs the previous
+  shape's image against this shape's golden. Repeat runs at one shape still hit
+  the cache.
+
+What each kernel's shape can actually be:
+
+| kernel | free | fixed |
+| --- | --- | --- |
+| `matmul` | rows, contraction tiles, output tiles | — |
+| `ffn` | `T`, `D`, `DFF`, all multiples of `TPU_N` | — |
+| `mha` | `T`, `D`, `head_dim`, all multiples of `TPU_N` | one head, no causal mask |
+| `tiled` | all seven extents, and the arena | — |
+| `spadwin` | vector length, gathered row bytes (a multiple of 4) | — |
+| `infer` | `L / d / d_ff / heads / T / prompt / batch / block` | via `infer_config.h`, not `-D` |
+
+`infer` is the one that uses a generated header instead: it has a whole DRAM map
+to carry, not five addresses, and a header keeps the command line short. Same
+principle, different delivery.
 
 ## Running it
 
@@ -74,6 +175,7 @@ counters; `passed()` is the verdict.
 python accel/test/run_suite.py                      # every kernel, on the ISS
 python accel/test/run_suite.py -b rtl               # ...through the whole core, ~20 s
 python accel/test/run_suite.py -b rtl -k tiled -v   # one, with the simulator's output
+python accel/test/run_suite.py -b rtl --bench       # ...and the full counter breakdown
 python accel/test/run_suite.py -b board -p /dev/ttyUSB1
 
 python accel/test/tests/matmul/generate.py -b rtl --ktiles 16 --ntiles 16
@@ -92,11 +194,17 @@ The RTL block testbenches are unchanged and still live in `accel/tpu/tb`:
 
 1. `mkdir accel/test/tests/<name>` and put the kernel's `.c` in it. It includes `tpu.h` or
    `tpulib.h`; `accel/tpu/fw` is on the include path, and so is the test's own directory.
-2. Write `generate.py`: subclass `VectorGenerator`, implement `static()` and `cases()`,
-   and expose `program(backend)` plus a `main()` built on `standard_parser` /
-   `backend_from_args` / `report`.
+   **`#ifndef`-guard every shape, address and requant word** — the guarded value is the
+   default for a bare `make`, and the generator's `-D` is what runs.
+2. Write `generate.py`: subclass `VectorGenerator`, build an `AddressMap`, compute the
+   golden stage by stage with `fit_rq` between stages, put shape + map + requant words in
+   `self.defines`, and expose `program(backend, ...)` plus a `main()` built on
+   `standard_parser` / `backend_from_args` / `report`. Give every shape a flag.
 3. Add its watchdog to `run_suite.WATCHDOG_NS` if it runs longer than a few thousand
    clocks. A watchdog that never fires on a hang is worth nothing.
+
+`main()` gets the counter table for free — `report(prog, args.clk_mhz)` prints it whenever
+the backend produced one.
 
 **Compute the golden, don't capture it.** `vector_generator` gives you `narrow`, `dyt`,
 `rq_word` and the packing helpers; the reference should be the plainest thing that gets the

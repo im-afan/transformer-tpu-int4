@@ -120,9 +120,87 @@ class TPUProgram:
     def _peek(self, run, addr: int) -> int:
         return run.dram.get(addr, -1)
 
+    # ---- benchmarking -------------------------------------------------------
     def read_timers(self) -> list:
-        """Per-case performance counters, for the backends that have them."""
+        """One counter dict per case, for the backends that have them.
+
+        `rtl`, `rtl-uart` and `board` do; the ISS has no cycle model and returns
+        an empty list. The keys and their order are the board's 'T' reply
+        (`tpu_uart.TIMER_COUNTERS`), so a simulated run and a hardware run are
+        directly comparable. The simulation adds `mxucmd` / `dmacmd` / `wallclk`,
+        which the link has no way to report.
+
+        Every counter measures the same window — reset at 'G', frozen at the
+        halt — and they **overlap** rather than partitioning it: `mload` is a
+        subset of `mxu`, `ovlap` of the three unit counters. `run` is the
+        denominator. `swait` and `vmm` are retired slots and always read 0.
+        """
         return [r.counters for r in self.results if r.counters]
+
+    def timer_totals(self) -> dict:
+        """The per-case counters summed. Empty if the backend has none."""
+        totals: dict = {}
+        for ctr in self.read_timers():
+            for key, val in ctr.items():
+                totals[key] = totals.get(key, 0) + val
+        return totals
+
+    def benchmark(self, clk_mhz: float = 12.0) -> dict | None:
+        """A summary of what the run cost, or None if nothing was timed.
+
+        `clk_mhz` only converts clocks to milliseconds — the clocks themselves
+        are the measurement, and they are the same clocks in simulation and on
+        the board. 12 MHz is the Cmod A7's core clock.
+        """
+        per_case = self.read_timers()
+        if not per_case:
+            return None
+        runs = [c.get("run", 0) for c in per_case]
+        totals = self.timer_totals()
+        total_run = sum(runs) or 1
+        return {
+            "cases": len(per_case),
+            "clk_mhz": clk_mhz,
+            "clocks": totals.get("run", 0),
+            "ms": totals.get("run", 0) / (clk_mhz * 1e3),
+            "per_case": per_case,
+            "run_min": min(runs), "run_max": max(runs),
+            "run_mean": sum(runs) / len(runs),
+            "totals": totals,
+            # Fraction of the run each counter was active. Sums past 1.0 on
+            # purpose: they overlap.
+            "share": {k: v / total_run for k, v in totals.items()
+                      if k not in ("run", "mxucmd", "dmacmd", "wallclk")},
+        }
+
+    def format_benchmark(self, clk_mhz: float = 12.0, indent: str = "  ") -> str:
+        """`benchmark()` as a table. Empty string when nothing was timed."""
+        bench = self.benchmark(clk_mhz)
+        if bench is None:
+            return ""
+        labels = {"mxu": "MXU busy", "mload": "  of which weight load",
+                  "vpu": "VPU busy", "dma": "DMA busy",
+                  "idlec": "no unit busy (issue overhead)",
+                  "qfull": "producer stalled on a full queue",
+                  "ovlap": "two or more units busy"}
+        lines = [f"{indent}{'run':<34} {bench['clocks']:>12} clocks  "
+                 f"{bench['ms']:.3f} ms @ {clk_mhz:g} MHz"]
+        for key, label in labels.items():
+            if key not in bench["totals"]:
+                continue
+            lines.append(f"{indent}{label:<34} {bench['totals'][key]:>12}  "
+                         f"{100 * bench['share'][key]:5.1f}%")
+        for key, label in (("mxucmd", "MXU dispatches"),
+                           ("dmacmd", "DMA dispatches")):
+            if key in bench["totals"]:
+                lines.append(f"{indent}{label:<34} {bench['totals'][key]:>12}")
+        if bench["cases"] > 1:
+            lines.append(f"{indent}{'per case':<34} "
+                         f"{bench['run_mean']:>12.0f} mean, "
+                         f"{bench['run_min']} min, {bench['run_max']} max")
+        if any(v == 0xFFFFFFFF for v in bench["totals"].values()):
+            lines.append(f"{indent}[SATURATED — at least one counter pinned]")
+        return "\n".join(lines)
 
     def passed(self) -> bool:
         return bool(self.results) and all(r.ok for r in self.results)
@@ -146,6 +224,9 @@ def standard_parser(description: str):
     ap.add_argument("-p", "--port", default=None, help="serial port (board only)")
     ap.add_argument("-v", "--verbose", action="store_true",
                     help="show the simulator's own output")
+    ap.add_argument("--clk-mhz", type=float, default=12.0,
+                    help="core clock the benchmark's milliseconds are quoted "
+                         "at (default 12, the Cmod A7's)")
     return ap
 
 
@@ -162,11 +243,17 @@ def backend_from_args(args, watchdog_ns: int = 2_000_000):
     return TPUBackend(port=args.port, quiet=not args.verbose)
 
 
-def report(program: "TPUProgram") -> int:
-    """Print the verdict; return a process exit code."""
+def report(program: "TPUProgram", clk_mhz: float = 12.0) -> int:
+    """Print the verdict and, where the backend timed the run, what it cost.
+    Returns a process exit code."""
     n = len(program.results)
     bad = [r for r in program.results if not r.ok]
     print()
+    bench = program.format_benchmark(clk_mhz)
+    if bench:
+        print(f"{program.name} on {program.backend.name}, {n} case(s):")
+        print(bench)
+        print()
     if not bad:
         print(f"{program.name}: {n} case(s) PASSED on {program.backend.name}")
         return 0

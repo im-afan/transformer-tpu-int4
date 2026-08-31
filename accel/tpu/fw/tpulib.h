@@ -30,11 +30,6 @@
 #endif
 #define TPU_BANK_BYTES (TPU_BANK_WORDS * TPU_WORD_BYTES)
 
-/* vpu_vlen is 10 bits and must be even; a whole number of array words keeps a
- * chunk's byte count a whole number of scratchpad words too. */
-#define TPU_VLEN_MAX   1023u
-#define TPU_VCHUNK_MAX ((TPU_VLEN_MAX / TPU_N) * TPU_N)
-
 #define TPU_ALIGN_DOWN(v, a) ((v) & ~((uint32_t)(a) - 1u))
 #define TPU_ALIGN_UP(v, a)   TPU_ALIGN_DOWN((v) + (uint32_t)(a) - 1u, (a))
 

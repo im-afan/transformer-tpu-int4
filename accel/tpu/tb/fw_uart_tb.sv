@@ -475,6 +475,16 @@ module fw_uart_tb;
                  n_cmd_got, n_cmd_exp);
     endtask
 
+    // The counters as one parseable line. Ten fields, tpu_top.sv's PERF_* order,
+    // which is also TIMER_COUNTERS in accel/test/tpu_uart.py.
+    task automatic emit_perf(input logic [NPERF*32-1:0] ctr);
+        $display("PERF run=%0d mxu=%0d mload=%0d vpu=%0d dma=%0d swait=%0d vmm=%0d idlec=%0d qfull=%0d ovlap=%0d",
+                 ctr_w(ctr, P_RUN), ctr_w(ctr, P_MXU), ctr_w(ctr, P_MLOAD),
+                 ctr_w(ctr, P_VPU), ctr_w(ctr, P_DMA), ctr_w(ctr, P_SWAIT),
+                 ctr_w(ctr, P_VMM), ctr_w(ctr, P_IDLEC), ctr_w(ctr, P_QFULL),
+                 ctr_w(ctr, P_OVLAP));
+    endtask
+
     // The counter block, checked for the invariants that hold for any kernel —
     // this tests perf_counters.sv and the 'T' reply rather than this particular
     // program. The per-unit expectations are derived from the *expected command
@@ -498,6 +508,11 @@ module fw_uart_tb;
                  ctr_w(ctr, P_VPU), ctr_w(ctr, P_VMM), ctr_w(ctr, P_DMA));
         $display("            idlec=%0d qfull=%0d ovlap=%0d",
                  ctr_w(ctr, P_IDLEC), ctr_w(ctr, P_QFULL), ctr_w(ctr, P_OVLAP));
+        // One machine-readable line for accel/test, all ten in the 'T' wire
+        // order. These are the bytes the board's 'T' reply carries, read back
+        // over the link rather than probed, so a benchmark taken here and one
+        // taken on hardware are the same measurement.
+        emit_perf(ctr);
 
         // The device's own measure of the run against the testbench's.
         want = busy_clocks();

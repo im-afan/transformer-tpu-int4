@@ -3,18 +3,36 @@
  * See accel/tpu/docs/fw.md. */
 #include "tpulib.h"
 
+/* Shape and both address maps come from generate.py as -D. The defaults below
+ * are only for a bare `make`. */
+#ifndef VEC_WORDS
 #define VEC_WORDS 16            /* int32 words the CPU scans */
+#endif
+#ifndef ROW_BYTES
 #define ROW_BYTES 16            /* bytes in one table row    */
+#endif
 
 /* ---- DRAM ---------------------------------------------------------------- */
-#define DR_VEC   0x0000u        /* [VEC_WORDS] int32     — host   */
-#define DR_TABLE 0x0100u        /* [13][ROW_BYTES] int8  — host   */
-#define DR_OUT   0x0200u        /* the results below     — device */
+#ifndef DR_VEC
+#define DR_VEC   0x0000u        /* [VEC_WORDS] int32       — host   */
+#endif
+#ifndef DR_TABLE
+#define DR_TABLE 0x0100u        /* [rows][ROW_BYTES] int8  — host   */
+#endif
+#ifndef DR_OUT
+#define DR_OUT   0x0200u        /* the results below       — device */
+#endif
 
 /* ---- scratchpad ---------------------------------------------------------- */
+#ifndef SP_VEC
 #define SP_VEC 0x0000u          /* [VEC_WORDS] int32                    */
+#endif
+#ifndef SP_OUT
 #define SP_OUT 0x0100u          /* {index, value, readback} int32       */
+#endif
+#ifndef SP_ROW
 #define SP_ROW 0x0200u          /* [ROW_BYTES] int8, the gathered row   */
+#endif
 
 int main(void)
 {
@@ -45,7 +63,7 @@ int main(void)
                    TPU_DMA_FILL);
     tpu_wait(TPU_U_DMA);
 
-    tpu_move_bytes(SP_OUT, DR_OUT, 12u, TPU_DMA_SPILL);
+    tpu_move_bytes(SP_OUT, DR_OUT, 3u * 4u, TPU_DMA_SPILL);
     tpu_move_bytes(SP_ROW, DR_OUT + 16u, ROW_BYTES, TPU_DMA_SPILL);
     tpu_wait(TPU_U_DMA);
 

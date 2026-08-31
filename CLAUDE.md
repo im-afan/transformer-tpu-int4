@@ -58,7 +58,8 @@ python accel/test/run_suite.py -b rtl -k tiled -v
 python accel/test/run_suite.py -b rtl-uart      # ...loaded over the simulated UART, ~6x
 python accel/test/run_suite.py -b board -p COM5
 
-python accel/test/tests/matmul/generate.py -b rtl --ktiles 16 --ntiles 16
+python accel/test/tests/matmul/generate.py -b rtl -M 32 --ktiles 8 --ntiles 4
+python accel/test/tests/ffn/generate.py -b rtl -T 32 -d 64 -f 256
 python accel/test/tests/infer/generate.py -b iss --synthetic --gen 3 -n 1
 python accel/test/tests/infer/generate.py -b iss -n 256        # accuracy, generating
 python -m accel.test.export --dump-rq --model-path model/saved/int4_d128_f512_l4.pt
@@ -288,13 +289,25 @@ training shape and the generation shape**.
 - `backends.py` — `ISSBackend` (native build + co-execution), `RTLBackend` (RISC-V image
   through the whole core in Icarus, `uart=True` for the serial load path), `TPUBackend`
   (the board). All three: `build`, `load` once, `run(patch)` per case.
-- `vector_generator.py` — the `VectorGenerator` / `Case` contract and the packing, requant
-  and `$readmemh` helpers.
+- `vector_generator.py` — the `VectorGenerator` / `Case` contract, `AddressMap`, `fit_rq`,
+  and the packing / requant / `$readmemh` helpers.
 - `program.py` — `TPUProgram(source, backend, generator).run_program()`: build, load,
-  per-case compare, plus the stray-write check.
+  per-case compare, plus the stray-write check. Each `Result` carries that case's perf
+  counters; `benchmark()` / `format_benchmark()` aggregate them, and `report()` and
+  `run_suite.py` print them. Keys and order are the board's `'T'` reply on every backend
+  that has them, so `rtl`, `rtl-uart` and `board` are directly comparable — they overlap
+  and do not partition the run.
 - `export.py` — checkpoint -> `infer_config.h` (shape, the whole DRAM map, the requant
   table) + the static DRAM image. **Python owns the addresses; `infer.c` computes none.**
 - `tests/<name>/` — one kernel's `.c` and its `generate.py`, in one folder.
+  **A kernel's shape, address map and requant words come from its generator as `-D`**; the
+  `.c` carries `#ifndef` defaults for a bare `make`. `fit_rq` derives each requant word
+  from the accumulators the golden produced, so a shape change cannot silently saturate or
+  collapse a tensor. Every shape has a flag: `-M/--ktiles/--ntiles`, `-T/-d/-f`,
+  `--head-dim`, `--depth1/--vec/--arena-banks`, `-w/--row-bytes`.
+  **The build directory is keyed on a hash of the flags** — `make` compares timestamps and
+  cannot see a changed `-D`, so without that a sweep runs the previous shape's image
+  against this shape's golden.
 - `run_suite.py` — all of them, on one backend.
 
 Three rules the backends depend on: the static image must be **dense over everything the
