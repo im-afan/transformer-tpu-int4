@@ -223,6 +223,11 @@ command queues 815, `dma` 493.
 - `tpu_matmul` blocks a GEMM in rows (`t_len <= 32`), columns and the contraction, stages
   whichever operands are in DRAM through a caller-supplied `tpu_arena`, and requants on store
   when the contraction was unsplit or through the VPU when it was not.
+- **`tpu_matmul_wide` is `tpu_matmul` with a one-column-block C.** It spends the
+  arena's spare bytes on row-panel depth instead of C width, so a wide GEMM reads
+  its weight stream fewer times — but it has no transposed-B and no accumulate
+  path, and it issues `cols/N` spills per panel instead of one. `docs/fw.md` has
+  the cases where it is a loss; `tests/tiled/`'s `--mm5-general` is the A/B.
 - `tpu_add_narrow` / `tpu_relu_narrow` / `tpu_pack4` chunk the VPU pairs at `vlen`;
   `tpu_transpose_int8`, `tpu_transpose_dram_int8`, `tpu_move2d` cover the rest.
 - **Every primitive is self-fencing** — it returns only once its commands have retired — so

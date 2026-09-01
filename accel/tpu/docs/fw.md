@@ -46,12 +46,115 @@ a raw DMA the caller fences itself.
 `tpu_matmul`'s row loop runs over panels sized to the arena rather than single
 N-row blocks, and a panel's whole C stays resident until the column loop is
 done — so a weight stream and a result spill are each paid once per panel, not
-once per output block.
+once per output block. `tpu_matmul_wide` is the same loop with a one-block-wide
+C; the section below is when to reach for which.
 
 `tpu_matmul`, `tpu_gemm_blocks`-equivalent chooser logic, and friends are
 `always_inline`, which is load-bearing: with the shape constant at the call
 site gcc folds the block arithmetic away, and the PicoRV32 runs it with no
 unit busy. See CLAUDE.md's note on `always_inline` firmware primitives.
+
+### `tpu_matmul_wide` — one column block of C on chip instead of a whole row
+
+Same GEMM, same `tpu_gemm` struct, same arena. The one structural change is that
+a staged C row is `TPU_N` wide rather than `cols` wide, so the arena's spare
+bytes buy row-panel depth instead of C width:
+
+| | a panel row costs | staged C |
+| --- | --- | --- |
+| `tpu_matmul` | `depth/2 + align_up(cols, N)/2` | `[panel_rows][cols]` |
+| `tpu_matmul_wide` | `depth/2 + TPU_WORD_BYTES` | `[panel_rows][N]` |
+
+B is re-read `ceil(rows / panel_rows)` times, and that re-read is the whole
+weight stream. So a deeper panel is fewer passes over B — which is the win, and
+the only win. It is paid for with `cols/N` spill commands per panel instead of
+one, so the same C bytes leave in `cols/N` times as many DMA ranges.
+
+`tests/tiled/`'s fifth pass is the regression, and `MM5_WIDE=0`
+(`--mm5-general`) runs the identical problem through `tpu_matmul` against the
+same golden — that is the A/B.
+
+#### Where it is not legal
+
+The first four are `TPU_ASSERT`s, and **`TPU_ASSERT` compiles to nothing outside
+the `TPU_TRACE` build** — a violation is caught on the ISS and corrupts silently
+on the RTL and the board. Check the shape on `-b iss` before running it anywhere
+else.
+
+1. **A transposed B.** `TPU_MM_T` has no path here. A transposed column block is
+   `[N][depth]` in DRAM, a different fill and a different `b_stride`; attention's
+   `Q@K'` and anything else with `.transpose = 1` needs `tpu_matmul`.
+2. **Accumulate.** No `TPU_MM_ACC` path: it would need the C column block filled
+   from DRAM before each column's matmuls, and the callers that want accumulate
+   are the split-contraction ones this is not aimed at.
+3. **`depth` not a multiple of `TPU_N`, or past `0xFFFF`.** The contraction is
+   taken in one dispatch, exactly as in `tpu_matmul`.
+4. **An odd `cols`.** A row is two elements per byte.
+5. **An arena under three banks.** A, B and C are read on the same clock and a
+   bank serves one requester per clock, so each needs a whole bank of its own.
+
+A `cols` that is *not* a multiple of `TPU_N` is fine — the last column block
+computes `TPU_N` wide and spills `ncols`, the same way `tpu_matmul` does. This is
+the one restriction the hand-written `tiled_simple.c::tiled_matmul_optimized`
+has that the library function does not.
+
+#### Where it is legal and still a loss
+
+6. **`depth/2` already dominates `cols/2`.** Then A's slot, not C's, is what caps
+   the panel, both functions pick the same `panel_rows`, and the extra spill
+   commands are pure cost. `tiled`'s default fifth pass — 20x512 @ 512x52 in a
+   3-bank arena — is exactly this: both settle on a 16-row panel, and the run is
+   **92 commands wide against 80 general**.
+7. **The problem already fits one panel of `tpu_matmul`** (`rows <= panel_rows`).
+   Both read B once; only the spill count differs, so wide can only lose.
+8. **`cols` near `TPU_N`.** There is nothing to reclaim from C's width.
+9. **A wide C over a shallow panel.** The spill command count is
+   `ceil(rows/panel_rows) * cols/N`, and each of those is a fence for the
+   producer. Past some width the issue overhead outruns the B reuse — the
+   crossover is a property of the shape, so measure it rather than assume.
+
+Range count itself is close to free: `tiled_simple` at 128x128 @ 128x512 moves
+16 512 DMA ranges and lands at 106 688 clocks against a 106 496-clock floor, so
+`sram.sv` charges ~0 per range beyond its bytes. The cost of point 9 is the
+**commands**, not the ranges.
+
+#### What it is worth when it applies
+
+The A/B in `tests/tiled/`, at `--rows5 128 --depth5 64 --cols5 512
+--arena-banks 6`. `tpu_matmul` settles on a 48-row panel there (a panel row
+costs it `32 + 256` bytes) and reads B three times; `tpu_matmul_wide` gets 128
+rows (`32 + 4`) and reads it once. Whole-kernel totals through the RTL, so
+passes 1-4 are the same work in both columns:
+
+| | commands | run | DMA busy | idle | MXU busy |
+| --- | --- | --- | --- | --- | --- |
+| `--mm5-general` | 1259 | 281 811 | 142 099 | 42 181 | 95 866 |
+| `tpu_matmul_wide` | 1190 | **221 779** | **109 514** | **14 734** | 95 866 |
+
+Identical MXU busy — it is the same arithmetic — and 60 032 clocks off the run,
+32 585 of it the two extra passes over B and 27 447 of it the barriers those
+passes cost the CPU.
+
+`tests/tiled_simple/` is the same algorithm hand-written out of raw `tpu.h`
+commands, without the library's arena arithmetic, and it is the cleaner
+measurement. At 128x128 @ 128x512 through the RTL:
+
+| | commands | run | DMA busy | idle |
+| --- | --- | --- | --- | --- |
+| one row block at a time | 3089 | 997 146 | 601 088 | 239 386 |
+| the whole of A staged | 1154 | **273 112** | **106 688** | 9 752 |
+
+3.65x, and the DMA lands on the single-pass floor: A once, B once, C once. What
+was removed is 15 re-reads of the weight stream.
+
+`tiled_matmul_optimized` is now the only kernel in that test: the one-row-block
+variant it was measured against is gone, and the superblock height is derived in
+the C from `SPAD_SIZE` and the shape rather than passed in as `SUPER_ROWS`. It
+takes `transpose` and `acc`, which pick up `TPU_MM_T` (W stored `[N][K]`, filled
+as `TPU_N` rows of `K` and given a `b_stride` of `K/2`) and `TPU_MM_ACC` (each C
+block filled from DRAM alongside its column block of W, one fill per superblock
+column rather than per row block). `generate.py`'s `--transpose` / `--acc` are
+the A/B.
 
 ## infer.c — the model generating
 
@@ -73,6 +176,31 @@ match and the emitted tokens aren't scored.
 `[BATCH][rows][D]`, sequence-major, so the three projections, `Wo` and both FFN
 matmuls run once over `BATCH*rows` rows. Attention stays per sequence — each
 has its own KV cache and its own append into it.
+
+**Which matmul each site gets.** Every non-transposed matmul goes through
+`INFER_MM`, which picks `tpu_matmul_wide` over `tpu_matmul` exactly where the
+wide layout's deeper row panel removes a pass over the weight stream —
+`TPU_MM_PREFER_WIDE` in `tpulib.h` compares the two pass counts from the same
+layout arithmetic the two functions use. `Q@K^T` is transposed, so it stays on
+`tpu_matmul`. Everything the macro sees is constant once `infer_block` is
+inlined, so the branch folds and only one of the two is emitted.
+
+At the live shape — `d=128`, `f=512`, a 61 440-byte usable arena, `BATCH=1`,
+`BLOCK=32` — it picks the general layout everywhere, because every problem
+already fits one panel (point 7 above):
+
+| site | rows | shape | general panel | wide panel | picked |
+| --- | --- | --- | --- | --- | --- |
+| `Wq`/`Wk`/`Wv`/`Wo` | 32 | 128 x 128 | 448 | 832 | general |
+| `P@V` | 32 | 128 x 32 | 704 | 832 | general |
+| FF1 | 32 | 128 x 512 | 160 | 832 | general |
+| FF2 | 32 | 512 x 128 | 176 | 208 | general |
+| head | 1 | 128 x 16 | 768 | 832 | general |
+
+FF1 is the site that flips: it wants `BATCH*BLOCK > 160`, so `--batch 8` at
+`BLOCK=32` puts it on the wide layout and takes its passes over `W1` from 2 to
+1. `-DINFER_MM_WIDE=1` forces wide at every legal site and `=0` forces general,
+which is the A/B.
 
 **Where tensors live.** Every tensor is in DRAM, every element int4, two per
 byte. `tpulib.h` owns the scratchpad: it stages each primitive's operands in
@@ -173,7 +301,7 @@ in, since A, B and C each need one of their own — so every loop in
 `tpu_matmul` and `tpu_elementwise` runs more than once to produce a right
 answer.
 
-Four problems, chosen for what they force rather than for what they compute:
+Five problems, chosen for what they force rather than for what they compute:
 1. `C1 = A1 @ W1`, 16x1024 @ 1024x16 — a whole 1024-element contraction in one
    dispatch (`len` is 16 bits, so the array never splits one) against operands
    that don't fit a bank; both the row loop and column loop run twice.
@@ -184,6 +312,10 @@ Four problems, chosen for what they force rather than for what they compute:
    extents that are NOT multiples of the array: the block computes padded and
    only the live rows/columns spill, the path that keeps decode's rows=1
    honest.
+4. `C5 = A5 @ W5`, 20x512 @ 512x52 through `tpu_matmul_wide` — more rows than
+   one panel of a 3-bank arena, so its row loop runs twice, and a last column
+   block that is 4 of 8 wide. `--mm5-general` runs the same problem through
+   `tpu_matmul` against the same golden.
 
 This is the one kernel that alone wouldn't test anything, because a tiling bug
 is something the ISS would reproduce as faithfully as the RTL. So

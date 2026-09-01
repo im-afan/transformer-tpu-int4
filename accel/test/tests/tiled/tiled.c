@@ -31,6 +31,19 @@
 #define MM4_COLS  20
 #endif
 
+#ifndef MM5_ROWS
+#define MM5_ROWS  20            /* more rows than one panel of this arena */
+#endif
+#ifndef MM5_DEPTH
+#define MM5_DEPTH 512
+#endif
+#ifndef MM5_COLS
+#define MM5_COLS  52            /* a ragged last column block */
+#endif
+#ifndef MM5_WIDE
+#define MM5_WIDE  1             /* 0 runs the same problem through tpu_matmul */
+#endif
+
 /* {m0, n} literals: m0 in the low 12 bits, n above. generate.py fits them to
  * the accumulators the golden actually produced, so they follow the shape. */
 #define RQ(m0, n) ((uint32_t)((n) << 12) | (m0))
@@ -45,6 +58,9 @@
 #endif
 #ifndef RQ_C4
 #define RQ_C4 RQ(1u, 4u)
+#endif
+#ifndef RQ_C5
+#define RQ_C5 RQ(1u, 7u)
 #endif
 
 #define I4(cols) ((cols) / 2)
@@ -79,6 +95,15 @@
 #endif
 #ifndef DR_C4
 #define DR_C4 0x05700u          /* [MM4_ROWS][MM4_COLS]  int4 */
+#endif
+#ifndef DR_A5
+#define DR_A5 0x05800u          /* [MM5_ROWS][MM5_DEPTH] int4 */
+#endif
+#ifndef DR_W5
+#define DR_W5 0x07000u          /* [MM5_DEPTH][MM5_COLS] int4 */
+#endif
+#ifndef DR_C5
+#define DR_C5 0x0B000u          /* [MM5_ROWS][MM5_COLS]  int4 */
 #endif
 
 /* ---- scratchpad ---------------------------------------------------------- */
@@ -119,6 +144,19 @@ int main(void)
         .rq_word = RQ_C4,
     };
     tpu_matmul(&mm4, &arena);
+
+    const tpu_gemm mm5 = {
+        .rows = MM5_ROWS, .depth = MM5_DEPTH, .cols = MM5_COLS,
+        .a = TPU_ROWS(DR_A5, I4(MM5_DEPTH)),
+        .b = TPU_ROWS(DR_W5, I4(MM5_COLS)),
+        .c = TPU_ROWS(DR_C5, I4(MM5_COLS)),
+        .rq_word = RQ_C5,
+    };
+#if MM5_WIDE
+    tpu_matmul_wide(&mm5, &arena);
+#else
+    tpu_matmul(&mm5, &arena);
+#endif
 
     return 0;                   /* start.S raises `done` from here */
 }

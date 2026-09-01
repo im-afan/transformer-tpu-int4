@@ -83,6 +83,31 @@ static tpu_arena arena;
 #define S_BUF   TPU_ROWS(DR_S,     I4(T))
 #define H_BUF   TPU_ROWS(DR_H,     I4(DFF))
 
+/* -DINFER_MM_WIDE=1 forces the wide layout at every legal site and =0 forces
+ * the general one; unset picks per shape. */
+#ifdef INFER_MM_WIDE
+#define INFER_MM_PICK(rows_, depth_, cols_) (INFER_MM_WIDE)
+#else
+#define INFER_MM_PICK(rows_, depth_, cols_) \
+    TPU_MM_PREFER_WIDE(SP_MAILBOX, (rows_), (depth_), (cols_))
+#endif
+
+/* Every matmul here that is not transposed goes through this. tpu_matmul_wide
+ * spends the arena on row-panel depth instead of C's width, so it reads the
+ * weight stream fewer times and spills once per column block; it is picked only
+ * where that removes a pass over B. Both are always_inline and every argument
+ * is constant once infer_block is inlined, so the branch folds away. */
+#define INFER_MM(rows_, depth_, cols_, ...)                                   \
+    do {                                                                      \
+        const tpu_gemm mm = { .rows = (rows_), .depth = (depth_),             \
+                              .cols = (cols_), __VA_ARGS__ };                 \
+                                                                              \
+        if (INFER_MM_PICK((rows_), (depth_), (cols_)))                        \
+            tpu_matmul_wide(&mm, &arena);                                     \
+        else                                                                  \
+            tpu_matmul(&mm, &arena);                                          \
+    } while (0)
+
 /* X holds embeddings for positions first_pos..first_pos+rows-1 of each of the
  * BATCH sequences, sequence-major; on return, the residual stream after all
  * four layers. `rows` is per sequence. See docs/fw.md. */
@@ -97,24 +122,21 @@ static inline void infer_block(unsigned rows, unsigned first_pos)
 
         /* Three [D][D] projections off the same X, separate because each weight
          * has its own scale and so its own {m0,n}. */
-        tpu_matmul(&(const tpu_gemm){
-            .rows = rows_all, .depth = D, .cols = D,
-            .a = X_BUF,
-            .b = TPU_ROWS(layer_wgt + LW_WQ, I4(D)),
-            .c = Q_BUF,
-            .rq_word = rq[RQ_Q] }, &arena);
-        tpu_matmul(&(const tpu_gemm){
-            .rows = rows_all, .depth = D, .cols = D,
-            .a = X_BUF,
-            .b = TPU_ROWS(layer_wgt + LW_WK, I4(D)),
-            .c = TMP_A,                         /* K_new */
-            .rq_word = rq[RQ_K] }, &arena);
-        tpu_matmul(&(const tpu_gemm){
-            .rows = rows_all, .depth = D, .cols = D,
-            .a = X_BUF,
-            .b = TPU_ROWS(layer_wgt + LW_WV, I4(D)),
-            .c = TMP_B,                         /* V_new */
-            .rq_word = rq[RQ_V] }, &arena);
+        INFER_MM(rows_all, D, D,
+                 .a = X_BUF,
+                 .b = TPU_ROWS(layer_wgt + LW_WQ, I4(D)),
+                 .c = Q_BUF,
+                 .rq_word = rq[RQ_Q]);
+        INFER_MM(rows_all, D, D,
+                 .a = X_BUF,
+                 .b = TPU_ROWS(layer_wgt + LW_WK, I4(D)),
+                 .c = TMP_A,                    /* K_new */
+                 .rq_word = rq[RQ_K]);
+        INFER_MM(rows_all, D, D,
+                 .a = X_BUF,
+                 .b = TPU_ROWS(layer_wgt + LW_WV, I4(D)),
+                 .c = TMP_B,                    /* V_new */
+                 .rq_word = rq[RQ_V]);
 
         /* Per sequence: append to its cache, then attend over it. Sequence
          * `seq`'s scores overwrite its own rows of K_new with A, which is safe
@@ -149,21 +171,19 @@ static inline void infer_block(unsigned rows, unsigned first_pos)
                         rows * T, rq[RQ_ID], &arena);
                 tpu_relu(S_BUF, S_BUF, rows * T, rq[RQ_P], &arena);
 
-                tpu_matmul(&(const tpu_gemm){
-                    .rows = rows, .depth = T, .cols = HEAD_DIM,
-                    .a = S_BUF,
-                    .b = TPU_ROWS(v_cache + head * I4(HEAD_DIM), I4(D)),
-                    .c = tpu_off(TMP_A, seq_off + head * I4(HEAD_DIM)),
-                    .rq_word = rq[RQ_A] }, &arena);        /* A */
+                INFER_MM(rows, T, HEAD_DIM,
+                         .a = S_BUF,
+                         .b = TPU_ROWS(v_cache + head * I4(HEAD_DIM), I4(D)),
+                         .c = tpu_off(TMP_A, seq_off + head * I4(HEAD_DIM)),
+                         .rq_word = rq[RQ_A]);              /* A */
             }
         }
 
-        tpu_matmul(&(const tpu_gemm){
-            .rows = rows_all, .depth = D, .cols = D,
-            .a = TMP_A,                         /* A */
-            .b = TPU_ROWS(layer_wgt + LW_WO, I4(D)),
-            .c = TMP_B,                         /* O; V_new is dead */
-            .rq_word = rq[RQ_O] }, &arena);
+        INFER_MM(rows_all, D, D,
+                 .a = TMP_A,                    /* A */
+                 .b = TPU_ROWS(layer_wgt + LW_WO, I4(D)),
+                 .c = TMP_B,                    /* O; V_new is dead */
+                 .rq_word = rq[RQ_O]);
 
         /* MultiHeadAttention.forward ends in `O + X` and Transformer.forward
          * adds X again, so this is 2X + O in two adds. The second is the DyT,
@@ -171,19 +191,17 @@ static inline void infer_block(unsigned rows, unsigned first_pos)
         tpu_add(TMP_A, X_BUF, TMP_B, rows_all * D, rq[RQ_XO], &arena);
         tpu_dyt(TMP_B, TMP_A, X_BUF, rows_all * D, rq[RQ_X1], &arena);
 
-        tpu_matmul(&(const tpu_gemm){
-            .rows = rows_all, .depth = D, .cols = DFF,
-            .a = TMP_B,                         /* X1 */
-            .b = TPU_ROWS(layer_wgt + LW_FF1, I4(DFF)),
-            .c = H_BUF,
-            .rq_word = rq[RQ_H] }, &arena);
+        INFER_MM(rows_all, D, DFF,
+                 .a = TMP_B,                    /* X1 */
+                 .b = TPU_ROWS(layer_wgt + LW_FF1, I4(DFF)),
+                 .c = H_BUF,
+                 .rq_word = rq[RQ_H]);
         tpu_relu(H_BUF, H_BUF, rows_all * DFF, rq[RQ_HR], &arena);
-        tpu_matmul(&(const tpu_gemm){
-            .rows = rows_all, .depth = DFF, .cols = D,
-            .a = H_BUF,
-            .b = TPU_ROWS(layer_wgt + LW_FF2, I4(D)),
-            .c = TMP_A,                         /* F; X+O is dead */
-            .rq_word = rq[RQ_F] }, &arena);
+        INFER_MM(rows_all, DFF, D,
+                 .a = H_BUF,
+                 .b = TPU_ROWS(layer_wgt + LW_FF2, I4(D)),
+                 .c = TMP_A,                    /* F; X+O is dead */
+                 .rq_word = rq[RQ_F]);
 
         tpu_dyt(X_BUF, TMP_B, TMP_A, rows_all * D, rq[RQ_X2], &arena);
     }
@@ -207,12 +225,11 @@ static unsigned head_argmax(unsigned x_row, unsigned seq, unsigned pos)
     int best_logit;
     uint32_t packed[I4(VOCAB_PAD) / 4u];
 
-    tpu_matmul(&(const tpu_gemm){
-        .rows = 1, .depth = D, .cols = VOCAB_PAD,
-        .a = tpu_off(X_BUF, x_row * I4(D)),
-        .b = TPU_ROWS(DR_HEAD_WGT, I4(VOCAB_PAD)),
-        .c = TPU_ROWS(dram_logits, I4(VOCAB_PAD)),
-        .rq_word = INFER_RQ_LOGIT }, &arena);
+    INFER_MM(1u, D, VOCAB_PAD,
+             .a = tpu_off(X_BUF, x_row * I4(D)),
+             .b = TPU_ROWS(DR_HEAD_WGT, I4(VOCAB_PAD)),
+             .c = TPU_ROWS(dram_logits, I4(VOCAB_PAD)),
+             .rq_word = INFER_RQ_LOGIT);
 
     tpu_move_bytes(SP_LOGITS, dram_logits, I4(VOCAB_PAD), TPU_DMA_FILL);
     tpu_wait(TPU_U_DMA);
