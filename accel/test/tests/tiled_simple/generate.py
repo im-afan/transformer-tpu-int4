@@ -9,10 +9,13 @@ the image holds.
 
 `--transpose` stores W as [N][K] and runs the matmul with TPU_MM_T; `--acc`
 seeds DR_C and runs with TPU_MM_ACC, so C = clip4(requant(A @ W) + C_old).
+Column block j+1 is staged under block j's matmuls by default, into a second
+bank-aligned half of the W region; `--single-buffer` is the A/B.
 
     python accel/test/tests/tiled_simple/generate.py -b iss
     python accel/test/tests/tiled_simple/generate.py -b rtl -M 32 -K 64 -N 32
     python accel/test/tests/tiled_simple/generate.py -b rtl -M 12 -K 256 -N 24
+    python accel/test/tests/tiled_simple/generate.py -b rtl -M 32 -K 64 -N 64 --single-buffer
     python accel/test/tests/tiled_simple/generate.py -b iss -M 12 -K 64 -N 16 --transpose --acc
 """
 from __future__ import annotations
@@ -45,15 +48,16 @@ def bank_up(nbytes: int) -> int:
     return (nbytes + TPU_BANK_BYTES - 1) // TPU_BANK_BYTES * TPU_BANK_BYTES
 
 
-def fit_super_rows(rows: int, depth: int) -> int:
+def fit_super_rows(rows: int, depth: int, double_buffer: bool = True) -> int:
     """tiled_simple.c's SUPER_ROWS, in Python.
 
-    The kernel spends one bank-aligned region on a [K][TPU_N] block of W and
-    the remainder on a row superblock of A and C, minus one bank for the round
-    up to C's own bank. A whole number of array tiles, so a partial last row
-    block stays the only partial thing in the kernel.
+    The kernel spends one bank-aligned region per staged [K][TPU_N] block of W
+    — two of them when it double-buffers — and the remainder on a row
+    superblock of A and C, minus one bank for the round up to C's own bank. A
+    whole number of array tiles, so a partial last row block stays the only
+    partial thing in the kernel.
     """
-    sp_a = bank_up(depth * i4_row(TPU_N))
+    sp_a = bank_up(depth * i4_row(TPU_N)) * (2 if double_buffer else 1)
     row_cost = i4_row(depth) + i4_row(TPU_N)
     spare = TPU_SPAD_BYTES - sp_a - TPU_BANK_BYTES
     fits = max(spare, 0) // row_cost // TPU_N * TPU_N
@@ -66,7 +70,8 @@ def fit_super_rows(rows: int, depth: int) -> int:
 
 class TiledSimpleVectors(VectorGenerator):
     def __init__(self, rows: int = 8, depth: int = 32, cols: int = 16,
-                 transpose: bool = False, acc: bool = False):
+                 transpose: bool = False, acc: bool = False,
+                 double_buffer: bool = True):
         # A stride is elements/2 bytes and must be a whole scratchpad word, so
         # both of the strided extents are whole array tiles. Rows are not.
         for name, val in (("K", depth), ("N", cols)):
@@ -76,7 +81,8 @@ class TiledSimpleVectors(VectorGenerator):
                                  f"is not a whole scratchpad word")
         self.rows, self.k, self.n = rows, depth, cols
         self.transpose, self.acc = transpose, acc
-        self.super_rows = fit_super_rows(rows, depth)
+        self.double_buffer = double_buffer
+        self.super_rows = fit_super_rows(rows, depth, double_buffer)
 
         self.dram = AddressMap(align=64, limit=DRAM_BYTES, what="tiled_simple")
         self.dram.alloc("DR_A", rows * i4_row(self.k))
@@ -93,6 +99,7 @@ class TiledSimpleVectors(VectorGenerator):
         self.defines = {"SPAD_SIZE": f"{TPU_SPAD_BYTES}u",
                         "M": rows, "K": self.k, "N": self.n,
                         "TRANSPOSE": int(transpose), "ACC": int(acc),
+                        "DOUBLE_BUFFER_W": int(double_buffer),
                         "RQ_C": f"{self.rq_c}u",
                         **self.dram.defines()}
 
@@ -142,9 +149,11 @@ class TiledSimpleVectors(VectorGenerator):
 
 
 def program(backend, rows: int = 8, depth: int = 32, cols: int = 16,
-            transpose: bool = False, acc: bool = False):
+            transpose: bool = False, acc: bool = False,
+            double_buffer: bool = True):
     return TPUProgram(os.path.join(HERE, "tiled_simple.c"), backend,
-                      TiledSimpleVectors(rows, depth, cols, transpose, acc))
+                      TiledSimpleVectors(rows, depth, cols, transpose, acc,
+                                         double_buffer))
 
 
 def main() -> int:
@@ -160,12 +169,16 @@ def main() -> int:
     ap.add_argument("--acc", action="store_true",
                     help="seed DR_C and run with TPU_MM_ACC, so the kernel "
                          "fills each C block before it computes into it")
+    ap.add_argument("--single-buffer", action="store_true",
+                    help="fill each column block of W between the matmuls that "
+                         "read it, instead of under the previous block's — the "
+                         "A/B for the double buffer, same golden either way")
     args = ap.parse_args()
 
     # The tb clock is 10 ns and a DMA byte is a clock (two on a spill), so the
     # watchdog has to follow the shape or a large one times out mid-run.
     gen = TiledSimpleVectors(args.rows, args.depth, args.cols, args.transpose,
-                             args.acc)
+                             args.acc, not args.single_buffer)
     fill, spill = gen.dma_bytes()
     watchdog = max(2_000_000, 80 * (fill + 2 * spill))
 
@@ -175,7 +188,8 @@ def main() -> int:
 
     if prog.benchmark(clk_mhz=12):
         print(f"{gen.super_rows}-row blocks of A staged at once, "
-              f"{gen.w_passes()} pass(es) over W")
+              f"{gen.w_passes()} pass(es) over W, "
+              f"{'double' if gen.double_buffer else 'single'}-buffered")
         print(f"moved {fill} to spad, {spill} to DRAM")
         print(f"expected DMA clocks: {fill + 2 * spill}")
 

@@ -25,6 +25,9 @@
 #ifndef ACC
 #define ACC 0                   /* C = clip4(requant(A @ W) + C_old) */
 #endif
+#ifndef DOUBLE_BUFFER_W
+#define DOUBLE_BUFFER_W 1       /* stage column block j+1 under block j */
+#endif
 
 #define A_ROW    (K / 2)        /* DRAM row strides, packed int4 */
 #define W_ROW    (N / 2)
@@ -50,14 +53,20 @@
  * clock and a scratchpad bank serves one requester per clock. W is one column
  * block, [K][TPU_N] (or [TPU_N][K] transposed, the same bytes). A and C take
  * the rest of the scratchpad as one row superblock, so a column block of W is
- * filled once per superblock rather than once per row block. */
+ * filled once per superblock rather than once per row block.
+ *
+ * Under DOUBLE_BUFFER_W the W region is two bank-aligned halves: the prefetch
+ * writes the half the array is not reading, and a bank apart so it does not
+ * lose its grant to the matmul on every beat. */
 #define BANK_BYTES    (1024u * TPU_WORD_BYTES)
 #define BANK_ROUND(x) (((x) + BANK_BYTES - 1u) / BANK_BYTES * BANK_BYTES)
 #define TILE_UP(x)    (((x) + TPU_N - 1u) / TPU_N * TPU_N)
 #define TILE_DOWN(x)  ((x) / TPU_N * TPU_N)
 
 #define SP_W      0u
-#define SP_W_SIZE (K * TILE_ROW)
+#define SP_W_HALF BANK_ROUND(K * TILE_ROW)
+#define SP_W_SIZE (DOUBLE_BUFFER_W ? 2u * SP_W_HALF : SP_W_HALF)
+
 #define SP_A      BANK_ROUND(SP_W + SP_W_SIZE)
 
 /* A superblock row costs a row of A and a row of C; one bank of the remainder
@@ -76,10 +85,22 @@ _Static_assert(SP_A + BANK_BYTES + TPU_N * (A_ROW + TILE_ROW) <= SPAD_SIZE,
 _Static_assert(SP_C + SP_C_SIZE <= SPAD_SIZE, "the row superblock overruns "
                                               "the scratchpad");
 
-void tiled_matmul_optimized(int transpose, int acc)
+/* Column block `j` of W, whichever way it is stored. */
+static inline void fill_w_block(uint32_t spad, unsigned j, int transpose)
+{
+    if (transpose)
+        tpu_dma(spad, DR_W + j * WT_ROW, K, TPU_N, WT_ROW, 0u, TPU_DMA_FILL);
+    else
+        tpu_dma(spad, DR_W + j / 2, TPU_N, K, W_ROW, 0u, TPU_DMA_FILL);
+}
+
+/* `double_buffer` has to agree with DOUBLE_BUFFER_W: the second half is only
+ * allocated when the macro is set. */
+void tiled_matmul_optimized(int transpose, int acc, int double_buffer)
 {
     const uint32_t flags = (transpose ? TPU_MM_T : 0u)
                          | (acc ? TPU_MM_ACC : 0u);
+    const uint32_t half = double_buffer ? SP_W_HALF : 0u;
 
     tpu_mxu_geom(A_ROW, transpose ? WT_ROW : TILE_ROW, TILE_ROW, K);
 
@@ -88,21 +109,31 @@ void tiled_matmul_optimized(int transpose, int acc)
 
         tpu_dma(SP_A, DR_A + i * A_ROW, K, rows, A_ROW, 0u, TPU_DMA_FILL);
 
+        if (double_buffer)
+            fill_w_block(SP_W, 0u, transpose);
+
         for (unsigned j = 0; j < N; j += TPU_N) {
-            if (transpose)
-                tpu_dma(SP_W, DR_W + j * WT_ROW, K, TPU_N, WT_ROW, 0u,
-                        TPU_DMA_FILL);
-            else
-                tpu_dma(SP_W, DR_W + j / 2, TPU_N, K, W_ROW, 0u, TPU_DMA_FILL);
+            unsigned block = j / TPU_N;
+            uint32_t w      = SP_W + (block & 1u) * half;
+            uint32_t w_next = SP_W + (~block & 1u) * half;
+
+            if (!double_buffer)
+                fill_w_block(w, j, transpose);
 
             if (acc)
                 tpu_dma(SP_C, DR_C + i * C_ROW + j / 2, TPU_N, rows, C_ROW, 0u,
                         TPU_DMA_FILL);
 
-            tpu_wait(TPU_U_DMA);        /* also retires the previous spill */
+            tpu_wait(TPU_U_DMA);    /* W is resident, and the previous spill
+                                     * has left SP_C */
+
+            /* Block j+1 streams in under this block's matmuls. The last reader
+             * of that half was block j-1, which retired an iteration ago. */
+            if (double_buffer && j + TPU_N < N)
+                fill_w_block(w_next, j + TPU_N, transpose);
 
             for (unsigned r = 0; r < rows; r += TPU_N)
-                tpu_mxu_mm(SP_C + r * TILE_ROW, SP_A + r * A_ROW, SP_W, flags,
+                tpu_mxu_mm(SP_C + r * TILE_ROW, SP_A + r * A_ROW, w, flags,
                            RQ_C);
             tpu_wait(TPU_U_MXU);
 
@@ -118,7 +149,7 @@ void tiled_matmul_optimized(int transpose, int acc)
 
 int main(void)
 {
-    tiled_matmul_optimized(TRANSPOSE, ACC);
+    tiled_matmul_optimized(TRANSPOSE, ACC, DOUBLE_BUFFER_W);
 
     return 0;                   /* start.S raises `done` from here */
 }

@@ -156,6 +156,16 @@ block filled from DRAM alongside its column block of W, one fill per superblock
 column rather than per row block). `generate.py`'s `--transpose` / `--acc` are
 the A/B.
 
+It also double-buffers W. The region is two bank-aligned halves; the fill for
+column block *j+1* is issued after the barrier that made block *j* resident, so
+it streams under block *j*'s matmuls, and the half it writes was last read by
+block *j-1*, which retired an iteration earlier. The halves are a bank apart
+because a bank serves one requester per clock and the matmul outranks the DMA —
+sharing one would cost the prefetch a beat for every beat the array reads.
+`DOUBLE_BUFFER_W=0` (`--single-buffer`) compiles it back to one half and the
+fill between the barriers, which is the A/B; it also gives the row superblock a
+bank back, so the two arms do not stage the same number of rows.
+
 ## infer.c — the model generating
 
 The int4 adder model as inference: prefill, then decode against a KV cache.

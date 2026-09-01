@@ -210,88 +210,88 @@ static inline void tpu_matmul(const tpu_gemm *gemm, tpu_arena *arena)
  * problem gets a deeper panel and reads B fewer times. It pays for that with
  * one spill per column block instead of one per panel, and it has no
  * transposed-B or accumulate path. See docs/fw.md for when that trade loses. */
-__attribute__((always_inline))
-static inline void tpu_matmul_wide(const tpu_gemm *gemm, tpu_arena *arena)
-{
-    const uint32_t depth_bytes = gemm->depth / 2u;
-    const uint32_t block_bytes = TPU_N * depth_bytes;   /* one N-row operand block */
+// __attribute__((always_inline))
+// static inline void tpu_matmul_wide(const tpu_gemm *gemm, tpu_arena *arena)
+// {
+//     const uint32_t depth_bytes = gemm->depth / 2u;
+//     const uint32_t block_bytes = TPU_N * depth_bytes;   /* one N-row operand block */
 
-    const uint32_t a_row = gemm->a.row_bytes ? gemm->a.row_bytes : depth_bytes;
-    const uint32_t b_row = gemm->b.row_bytes ? gemm->b.row_bytes : gemm->cols / 2u;
-    const uint32_t c_row = gemm->c.row_bytes ? gemm->c.row_bytes : gemm->cols / 2u;
+//     const uint32_t a_row = gemm->a.row_bytes ? gemm->a.row_bytes : depth_bytes;
+//     const uint32_t b_row = gemm->b.row_bytes ? gemm->b.row_bytes : gemm->cols / 2u;
+//     const uint32_t c_row = gemm->c.row_bytes ? gemm->c.row_bytes : gemm->cols / 2u;
 
-    TPU_ASSERT(gemm->depth % TPU_N == 0, "depth is not a whole array word");
-    TPU_ASSERT(gemm->cols % 2u == 0, "an odd column count spills half a byte");
-    TPU_ASSERT(gemm->depth <= 0xFFFFu, "contraction longer than the len field");
-    TPU_ASSERT(arena->base % TPU_BANK_BYTES == 0, "arena base is not bank aligned");
-    TPU_ASSERT(!gemm->transpose, "tpu_matmul_wide has no transposed-B path");
-    TPU_ASSERT(!gemm->accumulate, "tpu_matmul_wide has no accumulate path");
+//     TPU_ASSERT(gemm->depth % TPU_N == 0, "depth is not a whole array word");
+//     TPU_ASSERT(gemm->cols % 2u == 0, "an odd column count spills half a byte");
+//     TPU_ASSERT(gemm->depth <= 0xFFFFu, "contraction longer than the len field");
+//     TPU_ASSERT(arena->base % TPU_BANK_BYTES == 0, "arena base is not bank aligned");
+//     TPU_ASSERT(!gemm->transpose, "tpu_matmul_wide has no transposed-B path");
+//     TPU_ASSERT(!gemm->accumulate, "tpu_matmul_wide has no accumulate path");
 
-    /* Three bank-disjoint slots, as in tpu_matmul, but a staged C row is one
-     * output block wide whatever `cols` is. */
-    const uint32_t usable       = TPU_ALIGN_DOWN(arena->bytes, TPU_BANK_BYTES);
-    const uint32_t b_slot_bytes = TPU_ALIGN_UP(block_bytes, TPU_BANK_BYTES);
-    const uint32_t a_min        = TPU_ALIGN_UP(block_bytes, TPU_BANK_BYTES);
-    const uint32_t c_min        = TPU_ALIGN_UP(TPU_N * TPU_WORD_BYTES, TPU_BANK_BYTES);
+//     /* Three bank-disjoint slots, as in tpu_matmul, but a staged C row is one
+//      * output block wide whatever `cols` is. */
+//     const uint32_t usable       = TPU_ALIGN_DOWN(arena->bytes, TPU_BANK_BYTES);
+//     const uint32_t b_slot_bytes = TPU_ALIGN_UP(block_bytes, TPU_BANK_BYTES);
+//     const uint32_t a_min        = TPU_ALIGN_UP(block_bytes, TPU_BANK_BYTES);
+//     const uint32_t c_min        = TPU_ALIGN_UP(TPU_N * TPU_WORD_BYTES, TPU_BANK_BYTES);
 
-    TPU_ASSERT(usable >= b_slot_bytes + a_min + c_min,
-               "arena too small: A, B and C each need a whole N-row block");
+//     TPU_ASSERT(usable >= b_slot_bytes + a_min + c_min,
+//                "arena too small: A, B and C each need a whole N-row block");
 
-    /* A panel row costs a row in each of A and C; split the spare in that
-     * ratio so neither slot is what caps the panel. */
-    const uint32_t spare   = usable - b_slot_bytes - a_min - c_min;
-    const uint32_t c_extra = TPU_ALIGN_DOWN((spare / (depth_bytes + TPU_WORD_BYTES))
-                                            * TPU_WORD_BYTES, TPU_BANK_BYTES);
+//     /* A panel row costs a row in each of A and C; split the spare in that
+//      * ratio so neither slot is what caps the panel. */
+//     const uint32_t spare   = usable - b_slot_bytes - a_min - c_min;
+//     const uint32_t c_extra = TPU_ALIGN_DOWN((spare / (depth_bytes + TPU_WORD_BYTES))
+//                                             * TPU_WORD_BYTES, TPU_BANK_BYTES);
 
-    const uint32_t c_slot_bytes = c_min + c_extra;
-    const uint32_t a_slot_bytes = usable - b_slot_bytes - c_slot_bytes;
-    const uint32_t a_slot       = arena->base;
-    const uint32_t b_slot       = a_slot + a_slot_bytes;
-    const uint32_t c_slot       = b_slot + b_slot_bytes;
+//     const uint32_t c_slot_bytes = c_min + c_extra;
+//     const uint32_t a_slot_bytes = usable - b_slot_bytes - c_slot_bytes;
+//     const uint32_t a_slot       = arena->base;
+//     const uint32_t b_slot       = a_slot + a_slot_bytes;
+//     const uint32_t c_slot       = b_slot + b_slot_bytes;
 
-    const uint32_t a_rows = TPU_ALIGN_DOWN(a_slot_bytes / depth_bytes, TPU_N);
-    const uint32_t c_rows = TPU_ALIGN_DOWN(c_slot_bytes / TPU_WORD_BYTES, TPU_N);
-    uint32_t panel_rows = (a_rows < c_rows) ? a_rows : c_rows;
+//     const uint32_t a_rows = TPU_ALIGN_DOWN(a_slot_bytes / depth_bytes, TPU_N);
+//     const uint32_t c_rows = TPU_ALIGN_DOWN(c_slot_bytes / TPU_WORD_BYTES, TPU_N);
+//     uint32_t panel_rows = (a_rows < c_rows) ? a_rows : c_rows;
 
-    if (panel_rows > gemm->rows)
-        panel_rows = gemm->rows;
+//     if (panel_rows > gemm->rows)
+//         panel_rows = gemm->rows;
 
-    tpu_mxu_geom(depth_bytes, TPU_WORD_BYTES, TPU_WORD_BYTES, gemm->depth);
+//     tpu_mxu_geom(depth_bytes, TPU_WORD_BYTES, TPU_WORD_BYTES, gemm->depth);
 
-    for (uint32_t r0 = 0; r0 < gemm->rows; r0 += panel_rows) {
-        uint32_t nrows = gemm->rows - r0;
+//     for (uint32_t r0 = 0; r0 < gemm->rows; r0 += panel_rows) {
+//         uint32_t nrows = gemm->rows - r0;
 
-        if (nrows > panel_rows)
-            nrows = panel_rows;
+//         if (nrows > panel_rows)
+//             nrows = panel_rows;
 
-        tpu_dma(a_slot, gemm->a.addr + r0 * a_row,
-                gemm->depth, nrows, a_row, depth_bytes, TPU_DMA_FILL);
+//         tpu_dma(a_slot, gemm->a.addr + r0 * a_row,
+//                 gemm->depth, nrows, a_row, depth_bytes, TPU_DMA_FILL);
 
-        for (uint32_t c0 = 0; c0 < gemm->cols; c0 += TPU_N) {
-            uint32_t ncols = gemm->cols - c0;
+//         for (uint32_t c0 = 0; c0 < gemm->cols; c0 += TPU_N) {
+//             uint32_t ncols = gemm->cols - c0;
 
-            if (ncols > TPU_N)
-                ncols = TPU_N;
+//             if (ncols > TPU_N)
+//                 ncols = TPU_N;
 
-            tpu_dma(b_slot, gemm->b.addr + c0 / 2u,
-                    ncols, gemm->depth, b_row, TPU_WORD_BYTES, TPU_DMA_FILL);
-            tpu_wait(TPU_U_DMA);        /* also retires the previous spill */
+//             tpu_dma(b_slot, gemm->b.addr + c0 / 2u,
+//                     ncols, gemm->depth, b_row, TPU_WORD_BYTES, TPU_DMA_FILL);
+//             tpu_wait(TPU_U_DMA);        /* also retires the previous spill */
 
-            for (uint32_t sub = 0; sub < nrows; sub += TPU_N)
-                tpu_mxu_mm(c_slot + sub * TPU_WORD_BYTES,
-                           a_slot + sub * depth_bytes, b_slot, 0u,
-                           gemm->rq_word);
-            tpu_wait(TPU_U_MXU);
+//             for (uint32_t sub = 0; sub < nrows; sub += TPU_N)
+//                 tpu_mxu_mm(c_slot + sub * TPU_WORD_BYTES,
+//                            a_slot + sub * depth_bytes, b_slot, 0u,
+//                            gemm->rq_word);
+//             tpu_wait(TPU_U_MXU);
 
-            /* A short last block left the unstaged lanes stale; they sit in C
-             * columns past `ncols`, which this spill never reads. */
-            tpu_dma(c_slot, gemm->c.addr + r0 * c_row + c0 / 2u,
-                    ncols, nrows, c_row, TPU_WORD_BYTES, TPU_DMA_SPILL);
-        }
-    }
+//             /* A short last block left the unstaged lanes stale; they sit in C
+//              * columns past `ncols`, which this spill never reads. */
+//             tpu_dma(c_slot, gemm->c.addr + r0 * c_row + c0 / 2u,
+//                     ncols, nrows, c_row, TPU_WORD_BYTES, TPU_DMA_SPILL);
+//         }
+//     }
 
-    tpu_wait(TPU_U_DMA);
-}
+//     tpu_wait(TPU_U_DMA);
+// }
 
 /* ---- elementwise --------------------------------------------------------- */
 
