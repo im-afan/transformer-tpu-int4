@@ -1,4 +1,4 @@
-# Software rewrite
+# Software testing suite 
 
 ## Purpose: for better readability, cleanliness, and easy to scale to more archtictures and a full firmware test suite
 
@@ -17,6 +17,8 @@
         - TPUBackend: 
             - loads compiled fw c file (using riscv64-unknown-elf-gcc etc.) & input dram to TPU, sends RUN signal, reads it back, using tpu_uart.py
             - tpu_uart.py changes: it's very spaghetti right now, get rid of everything except for basic functions (read dram, write dram, write instr, go, read timer)
+        - RTLBackend:
+            - loads compiled fw c file to iverilog simulation, run it in sim, and read back the output .hex file
 - vector_generator.py: defines VectorGenerator class
     - VectorGenerator: def generate_vectors() -> input .hex, output .hex
 - program.py: defines TPUProgram class

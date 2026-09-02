@@ -119,7 +119,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--max_tokens",
         type=int,
-        default=numbers_data.MAX_TOKENS,
+        default=numbers_data.MAX_TOKENS, # 128 default
         help="Context length (sequence length)",
     )
     parser.add_argument(

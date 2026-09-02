@@ -1,0 +1,54 @@
+# (64 x 128) @ (128 x 512) matmul
+# 20% speedup from double buffering
+# not buffered
+tiled_simple on board, 1 case(s):
+  run                                      160644 clocks  13.387 ms @ 12 MHz
+  MXU busy                                  78336   48.8%
+    of which weight load                        0    0.0%
+  VPU busy                                      0    0.0%
+  DMA busy                                  69824   43.5%
+  no unit busy (issue overhead)             12484    7.8%
+  producer stalled on a full queue              0    0.0%
+  two or more units busy                        0    0.0%
+
+tiled_simple: 1 case(s) PASSED on board
+
+# double buffered
+tiled_simple on board, 1 case(s):
+  run                                      133988 clocks  11.166 ms @ 12 MHz
+  MXU busy                                  78336   58.5%
+    of which weight load                        0    0.0%
+  VPU busy                                      0    0.0%
+  DMA busy                                  69824   52.1%
+  no unit busy (issue overhead)             13863   10.3%
+  producer stalled on a full queue              0    0.0%
+  two or more units busy                    28035   20.9%
+
+tiled_simple: 1 case(s) PASSED on board
+
+
+
+# (128 x 128) @ (128 x 128) matmul
+# not double buffered
+tiled_simple on board, 1 case(s):
+  run                                       75131 clocks  6.261 ms @ 12 MHz
+  MXU busy                                  39168   52.1%
+    of which weight load                        0    0.0%
+  VPU busy                                      0    0.0%
+  DMA busy                                  32816   43.7%
+  no unit busy (issue overhead)              3147    4.2%
+  producer stalled on a full queue              0    0.0%
+  two or more units busy    
+  
+# double buffered
+tiled_simple on board, 1 case(s):
+  run                                       69071 clocks  5.756 ms @ 12 MHz
+  MXU busy                                  39168   56.7%
+    of which weight load                        0    0.0%
+  VPU busy                                      0    0.0%
+  DMA busy                                  32816   47.5%
+  no unit busy (issue overhead)              3687    5.3%
+  producer stalled on a full queue              0    0.0%
+  two or more units busy                     6600    9.6%
+
+tiled_simple: 1 case(s) PASSED on board

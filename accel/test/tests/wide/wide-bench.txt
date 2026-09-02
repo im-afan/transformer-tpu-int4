@@ -1,0 +1,14 @@
+# single-buffered:
+ok   512x128 @ 128x64, wide: 16384 bytes match
+
+wide on board, 1 case(s):
+  run                                      166672 clocks  13.889 ms @ 12 MHz
+  MXU busy                                  78336   47.0%
+    of which weight load                        0    0.0%
+  VPU busy                                      0    0.0%
+  DMA busy                                  82016   49.2%
+  no unit busy (issue overhead)              6320    3.8%
+  producer stalled on a full queue              0    0.0%
+  two or more units busy                        0    0.0%
+
+wide: 1 case(s) PASSED on board

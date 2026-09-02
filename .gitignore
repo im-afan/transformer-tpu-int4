@@ -1,6 +1,7 @@
 *__pycache__
 .venv*
 .claude
+.vscode*
 
 # --- model artifacts ---
 model/saved/test_*

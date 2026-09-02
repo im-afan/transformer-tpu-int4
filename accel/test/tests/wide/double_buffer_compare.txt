@@ -1,0 +1,27 @@
+# (128 x 128) @ (128 x 128)
+# singnle buffered
+
+wide on board, 1 case(s):
+  run                                       74905 clocks  6.242 ms @ 12 MHz
+  MXU busy                                  39168   52.3%
+    of which weight load                        0    0.0%
+  VPU busy                                      0    0.0%
+  DMA busy                                  32816   43.8%
+  no unit busy (issue overhead)              2921    3.9%
+  producer stalled on a full queue              0    0.0%
+  two or more units busy                        0    0.0%
+
+wide: 1 case(s) PASSED on board
+
+#double buffered
+wide on board, 1 case(s):
+  run                                       72959 clocks  6.080 ms @ 12 MHz
+  MXU busy                                  39168   53.7%
+    of which weight load                        0    0.0%
+  VPU busy                                      0    0.0%
+  DMA busy                                  41056   56.3%
+  no unit busy (issue overhead)              6115    8.4%
+  producer stalled on a full queue              0    0.0%
+  two or more units busy                    13380   18.3%
+
+wide: 1 case(s) PASSED on board
