@@ -230,16 +230,18 @@ def standard_parser(description: str):
     return ap
 
 
-def backend_from_args(args, watchdog_ns: int = 2_000_000):
+def backend_from_args(args, watchdog_ns: int = 2_000_000,
+                      max_cmds: int = 8192):
     from backends import ISSBackend, RTLBackend, TPUBackend
 
     if args.backend == "iss":
         return ISSBackend()
     if args.backend == "rtl":
-        return RTLBackend(watchdog_ns=watchdog_ns, quiet=not args.verbose)
+        return RTLBackend(watchdog_ns=watchdog_ns, max_cmds=max_cmds,
+                          quiet=not args.verbose)
     if args.backend == "rtl-uart":
         return RTLBackend(uart=True, watchdog_ns=watchdog_ns,
-                          quiet=not args.verbose)
+                          max_cmds=max_cmds, quiet=not args.verbose)
     return TPUBackend(port=args.port, quiet=not args.verbose)
 
 

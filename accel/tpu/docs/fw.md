@@ -74,24 +74,40 @@ one, so the same C bytes leave in `cols/N` times as many DMA ranges.
 (`--mm5-general`) runs the identical problem through `tpu_matmul` against the
 same golden — that is the A/B.
 
+#### B is double-buffered
+
+The B slot is two bank-aligned halves. The fill for column block `c0+N` is
+issued *after* the barrier that made block `c0` resident, so it streams under
+block `c0`'s matmuls, and the half it writes was last read by block `c0-N`,
+which retired an iteration earlier. The halves are a bank apart because the
+matmul outranks the DMA at the scratchpad — sharing one would cost the prefetch
+a beat for every beat the array reads.
+
+That second half costs a bank, which comes out of the row panel: at the live
+`infer` arena a `depth=128` wide panel is 768 rows against 832 single-buffered.
+`TPU_WGT_PREFETCH=0` compiles the prefetch out and gives the bank back, which is
+the A/B. An arena with no room for the second half single-buffers on its own
+rather than failing.
+
 #### Where it is not legal
 
-The first four are `TPU_ASSERT`s, and **`TPU_ASSERT` compiles to nothing outside
-the `TPU_TRACE` build** — a violation is caught on the ISS and corrupts silently
-on the RTL and the board. Check the shape on `-b iss` before running it anywhere
-else.
+These are `TPU_SHAPE_ASSERT`s: a **compile error** when the shape is constant at
+the call site, which is the normal case for an `always_inline` primitive, and a
+`TPU_ASSERT` otherwise. **`TPU_ASSERT` compiles to nothing outside the
+`TPU_TRACE` build**, so a shape that only the run knows is caught on the ISS and
+corrupts silently on the RTL and the board.
 
-1. **A transposed B.** `TPU_MM_T` has no path here. A transposed column block is
-   `[N][depth]` in DRAM, a different fill and a different `b_stride`; attention's
-   `Q@K'` and anything else with `.transpose = 1` needs `tpu_matmul`.
-2. **Accumulate.** No `TPU_MM_ACC` path: it would need the C column block filled
-   from DRAM before each column's matmuls, and the callers that want accumulate
-   are the split-contraction ones this is not aimed at.
-3. **`depth` not a multiple of `TPU_N`, or past `0xFFFF`.** The contraction is
+1. **`depth` not a multiple of `TPU_N`, or past `0xFFFF`.** The contraction is
    taken in one dispatch, exactly as in `tpu_matmul`.
-4. **An odd `cols`.** A row is two elements per byte.
-5. **An arena under three banks.** A, B and C are read on the same clock and a
+2. **An odd `cols`.** A row is two elements per byte.
+3. **An arena under three banks**, or under whatever one N-row block of each of
+   A, B and C costs at this `depth`. A, B and C are read on the same clock and a
    bank serves one requester per clock, so each needs a whole bank of its own.
+
+`transpose` and `accumulate` both work now — the transposed fill is `ncols` rows
+of `depth` with `b_stride = depth/2`, and accumulate fills the C column block
+from DRAM alongside its block of B, one fill per column block rather than per
+panel.
 
 A `cols` that is *not* a multiple of `TPU_N` is fine — the last column block
 computes `TPU_N` wide and spills `ncols`, the same way `tpu_matmul` does. This is
@@ -166,6 +182,33 @@ sharing one would cost the prefetch a beat for every beat the array reads.
 fill between the barriers, which is the A/B; it also gives the row superblock a
 bank back, so the two arms do not stage the same number of rows.
 
+### `tests/wide/` — the regression for `tpu_matmul_wide`
+
+One `tpu_matmul_wide`, DRAM to DRAM, at the shape the double buffer was written
+against: `20x512 @ 512x52` in a 4-bank arena, so the row panel is 16 and repeats,
+there are seven column blocks (the parity ends odd and has to reset for the
+second panel), and the last block is ragged. The golden is a plain Python
+matmul.
+
+Everything else is a flag over the same problem: `--transpose` stores B as
+`[N][K]` and runs it with `TPU_MM_T`, `--acc` seeds `DR_C` and runs with
+`TPU_MM_ACC` — the two paths the function did not used to have. `--single-buffer`
+compiles the prefetch out, and `--arena-banks 3` leaves no room for the second
+half so it single-buffers on its own. Through the RTL:
+
+| | commands | run | overlap |
+| --- | --- | --- | --- |
+| 3 banks, single-buffered | 52 | 47 190 | 0 |
+| 4 banks, double-buffered | 52 | **37 084** | 9 576 |
+| 4 banks, `TPU_WGT_PREFETCH=0` | 37 | 32 220 | 0 |
+| 4 banks, `--transpose --acc` | 66 | 37 646 | 9 704 |
+
+The first two rows are the prefetch on its own — identical work and identical
+commands, and the overlap is the whole 10 106-clock difference. The third row is
+the second half's other side: with the bank back the panel goes 16 rows to 32,
+the pass over B halves, and the DMA clocks it saves beat what the overlap buys.
+**Which way it lands is a property of the shape and the arena, so measure it.**
+
 ## infer.c — the model generating
 
 The int4 adder model as inference: prefill, then decode against a KV cache.
@@ -187,30 +230,42 @@ match and the emitted tokens aren't scored.
 matmuls run once over `BATCH*rows` rows. Attention stays per sequence — each
 has its own KV cache and its own append into it.
 
-**Which matmul each site gets.** Every non-transposed matmul goes through
-`INFER_MM`, which picks `tpu_matmul_wide` over `tpu_matmul` exactly where the
-wide layout's deeper row panel removes a pass over the weight stream —
-`TPU_MM_PREFER_WIDE` in `tpulib.h` compares the two pass counts from the same
-layout arithmetic the two functions use. `Q@K^T` is transposed, so it stays on
-`tpu_matmul`. Everything the macro sees is constant once `infer_block` is
-inlined, so the branch folds and only one of the two is emitted.
+**Which matmul each site gets.** All of them go through `INFER_MM`, which is
+`tpu_matmul_wide` — including `Q@K^T`, now that the wide layout has a
+transposed-B path. `tpu_matmul` has no call site left in this kernel, so gcc
+emits only one of the two. `-DINFER_MM_WIDE=0` (`generate.py --general`) puts
+every site back on `tpu_matmul` against the same golden, which is the A/B.
 
-At the live shape — `d=128`, `f=512`, a 61 440-byte usable arena, `BATCH=1`,
-`BLOCK=32` — it picks the general layout everywhere, because every problem
-already fits one panel (point 7 above):
+**What it buys, and it is not the row panel.** At the live shape — `d=128`,
+`f=512`, a 61 440-byte usable arena, `BATCH=1`, `BLOCK=32` — every site already
+fits one row panel on either layout, so the deeper panel removes no pass over B:
 
-| site | rows | shape | general panel | wide panel | picked |
+| site | rows | shape | general panel | wide panel | passes over B |
 | --- | --- | --- | --- | --- | --- |
-| `Wq`/`Wk`/`Wv`/`Wo` | 32 | 128 x 128 | 448 | 832 | general |
-| `P@V` | 32 | 128 x 32 | 704 | 832 | general |
-| FF1 | 32 | 128 x 512 | 160 | 832 | general |
-| FF2 | 32 | 512 x 128 | 176 | 208 | general |
-| head | 1 | 128 x 16 | 768 | 832 | general |
+| `Wq`/`Wk`/`Wv`/`Wo` | 32 | 128 x 128 | 448 | 768 | 1 either way |
+| `Q@K^T` | 32 | 32 x 64 (T) | 768 | 768 | 1 either way |
+| `P@V` | 32 | 128 x 32 | 704 | 768 | 1 either way |
+| FF1 | 32 | 128 x 512 | 160 | 768 | 1 either way |
+| FF2 | 32 | 512 x 128 | 176 | 192 | 1 either way |
+| head | 1 | 128 x 16 | 768 | 768 | 1 either way |
 
-FF1 is the site that flips: it wants `BATCH*BLOCK > 160`, so `--batch 8` at
-`BLOCK=32` puts it on the wide layout and takes its passes over `W1` from 2 to
-1. `-DINFER_MM_WIDE=1` forces wide at every legal site and `=0` forces general,
-which is the A/B.
+The win is the B prefetch, which `tpu_matmul` does not have at all. Through the
+RTL, `--gen 3` at that shape, one problem, byte-identical DRAM on both arms:
+
+| | clocks | mxu | dma | idlec | ovlap | commands |
+| --- | --- | --- | --- | --- | --- | --- |
+| `--general` | 3 489 116 | 755 094 | 1 985 938 | 654 196 | 0 | 8 682 |
+| wide | **2 890 294** | 755 094 | 1 992 355 | 632 652 | **583 695** | 10 821 |
+
+Identical array work and within 0.3% on DMA clocks: the whole 598 822-clock
+difference is overlap the general layout cannot express, worth **17.2%** of the
+run. It is paid for in commands (+24.6%, the `cols/N` spills per panel) and in
+image — 14 708 bytes of the 16 KB firmware RAM against 12 204, so the stack has
+~1.6 KB rather than ~3.9 KB.
+
+FF1 is where the row panel would start to matter too: it wants `BATCH*BLOCK >
+160`, so `--batch 8` at `BLOCK=32` takes its passes over `W1` from 2 to 1 on the
+wide layout and leaves them at 2 on the general one.
 
 **Where tensors live.** Every tensor is in DRAM, every element int4, two per
 byte. `tpulib.h` owns the scratchpad: it stages each primitive's operands in
@@ -252,6 +307,20 @@ then lower `BATCH`.
 **Scratchpad.** The CPU has no path to DRAM, so what it reads (prompt ids,
 logits) and writes (the chosen token) lives in a fixed mailbox the scratchpad
 window reaches. That's the only fixed allocation — the rest is arena.
+
+**`--bench` — timing without weights.** `tests/infer/generate.py --bench` runs
+the same kernel with nothing staged into DRAM: no weights, no embedding table,
+no mask, no zeroed cache, and no golden compare. What a step costs is not
+data-dependent, so the counters are the same ones a checked run reports, and
+the load — ~400 KB of weights, which dominates `-b rtl-uart` and `-b board` —
+is gone. The prompt ids are still patched in (an id outside the table would
+make the embedding gather read DRAM the map does not own), and they are built
+in the generator rather than taken from the dataset, so `--bench` needs neither
+torch nor a checkpoint. It defaults to one case, and every address in the map
+counts as writable, since with an empty image the stray-write check has no
+baseline to compare against.
+
+    python accel/test/tests/infer/generate.py -b rtl --synthetic --gen 3 --bench
 
 ## ffn.c / mha.c / matmul.c — datapath smoke tests
 

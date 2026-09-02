@@ -83,26 +83,23 @@ static tpu_arena arena;
 #define S_BUF   TPU_ROWS(DR_S,     I4(T))
 #define H_BUF   TPU_ROWS(DR_H,     I4(DFF))
 
-/* -DINFER_MM_WIDE=1 forces the wide layout at every legal site and =0 forces
- * the general one; unset picks per shape. */
-#ifdef INFER_MM_WIDE
-#define INFER_MM_PICK(rows_, depth_, cols_) (INFER_MM_WIDE)
-#else
-#define INFER_MM_PICK(rows_, depth_, cols_) \
-    TPU_MM_PREFER_WIDE(SP_MAILBOX, (rows_), (depth_), (cols_))
+/* -DINFER_MM_WIDE=0 puts every site back on tpu_matmul, which is the A/B. */
+#ifndef INFER_MM_WIDE
+#define INFER_MM_WIDE 1
 #endif
 
-/* Every matmul here that is not transposed goes through this. tpu_matmul_wide
- * spends the arena on row-panel depth instead of C's width, so it reads the
- * weight stream fewer times and spills once per column block; it is picked only
- * where that removes a pass over B. Both are always_inline and every argument
- * is constant once infer_block is inlined, so the branch folds away. */
+/* Every matmul in this kernel goes through this. tpu_matmul_wide stages one
+ * column block of C instead of a whole C row, which spends the arena on
+ * row-panel depth, and it double-buffers B so the next column block's weights
+ * fill under this one's matmuls. It pays one spill per column block instead of
+ * one per row panel. always_inline plus a constant shape at the call site folds
+ * the whole thing; see docs/fw.md. */
 #define INFER_MM(rows_, depth_, cols_, ...)                                   \
     do {                                                                      \
         const tpu_gemm mm = { .rows = (rows_), .depth = (depth_),             \
                               .cols = (cols_), __VA_ARGS__ };                 \
                                                                               \
-        if (INFER_MM_PICK((rows_), (depth_), (cols_)))                        \
+        if (INFER_MM_WIDE)                                                    \
             tpu_matmul_wide(&mm, &arena);                                     \
         else                                                                  \
             tpu_matmul(&mm, &arena);                                          \
@@ -158,13 +155,12 @@ static inline void infer_block(unsigned rows, unsigned first_pos)
                  * them keeps the shape constant; a runtime column count would
                  * unfold the block loop, which costs more than the extra
                  * tiles. */
-                tpu_matmul(&(const tpu_gemm){
-                    .rows = rows, .depth = HEAD_DIM, .cols = T,
-                    .a = tpu_off(Q_BUF, seq_off + head * I4(HEAD_DIM)),
-                    .b = TPU_ROWS(k_cache + head * I4(HEAD_DIM), I4(D)),
-                    .c = S_BUF,
-                    .transpose = 1,
-                    .rq_word = rq[RQ_S] }, &arena);
+                INFER_MM(rows, HEAD_DIM, T,
+                         .a = tpu_off(Q_BUF, seq_off + head * I4(HEAD_DIM)),
+                         .b = TPU_ROWS(k_cache + head * I4(HEAD_DIM), I4(D)),
+                         .c = S_BUF,
+                         .transpose = 1,
+                         .rq_word = rq[RQ_S]);
 
                 /* P = relu(S + mask), both passes in place. */
                 tpu_add(S_BUF, S_BUF, TPU_ROWS(DR_MASK + first_pos * I4(T), I4(T)),

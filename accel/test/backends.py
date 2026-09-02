@@ -233,15 +233,21 @@ class RTLBackend(Backend):
     sees_whole_dram = True
 
     def __init__(self, uart: bool = False, watchdog_ns: int = 2_000_000,
-                 uart_cpb: int = 16, rerun: bool = False, quiet: bool = True):
+                 uart_cpb: int = 16, rerun: bool = False, quiet: bool = True,
+                 max_cmds: int = 8192):
         self.uart, self.watchdog_ns, self.uart_cpb = uart, watchdog_ns, uart_cpb
+        # The testbench holds both traces in fixed arrays and reports an
+        # overflow rather than truncating, so a kernel that issues more commands
+        # than this fails the case. infer's count scales with the tokens it
+        # generates and with which matmul primitive its sites use.
+        self.max_cmds = max_cmds
         self.name = "rtl-uart" if uart else "rtl"
         self.rerun, self.quiet = rerun, quiet
         self.iss = ISSBackend()
         self.workdir = os.path.join(BUILD_ROOT, "rtl")
         self.image: dict = {}
         self.vvp = self.hex = None
-        self.stem = ""
+        self.stem = self.tb = ""
 
     def build(self, source: str, defines: dict, include_dirs=()) -> None:
         os.makedirs(self.workdir, exist_ok=True)
@@ -251,25 +257,44 @@ class RTLBackend(Backend):
 
         if shutil.which("iverilog") is None:
             raise SystemExit("iverilog is not on PATH")
-        tb = "fw_uart_tb" if self.uart else "fw_matmul_tb"
+        self.tb = "fw_uart_tb" if self.uart else "fw_matmul_tb"
         # The image path is compiled into the .vvp, so it is keyed the same way.
         key = _build_key(source, defines, include_dirs)
         self.workdir = os.path.join(BUILD_ROOT, "rtl", f"{self.stem}-{key}")
         os.makedirs(self.workdir, exist_ok=True)
-        self.vvp = os.path.join(self.workdir, f"{tb}.vvp")
+        self.vvp = os.path.join(self.workdir, f"{self.tb}.vvp")
+        self._compile_tb()
+
+    def _compile_tb(self) -> None:
         # iverilog runs from tb/, which is what core.f's relative paths assume.
         cmd = ["iverilog", "-g2012", "-Wall", "-f", "core.f",
                f'-DFW_HEX="{self.hex}"', f'-DFW_NAME="{self.stem}"',
                f'-DFW_VEC_DIR="{self.workdir}"',
                f"-DWATCHDOG_NS={self.watchdog_ns}",
+               f"-DMAX_CMDS={self.max_cmds}",
                *([f"-DUART_CPB={self.uart_cpb}"] if self.uart else []),
-               "-o", self.vvp, f"{tb}.sv"]
+               "-o", self.vvp, f"{self.tb}.sv"]
         # iverilog is loud about the vendored picorv32's timescales and its
         # unsupported-but-harmless constructs; none of it is about this run.
         iv = subprocess.run(cmd, cwd=TB_DIR, capture_output=self.quiet, text=True)
         if iv.returncode:
             print(iv.stdout or "", iv.stderr or "", file=sys.stderr)
-            raise SystemExit(f"iverilog failed on {tb}")
+            raise SystemExit(f"iverilog failed on {self.tb}")
+
+    def _fit_cmd_capacity(self, expected: int) -> None:
+        """Re-elaborate the testbench if this case's trace will not fit.
+
+        MAX_CMDS is a compile-time array bound and the .vvp is built before any
+        case has run, so the count is not known then. The ISS run that produces
+        the golden happens first and knows it exactly; the headroom is for an
+        RTL run that issues more commands than the ISS did, which is the bug
+        this check exists to catch and must be reported rather than overflow.
+        """
+        want = expected + expected // 4 + 256
+        if want <= self.max_cmds:
+            return
+        self.max_cmds = want
+        self._compile_tb()
 
     def load(self, image: dict) -> None:
         self.image = dict(image)
@@ -286,6 +311,7 @@ class RTLBackend(Backend):
                   {a: self.iss.tpu.dram[a] for a in sorted(iss_result.written)},
                   f"{self.stem} golden DRAM (ISS)")
         self._write_cmds(iss_result.cmds)
+        self._fit_cmd_capacity(len(iss_result.cmds))
 
         dump = os.path.join(self.workdir, f"{self.stem}_dram_out.hex")
         argv = ["vvp", self.vvp, f"+DRAMOUT={dump}"]

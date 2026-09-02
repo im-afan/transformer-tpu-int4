@@ -36,7 +36,7 @@ else points at. Its shape and its whole DRAM map come from a generated `infer_co
   writes an untrained one at `model/saved/int4_d128_f512_l4.pt` so the export, staging and
   RTL paths can run. Any accuracy it scores is chance — `fw/perf_notes.md`'s 0.00% is that.
 - **`numpy` and `torch` are needed for the `infer` test and for `export.py`.** The other
-  five kernels need only a host C compiler.
+  seven kernels need only a host C compiler.
 
 ## Commands
 
@@ -52,7 +52,7 @@ TPU stack — **one command producer, PicoRV32 firmware built out of `accel/tpu/
 is no assembler and no `.tpu` language. Everything runs through `accel/test`:
 
 ```bash
-python accel/test/run_suite.py                  # 5 kernels on the ISS, <1 s
+python accel/test/run_suite.py                  # 8 kernels on the ISS, ~1 s
 python accel/test/run_suite.py -b rtl           # ...through the whole core, ~20 s
 python accel/test/run_suite.py -b rtl -k tiled -v
 python accel/test/run_suite.py -b rtl-uart      # ...loaded over the simulated UART, ~6x
@@ -225,9 +225,16 @@ command queues 815, `dma` 493.
   when the contraction was unsplit or through the VPU when it was not.
 - **`tpu_matmul_wide` is `tpu_matmul` with a one-column-block C.** It spends the
   arena's spare bytes on row-panel depth instead of C width, so a wide GEMM reads
-  its weight stream fewer times — but it has no transposed-B and no accumulate
-  path, and it issues `cols/N` spills per panel instead of one. `docs/fw.md` has
-  the cases where it is a loss; `tests/tiled/`'s `--mm5-general` is the A/B.
+  its weight stream fewer times — but it issues `cols/N` spills per panel instead
+  of one, and it double-buffers B, which costs a bank. Transposed-B and
+  accumulate both work. `docs/fw.md` has the cases where it is a loss;
+  `tests/tiled/`'s `--mm5-general` and `tests/wide/` are the A/Bs.
+- **`infer.c` uses `tpu_matmul_wide` at every site**, `Q@K^T` included.
+  `-DINFER_MM_WIDE=0` (`tests/infer/generate.py --general`) is the A/B. On the RTL
+  at `d=128/f=512, --gen 3`: **2 890 294 clocks against 3 489 116 (−17.2%)**, with
+  identical `mxu` and DMA clocks — the whole difference is 583 695 clocks of
+  prefetch overlap that `tpu_matmul` cannot express. It costs +24.6% commands and
+  ~2.5 KB of the 16 KB firmware image.
 - `tpu_add_narrow` / `tpu_relu_narrow` / `tpu_pack4` chunk the VPU pairs at `vlen`;
   `tpu_transpose_int8`, `tpu_transpose_dram_int8`, `tpu_move2d` cover the rest.
 - **Every primitive is self-fencing** — it returns only once its commands have retired — so
@@ -280,9 +287,11 @@ training shape and the generation shape**.
   projections, `Wo` and both FFN matmuls run once over `BATCH*rows` rows. Attention stays per
   sequence. That is the point at decode, where a step is one row of arithmetic against
   ~390 KB of weights.
-- **The image is ~15.8 KB of a 16 KB firmware RAM** at `d=128 / f=512`, with the stack
-  growing down from the same RAM. ~600 bytes of headroom. It is 11 008 at `d=64 / f=256`,
-  and `-DTPU_WGT_PREFETCH=0` takes ~4 KB off either.
+- **The image is 14 708 bytes of a 16 KB firmware RAM** at `d=128 / f=512`, with the
+  stack growing down from the same RAM — ~1.6 KB of headroom. It is 14 804 at
+  `d=64 / f=256`. The wide-everywhere `INFER_MM` is what costs it: `-DINFER_MM_WIDE=0`
+  is 12 204 and `-DTPU_WGT_PREFETCH=0` is 11 808. **Check `size` on the .elf before
+  adding a call site.**
 - **Its shape and its whole DRAM map come from the generated `infer_config.h`.** There is
   no `DR_ALIGN` chain in the C any more, and `DR_LAYER0` is wherever the activations end
   rather than a hardcoded `0x20000`.
@@ -334,9 +343,9 @@ derivation, `iss.py`, and the RTL.
 ## Long simulations
 
 - **The ISS is where you iterate.** `python accel/test/run_suite.py` is under a second and
-  covers five kernels; `tests/infer/generate.py -b iss --gen 4 -n 4` is the model. The RTL
+  covers eight kernels; `tests/infer/generate.py -b iss --gen 4 -n 4` is the model. The RTL
   run is what proves the *hardware* agrees.
-- `run_suite.py -b rtl` is ~20 s for all five and is the smoke test that dispatch still
+- `run_suite.py -b rtl` is the smoke test that dispatch still
   works at all. `spadwin` is the only thing exercising the CPU's scratchpad window.
 - `infer` on the RTL is DMA-bound at ~830 k clocks per generated token — **use `--gen 3`
   while iterating.** `run_suite.WATCHDOG_NS` sizes each kernel's watchdog.

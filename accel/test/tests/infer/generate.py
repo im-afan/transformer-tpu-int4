@@ -16,6 +16,10 @@ cache, and a reference that kept one would agree with a broken kernel.
     python accel/test/tests/infer/generate.py -b iss --synthetic -n 2
     python accel/test/tests/infer/generate.py -b iss -n 8 --gen 4
     python accel/test/tests/infer/generate.py -b rtl --synthetic --gen 3 -n 1
+    python accel/test/tests/infer/generate.py -b rtl --synthetic --gen 3 --bench
+
+--bench is timing only: no weights are staged into DRAM and no output is
+checked, so the run is just the kernel and its perf counters.
 """
 from __future__ import annotations
 
@@ -123,8 +127,10 @@ class Reference:
 # =============================================================================
 class InferVectors(VectorGenerator):
     def __init__(self, shape: Shape, problems: int, model_path: str | None = None,
-                 seed: int = 0):
+                 seed: int = 0, wide: bool = True, bench: bool = False):
         self.s = shape
+        self.wide = wide
+        self.bench = bench
         self.map = dram_map(shape)
         self.problems, self.seed = problems, seed
         self.model_path = model_path
@@ -157,7 +163,10 @@ class InferVectors(VectorGenerator):
 
         self.emb = np.array([[emb_val(v, d) for d in range(s.D)]
                              for v in range(s.VOCAB)], dtype=np.int64)
+        # static_image zero-fills the head past VOCAB, so the reference has to
+        # see zeros there too or the golden logits disagree in the pad columns.
         self.head = block(s.D, s.VOCAB_PAD, 0)
+        self.head[:, s.VOCAB:] = 0
         self.weights = {"fc": self.head[:, :s.VOCAB]}
         self.layers = []
         for L in range(s.LAYERS):
@@ -188,13 +197,22 @@ class InferVectors(VectorGenerator):
     # ---- the images ---------------------------------------------------------
     @property
     def defines(self) -> dict:
-        return {}                       # everything is in the config header
+        # Everything else is in the config header. INFER_MM_WIDE is not a shape:
+        # it is which matmul primitive every site uses, and 0 is the A/B.
+        return {} if self.wide else {"INFER_MM_WIDE": 0}
 
     def static(self) -> dict:
+        """In --bench nothing is staged at all: no weights, no embeddings, no
+        mask, no zeroed cache. A step's clock count is not data-dependent, so
+        the run costs the same against whatever DRAM already held."""
+        if self.bench:
+            return {}
         return export.static_image(self.s, self.map, self.weights, self.emb)
 
     def writable_ranges(self) -> list:
         """The caches and every activation buffer: scratch, by design."""
+        if self.bench:
+            return [(0, self.map["DR_END"])]
         base = self.map["DR_K_CACHE"]
         return [(base, self.map["DR_ACT_END"] - base)]
 
@@ -219,6 +237,20 @@ class InferVectors(VectorGenerator):
     def cases(self):
         s, m = self.s, self.map
         self.targets = []
+        if self.bench:
+            # A step costs the same clocks whatever the ids are, so the prompt
+            # is made here rather than from the dataset — that keeps --bench off
+            # torch. The ids only have to be inside the table, or the embedding
+            # gather reads DRAM the map does not own.
+            for i in range(self.problems):
+                patch = {}
+                for seq in range(s.BATCH):
+                    ids = [(i * 31 + seq * 7 + pos) % s.VOCAB
+                           for pos in range(s.PROMPT)]
+                    put_i32(patch, token_addr(s, m, seq, 0), ids)
+                yield Case(name=f"bench {i}", patch=patch, golden={},
+                           check_ranges=[])
+            return
         for i, (expr, rows) in enumerate(self.prompts()):
             patch, golden, ranges = {}, {}, []
             targets = []
@@ -243,8 +275,8 @@ class InferVectors(VectorGenerator):
 
 # =============================================================================
 def program(backend, shape: Shape, problems: int, model_path: str | None = None,
-            seed: int = 0):
-    gen = InferVectors(shape, problems, model_path, seed)
+            seed: int = 0, wide: bool = True, bench: bool = False):
+    gen = InferVectors(shape, problems, model_path, seed, wide, bench)
     return TPUProgram(os.path.join(HERE, "infer.c"), backend, gen,
                       include_dirs=[BUILD])
 
@@ -293,6 +325,12 @@ def main() -> int:
                     help="layers, --synthetic only")
     ap.add_argument("--heads", type=int, default=4)
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--bench", action="store_true",
+                    help="timing only: stage no weights and check no output, "
+                         "just run and read the perf counters")
+    ap.add_argument("--general", action="store_true",
+                    help="every matmul through tpu_matmul instead of "
+                         "tpu_matmul_wide — the A/B")
     args = ap.parse_args()
 
     if not args.synthetic and not args.model_path:
@@ -308,14 +346,16 @@ def main() -> int:
         shape = Shape(D=args.d, DFF=args.dff, LAYERS=args.layers, **knobs)
         shape.check()
 
-    problems = args.cases if args.cases else 4
+    problems = args.cases if args.cases else (1 if args.bench else 4)
     # infer is DMA-bound at ~830 k clocks per generated token; the watchdog has
     # to cover a whole run of them.
     watchdog = 1_000_000 * 1000 * max(1, gen_n)
     prog = program(backend_from_args(args, watchdog_ns=watchdog), shape,
-                   problems, args.model_path, args.seed)
+                   problems, args.model_path, args.seed, not args.general,
+                   args.bench)
     prog.run_program()
-    score(prog.generator)
+    if not args.bench:
+        score(prog.generator)
     return report(prog, args.clk_mhz)
 
 

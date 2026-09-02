@@ -138,6 +138,7 @@ def dram_map(s: Shape) -> dict:
             f"in this order: lower BLOCK (scales X, TMP_A, TMP_B and the scratch "
             f"union, at one weight stream per extra pass), then lower BATCH.")
     m["DR_END"] = end
+    print(f"{end} bytes of SRAM in used total (including weights and KV cache)")
     return m
 
 
