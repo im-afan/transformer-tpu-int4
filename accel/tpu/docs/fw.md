@@ -218,12 +218,28 @@ between the training shape and the generative one.
 
 **Phases, for benchmarking.** `INFER_PREFILL`/`INFER_DECODE` select which half
 of a generation this image runs; both default to 1 (the whole thing, what the
-accuracy path builds). `make PROG=infer PHASE=prefill|decode|both` sets them.
+accuracy path builds). They come from the config header, so
+`tests/infer/generate.py --phase prefill|decode|both|split` is what sets them.
 The counters can't be read mid-run — they reset at `G` and freeze at the
-halt — so an image that runs one half IS the measurement of that half. The
-decode-only image starts from the prompt's last token instead of the one the
-prefill would have produced: a step's cost isn't data-dependent, so the clocks
-match and the emitted tokens aren't scored.
+halt — so an image that runs one half IS the measurement of that half.
+
+- `--phase split` runs the prefill-only and the decode-only image in turn and
+  prints each phase's clocks divided by the tokens it covered. Two images, so
+  the sum counts the prompt load and the id spill twice: at `d=32/f=64/L=2,
+  PROMPT=16, --gen 3` it is 267 998 clocks against 263 316 for one whole run,
+  1.8% high.
+- The decode-only image starts from the prompt's last token instead of the one
+  the prefill would have produced, so its ids are noise and nothing is checked.
+  A step's cost isn't data-dependent, so the clocks are the same clocks.
+- The prefill-only image still produces the reference's first token, so that
+  one token and its logits are checked against the golden like any other case.
+- `head_argmax` is `noinline`. With both phases gcc outlines it anyway; a
+  phase-only image has one call site, and inlining it into `main` grew `main`
+  to where gcc expands `tpu_gemm_fit`'s `spare / (depth_bytes + c_slot_row)`
+  as a `__udivsi3` call, which does not link — there is no libgcc here. It also
+  keeps every phase measuring the same head. The whole-run image is
+  byte-identical with the attribute (14 708 bytes); prefill-only is 8 372 and
+  decode-only 7 908.
 
 **Batching.** `BATCH` independent sequences share every weight stream. X is
 `[BATCH][rows][D]`, sequence-major, so the three projections, `Wo` and both FFN
@@ -401,7 +417,7 @@ is something the ISS would reproduce as faithfully as the RTL. So
 `tests/tiled/generate.py` also carries an independent Python matmul and checks the
 ISS against a plain Python matmul before any vectors are written.
 
-## memops.c — memcpy/memset for a freestanding build
+## memops.c — memcpy/memset and 32-bit unsigned division
 
 `-ffreestanding -fno-builtin` stops gcc from recognizing memcpy/memset in
 source, but not from emitting calls to them: the ABI lowers a struct
@@ -416,6 +432,27 @@ fold every descriptor into constants, so none is ever materialized or copied,
 and `--gc-sections` drops the file. It stays because that's a property of
 these kernels, not of the library: a kernel with genuinely runtime shapes gets
 the general path, gets a descriptor in memory, and needs this.
+
+### `__udivsi3` / `__umodsi3`
+
+The core is built `ENABLE_DIV(0)`, so `div`/`rem` trap, and `-march=rv32ic_zmmul`
+is what tells gcc that. That leaves gcc two ways to do a division: open-code a
+constant divisor as a magic multiply (`mulhu`, a shift), or call a libgcc
+helper. It picks the helper for a block it predicted **cold**, where it
+optimizes for size, and then the link fails — nothing here links libgcc, and
+this toolchain has no rv32 multilib of it to link even if it did.
+
+That is not hypothetical. `tpu_gemm_fit` divides by `depth/2 + c_slot_row`, and
+in the prefill-only `infer` image (`generate.py --phase prefill|split`, so
+`INFER_DECODE=0`) 6 of the 7 `/68` sites open-code and the 7th — the
+`head_argmax` after the last prefill pass, which gcc reads as cold because
+nothing follows it — becomes `undefined reference to __udivsi3`. `-Os` makes it
+10 of 10. So the fix belongs here, not at the call site: gcc's block-frequency
+guess is not something a kernel can be written against.
+
+Shift-subtract, no `div`, one bit per iteration. `__udivsi3` is 74 bytes and
+`--gc-sections` drops both from every image that folds all its divisions —
+`--phase both` and `--phase decode` link with neither.
 
 ## infer_config.h — the whole configuration, generated
 

@@ -258,8 +258,10 @@ backend; after that nobody touches it.)
 
 **Benchmarking a phase in isolation.** The counters reset at `'G'` and freeze at the halt,
 so measuring prefill and decode separately needs two images — `INFER_PREFILL` and
-`INFER_DECODE` in the config header. A phase-only build scores nothing: the ids it
-generates are noise, but its clocks are the same clocks.
+`INFER_DECODE` in the config header, set by `tests/infer/generate.py --phase`.
+`--phase split` builds and runs both in turn and prints a per-token cost for each. The
+decode-only build scores nothing — the ids it generates are noise, but its clocks are the
+same clocks; the prefill-only build still produces the first token and is checked on it.
 
 `BATCH = B` runs B independent sequences per `'G'`, sharing one weight stream for the
 projections, `Wo` and both FFN matmuls (`B*rows` rows), while attention stays per sequence

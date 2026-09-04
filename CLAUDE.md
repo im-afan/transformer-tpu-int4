@@ -9,6 +9,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - Keep code self-documenting. Instead of writing long comments explaining everything, make variable names clear. Feel free to make names as long as needed!
 -  Keep comments to a minimum. You do not need to narrate every single line of code with a 4-line paragraph. The comments only confuse me more. Don't justify design choices in code, either. Just describe what it does (if it's confusing) and move on; leave the justification to the docs. Don't make a huge line of text at the beginning of a file, either. Leave all that to docs.
   - make a doc file for code changes instead of making huge comments
+- Make docs in markdown, but do not use markdown syntax; only bullet points and hashtags; I rarely read docs in actual rendered markdown, I just read the source.
+- Write all docs and comments in a concise style, in my voice. Look at sw_rewrite.md for a reference on style
 - Double-check before claiming something as fact. Don't state things confidently without a source - if you can't verify it, say so or go verify it first. Trust verified evidence over a single conflicting source.
 
 ## What this is
@@ -62,14 +64,22 @@ python accel/test/tests/matmul/generate.py -b rtl -M 32 --ktiles 8 --ntiles 4
 python accel/test/tests/ffn/generate.py -b rtl -T 32 -d 64 -f 256
 python accel/test/tests/infer/generate.py -b iss --synthetic --gen 3 -n 1
 python accel/test/tests/infer/generate.py -b iss -n 256        # accuracy, generating
+python accel/test/tests/infer/generate.py -b rtl --synthetic --gen 3 --phase split
 python -m accel.test.export --dump-rq --model-path model/saved/int4_d128_f512_l4.pt
 
 cd accel/tpu/tb && make list                    # RTL block testbenches
 cd accel/tpu/tb && make TEST=mxu                # one of them
 ```
 
-`infer`'s knobs are `--gen`, `--batch`, `--block`, `-T/--prompt`, and (synthetic only)
-`-d/-f/-L/--heads`. They land in the generated header, not in `-D` flags.
+`infer`'s knobs are `--gen`, `--batch`, `--block`, `-T/--prompt`, `--phase`, and
+(synthetic only) `-d/-f/-L/--heads`. They land in the generated header, not in `-D` flags.
+
+**`--phase prefill|decode|both|split` is how prefill and decode are measured apart.** The
+counters reset at the launch and freeze at the halt, so an image that runs one half *is*
+the measurement of that half; `split` runs both phase-only images in turn and prints each
+phase's clocks per token. Decode-only checks nothing (it starts from the prompt's last
+token, so its ids are noise; the clocks are not data-dependent and are the same clocks);
+prefill-only still produces the reference's first token and is checked on it.
 
 `ISSBackend` **runs** the `-DTPU_TRACE` binary as a co-process rather than reading a
 captured trace, because `infer.c` argmaxes its own logits and the token it picks lands in
@@ -77,7 +87,7 @@ the *address* of the next DMA — its command stream is not a function of the pr
 The ISS answers each `SRD` out of its own scratchpad.
 
 Deps are `torch` (+ jupyter for `model/notebook.ipynb`) and `pyserial` for the host driver.
-The venv is checked in at `.venv/` (Python 3.12); there is no requirements.txt.
+They live in the conda base env — `conda activate` before running anything that imports them. There is no requirements.txt and no `.venv/`.
 
 ## Architecture
 

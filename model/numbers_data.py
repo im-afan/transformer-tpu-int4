@@ -11,8 +11,8 @@ MAX_INTEGER = 99999
 MIN_TOKEN_LENGTH = 5  # e.g. "0+0=0"
 # First answer position; '=' sits at EQUALS_POS-1. Bounds operands at
 # max_digits <= (EQUALS_POS - 2) // 2, see model/docs/notes.md.
-EQUALS_POS = 64
-MAX_TOKENS = 128
+EQUALS_POS = 33
+MAX_TOKENS = 64
 
 # Digits are written least-significant first: "123+45=168" -> "321+54=861".
 # See model/docs/notes.md for why (carry direction + fixed place value).

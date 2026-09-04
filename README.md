@@ -1,32 +1,27 @@
 # Int4 Transformer + TPU
 
-A small decoder-only transformer that does multi-digit **addition**, plus a custom
+A small decoder-only transformer that does multi-digit addition, + custom
 SystemVerilog TPU that runs it end to end on an FPGA.
 
-- Everything is **int4** — weights *and* activations, trained with QAT.
-- The PyTorch model in `model/` is the golden reference. Every accelerator is checked
-  against it numerically.
+- Everything (weights and activations) is int4, trained with QAT.
 - The TPU runs on a **Digilent Cmod A7-35T** and generates answers autoregressively:
-  prefill, then decode against a KV cache, with the argmax and embedding lookup on the
-  device.
+  prefill, then decode with a KV cache.
 
 ## Layout
 
 ```
-model/            PyTorch golden reference
-  transformer.py    architecture + named configs
-  numbers_data.py   synthetic addition dataset + tokenizer
-  train.py          training loop (gradient accumulation)
-  make_dummy_checkpoint.py  untrained checkpoint for plumbing tests
-  saved/            checkpoints (gitignored)
+model/            PyTorch training & architecture
+  transformer.py    architecture
+  numbers_data.py   addition dataset + tokenizer
+  train.py          training loop
+  make_dummy_checkpoint.py  untrained checkpoint for plumbing tests & benchmarking
+  saved/            checkpoints
 
 accel/
-  cuda/             legacy CUDA MHA kernel (out of sync with the model)
   tpu/              the TPU
-    rtl/ tb/          design + Icarus block testbenches
-    fw/               the firmware library for the on-chip PicoRV32 — the only
-                      command producer: tpu.h, tpulib.h, start.S, link.ld
-    synth/ constraints/  Vivado build, per-board definitions
+    rtl/ tb/          design + iverilog module testbenches
+    fw/               the firmware library for the on-chip PicoRV32, with primitives like elementwise ops and tiled matmuls 
+    synth/ constraints/  Vivado build + board definitions
     docs/             per-block design notes
   test/             the verification suite
     iss.py            bit-exact model of the three units

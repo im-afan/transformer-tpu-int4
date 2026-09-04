@@ -19,8 +19,9 @@
 # -march MUST match how cpu_subsys.sv builds the core: COMPRESSED_ISA(1) and
 # ENABLE_FAST_MUL(1) but ENABLE_DIV(0), so `mul` is fine and `div`/`rem` would
 # decode as an illegal instruction and trap. That is what rv32ic_zmmul says.
-# A gcc older than 12 has no zmmul — use -march=rv32ic there and keep division
-# out of the kernel (libgcc is not linked).
+# A gcc older than 12 has no zmmul — use -march=rv32ic there. libgcc is not
+# linked (and this toolchain has no rv32 multilib of it), so memops.c carries
+# __udivsi3/__umodsi3 for the divisions gcc declines to open-code.
 
 # ---- host portability -------------------------------------------------------
 # GNU make runs recipes and $(shell ...) probes through cmd.exe whenever no sh

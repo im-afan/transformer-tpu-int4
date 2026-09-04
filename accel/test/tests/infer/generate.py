@@ -17,9 +17,15 @@ cache, and a reference that kept one would agree with a broken kernel.
     python accel/test/tests/infer/generate.py -b iss -n 8 --gen 4
     python accel/test/tests/infer/generate.py -b rtl --synthetic --gen 3 -n 1
     python accel/test/tests/infer/generate.py -b rtl --synthetic --gen 3 --bench
+    python accel/test/tests/infer/generate.py -b rtl --synthetic --gen 3 --phase split
 
 --bench is timing only: no weights are staged into DRAM and no output is
 checked, so the run is just the kernel and its perf counters.
+
+--phase picks which half of a generation the image runs. The counters reset at
+the launch and freeze at the halt, so an image that runs one half IS the
+measurement of that half; there is no way to read them mid-run. `split` builds
+both phase-only images in turn and prints a per-token cost for each.
 """
 from __future__ import annotations
 
@@ -131,6 +137,13 @@ class InferVectors(VectorGenerator):
         self.s = shape
         self.wide = wide
         self.bench = bench
+        # How many generated tokens the golden covers. A decode-only image
+        # starts from the prompt's last token instead of the one the prefill
+        # would have produced, so its ids are noise and nothing is checked; a
+        # prefill-only image still produces the reference's first token.
+        self.checked_gen = 0 if bench or not shape.PREFILL else (
+            shape.GEN if shape.DECODE else 1)
+        self.checks_output = self.checked_gen > 0
         self.map = dram_map(shape)
         self.problems, self.seed = problems, seed
         self.model_path = model_path
@@ -210,11 +223,17 @@ class InferVectors(VectorGenerator):
         return export.static_image(self.s, self.map, self.weights, self.emb)
 
     def writable_ranges(self) -> list:
-        """The caches and every activation buffer: scratch, by design."""
+        """The caches and every activation buffer: scratch, by design. When the
+        output is not checked, the ids and logits the kernel emits are scratch
+        too, or the stray-write check fails on them."""
         if self.bench:
             return [(0, self.map["DR_END"])]
         base = self.map["DR_K_CACHE"]
-        return [(base, self.map["DR_ACT_END"] - base)]
+        out = [(base, self.map["DR_ACT_END"] - base)]
+        if not self.checks_output:
+            out.append((self.map["DR_TOKENS"],
+                        self.map["DR_MASK"] - self.map["DR_TOKENS"]))
+        return out
 
     def prompts(self):
         """One BATCH-wide problem per case, from the addition dataset."""
@@ -251,23 +270,26 @@ class InferVectors(VectorGenerator):
                 yield Case(name=f"bench {i}", patch=patch, golden={},
                            check_ranges=[])
             return
+        n_check = self.checked_gen
         for i, (expr, rows) in enumerate(self.prompts()):
             patch, golden, ranges = {}, {}, []
             targets = []
             for seq, toks in enumerate(rows):
                 prompt = toks[:s.PROMPT]
                 put_i32(patch, token_addr(s, m, seq, 0), prompt)
+                if not n_check:
+                    continue
 
-                gen_tok, gen_log = self.reference.generate(prompt, s.GEN)
+                gen_tok, gen_log = self.reference.generate(prompt, n_check)
                 put_i32(golden, token_addr(s, m, seq, s.PROMPT), gen_tok)
                 for step, logits in enumerate(gen_log):
                     put_rowmajor_i4(
                         golden, logit_addr(s, m, seq, s.PROMPT - 1 + step),
                         1, s.VOCAB_PAD, lambda r, c, v=logits: int(v[c]))
-                ranges.append((token_addr(s, m, seq, s.PROMPT), s.GEN * 4))
+                ranges.append((token_addr(s, m, seq, s.PROMPT), n_check * 4))
                 ranges.append((logit_addr(s, m, seq, s.PROMPT - 1),
-                               s.GEN * i4_row(s.VOCAB_PAD)))
-                targets.append((prompt, toks[s.PROMPT:s.PROMPT + s.GEN], gen_tok))
+                               n_check * i4_row(s.VOCAB_PAD)))
+                targets.append((prompt, toks[s.PROMPT:s.PROMPT + n_check], gen_tok))
             self.targets.append(targets)
             yield Case(name=f"problem {i}: {expr}", patch=patch, golden=golden,
                        check_ranges=ranges)
@@ -297,13 +319,86 @@ def score(gen: InferVectors) -> None:
         return
     said = numbers_data.unreverse_expression(
         numbers_data.detokenize(gen.targets[0][0][2]))
-    print(f"addition: {100 * exact / n:.2f}% exact-sequence, "
-          f"{100 * tok_ok / max(tok_n, 1):.2f}% token; first answer {said!r}")
+    # A prefill-only image generates one token, so say how long the sequence
+    # being called exact actually was.
+    print(f"addition: {100 * exact / n:.2f}% exact-sequence over "
+          f"{gen.checked_gen} token(s), {100 * tok_ok / max(tok_n, 1):.2f}% "
+          f"token; first answer {said!r}")
 
     every = {t for problem in gen.targets for _, _, got in problem for t in got}
     if len(every) == 1:
         print(f"  WARNING: every generated token is {every.pop()} — the weights "
               f"have collapsed and this check is weak", file=sys.stderr)
+
+
+# =============================================================================
+# Phases.
+# =============================================================================
+PHASES = {"both": (1, 1), "prefill": (1, 0), "decode": (0, 1)}
+
+
+def shape_for(args, phase: str) -> Shape:
+    prefill, decode = PHASES[phase]
+    gen_n = args.gen if args.gen is not None else args.tokens - args.prompt
+    knobs = dict(T=args.tokens, PROMPT=args.prompt, GEN=gen_n, BATCH=args.batch,
+                 BLOCK=args.block, HEADS=args.heads,
+                 PREFILL=prefill, DECODE=decode)
+    if args.model_path:
+        net = export.load_checkpoint(args.model_path, args.heads)
+        return export.shape_of(net, **knobs)
+    shape = Shape(D=args.d, DFF=args.dff, LAYERS=args.layers, **knobs)
+    shape.check()
+    return shape
+
+
+def run_phase(args, backend, phase: str) -> TPUProgram:
+    shape = shape_for(args, phase)
+    problems = args.cases if args.cases else (1 if args.bench else 4)
+    prog = program(backend, shape, problems, args.model_path, args.seed,
+                   not args.general, args.bench)
+    prog.name = "infer" if phase == "both" else f"infer {phase}-only"
+    prog.run_program()
+    if prog.generator.checks_output:
+        score(prog.generator)
+    return prog
+
+
+def split_summary(progs: dict, shape: Shape, clk_mhz: float) -> str:
+    """The two phase-only images side by side, each divided by the tokens it
+    covered. They are separate runs of separate images, so the sum is what a
+    generation costs, not a measured whole."""
+    bench = {name: p.benchmark(clk_mhz) for name, p in progs.items()}
+    rows = [("prefill", shape.PROMPT, "prompt token"),
+            ("decode", shape.GEN - 1, "decode step")]
+    if any(b is None for b in bench.values()):
+        cmds = {name: [r.n_cmds for r in p.results if r.n_cmds is not None]
+                for name, p in progs.items()}
+        if not all(cmds.values()):
+            return ""
+        lines = ["  (the ISS has no cycle model — commands only)"]
+        for name, n, unit in rows:
+            mean = sum(cmds[name]) / len(cmds[name])
+            lines.append(f"  {name:<10} {mean:>12.0f} commands   "
+                         f"{mean / max(n, 1):>10.1f} per {unit}")
+        return "\n".join(lines)
+
+    lines = [f"  {'phase':<10} {'clocks':>12} {'ms':>10}   {'per token':>12}"
+             f" {'ms':>9}   {'mxu':>6} {'dma':>6} {'idlec':>6}"]
+    for name, n, unit in rows:
+        b = bench[name]
+        run, per = b["run_mean"], b["run_mean"] / max(n, 1)
+        share = b["share"]
+        lines.append(
+            f"  {name:<10} {run:>12.0f} {run / (clk_mhz * 1e3):>10.3f}   "
+            f"{per:>12.0f} {per / (clk_mhz * 1e3):>9.3f}   "
+            f"{100 * share.get('mxu', 0):>5.1f}% {100 * share.get('dma', 0):>5.1f}%"
+            f" {100 * share.get('idlec', 0):>5.1f}%")
+    total = sum(b["run_mean"] for b in bench.values())
+    lines.append(f"  {'sum':<10} {total:>12.0f} {total / (clk_mhz * 1e3):>10.3f}"
+                 f"   ({shape.PROMPT} prompt + {shape.GEN - 1} decode)")
+    lines.append("  the sum is two images, so it counts the prompt load and the "
+                 "id spill twice")
+    return "\n".join(lines)
 
 
 def main() -> int:
@@ -331,32 +426,43 @@ def main() -> int:
     ap.add_argument("--general", action="store_true",
                     help="every matmul through tpu_matmul instead of "
                          "tpu_matmul_wide — the A/B")
+    ap.add_argument("--phase", choices=("both", "prefill", "decode", "split"),
+                    default="both",
+                    help="which half of a generation the image runs. split "
+                         "builds the prefill-only and decode-only images in "
+                         "turn and prints each phase's cost per token")
     args = ap.parse_args()
 
     if not args.synthetic and not args.model_path:
         args.model_path = "model/saved/int4_d128_f512_l4.pt"
 
-    gen_n = args.gen if args.gen is not None else args.tokens - args.prompt
-    knobs = dict(T=args.tokens, PROMPT=args.prompt, GEN=gen_n, BATCH=args.batch,
-                 BLOCK=args.block, HEADS=args.heads)
-    if args.model_path:
-        net = export.load_checkpoint(args.model_path, args.heads)
-        shape = export.shape_of(net, **knobs)
-    else:
-        shape = Shape(D=args.d, DFF=args.dff, LAYERS=args.layers, **knobs)
-        shape.check()
 
-    problems = args.cases if args.cases else (1 if args.bench else 4)
+    gen_n = args.gen if args.gen is not None else args.tokens - args.prompt
     # infer is DMA-bound at ~830 k clocks per generated token; the watchdog has
     # to cover a whole run of them.
     watchdog = 1_000_000 * 1000 * max(1, gen_n)
-    prog = program(backend_from_args(args, watchdog_ns=watchdog), shape,
-                   problems, args.model_path, args.seed, not args.general,
-                   args.bench)
-    prog.run_program()
-    if not args.bench:
-        score(prog.generator)
-    return report(prog, args.clk_mhz)
+    backend = backend_from_args(args, watchdog_ns=watchdog)
+
+    if args.phase != "split":
+        return report(run_phase(args, backend, args.phase), args.clk_mhz)
+
+    # Two images, run one after the other: the counters cannot be read mid-run,
+    # so a phase is measured by an image that runs only that phase.
+    progs = {}
+    rc = 0
+    for phase in ("prefill", "decode"):
+        progs[phase] = run_phase(args, backend, phase)
+        rc |= report(progs[phase], args.clk_mhz)
+    summary = split_summary(progs, shape_for(args, "both"), args.clk_mhz)
+    if summary:
+        print(f"infer phases on {backend.name}, "
+              f"d={progs['decode'].generator.s.D} "
+              f"f={progs['decode'].generator.s.DFF} "
+              f"L={progs['decode'].generator.s.LAYERS} "
+              f"PROMPT={args.prompt} BATCH={args.batch}:")
+        print(summary)
+        print()
+    return rc
 
 
 if __name__ == "__main__":

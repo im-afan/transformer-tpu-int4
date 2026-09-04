@@ -1,0 +1,20 @@
+
+inference benchmark on d=128, f=512, L=4, prompt=64, T=128:
+infer decode-only on board, 1 case(s):
+  run                                    44602445 clocks  3716.870 ms @ 12 MHz
+  MXU busy                                8655822   19.4%
+    of which weight load                        0    0.0%
+  VPU busy                                 240912    0.5%
+  DMA busy                               30777586   69.0%
+  no unit busy (issue overhead)          13034524   29.2%
+  producer stalled on a full queue              0    0.0%
+  two or more units busy                  8106399   18.2%
+
+infer decode-only: 1 case(s) PASSED on board
+
+We will roughly calculate the expected DMA bytes during decode (let S = prompt size):
+- weight loads: 4d^2 for W_Q/K/V/O, 8d^2 for FFN -> 12Ld^2 per step => 12(S-T) * L * d^2
+- KV cache: 2LD(S + (S+1) + (S+2) + ... + (T-1) + T), approx = LD(S+T)(S-T)
+- total using above params: 12(64) * 4 * 128^2 + 4 * 128 * (128+64) * 64 = 56623104 int4s communicated
+- 56623104 int4 / (2 int4 / byte) * 1 clk / byte = 28311552 clk, almost exactly equal to DMA active time!
+- 1st optimization: cpu overhead

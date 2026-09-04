@@ -1,49 +1,35 @@
-# 8 TOKEN PROMPT, 16 TOKENS TOTAL, BATCH SIZE 8, d=128 f=512 l=4
-490944 bytes of SRAM in used total (including weights and KV cache)
+python generate.py --bench --phase decode --batch 1 -d 128 -f 512 --prompt 64 -T 128 -b board --synthetic
+470784 bytes of SRAM in used total (including weights and KV cache)
   ok   bench 0: 0 bytes match
 
-infer on board, 1 case(s):
-  run                                    11675281 clocks  972.940 ms @ 12 MHz
-  MXU busy                                1994816   17.1%
+infer decode-only on board, 1 case(s):
+  run                                    44602445 clocks  3716.870 ms @ 12 MHz
+  MXU busy                                8655822   19.4%
     of which weight load                        0    0.0%
-  VPU busy                                 240676    2.1%
-  DMA busy                                5804140   49.7%
-  no unit busy (issue overhead)           4805865   41.2%
+  VPU busy                                 240912    0.5%
+  DMA busy                               30777586   69.0%
+  no unit busy (issue overhead)          13034524   29.2%
   producer stalled on a full queue              0    0.0%
-  two or more units busy                  1170216   10.0%
+  two or more units busy                  8106399   18.2%
 
-infer: 1 case(s) PASSED on board
+infer decode-only: 1 case(s) PASSED on board
+
+
+
+python generate.py --bench --phase prefill --batch 1 -d 128 -f 512 --prompt 64 -T 128 -b board --synthetic
 484672 bytes of SRAM in used total (including weights and KV cache)
   ok   bench 0: 0 bytes match
 
-  
-
-# 64 PROMPT, 128 TOKENS TOTAL, BATCH SIZE 1, d=128 f=512 l=4
-infer on board, 1 case(s):
-  run                                    47821141 clocks  3985.095 ms @ 12 MHz
-  MXU busy                                9752832   20.4%
+infer prefill-only on board, 1 case(s):
+  run                                     3789957 clocks  315.830 ms @ 12 MHz
+  MXU busy                                1097010   28.9%
     of which weight load                        0    0.0%
-  VPU busy                                 483152    1.0%
-  DMA busy                               33354248   69.7%
-  no unit busy (issue overhead)          13050597   27.3%
+  VPU busy                                 242240    6.4%
+  DMA busy                                2576921   68.0%
+  no unit busy (issue overhead)            609539   16.1%
   producer stalled on a full queue              0    0.0%
-  two or more units busy                  8819688   18.4%
+  two or more units busy                   735753   19.4%
 
-infer: 1 case(s) PASSED on board
-484672 bytes of SRAM in used total (including weights and KV cache)
-439232 bytes of SRAM in used total (including weights and KV cache)
-  ok   bench 0: 0 bytes match
+infer prefill-only: 1 case(s) PASSED on board
 
-
-# python generate.py -b board --prompt 64 --tokens 128 --batch 8 -d 64 -f 256 --synthetic --bench >> inference_bench.txt
-infer on board, 1 case(s):
-  run                                   111270225 clocks  9272.519 ms @ 12 MHz
-  MXU busy                               12869344   11.6%
-    of which weight load                        0    0.0%
-  VPU busy                                2979720    2.7%
-  DMA busy                               42617784   38.3%
-  no unit busy (issue overhead)          58200609   52.3%
-  producer stalled on a full queue              0    0.0%
-  two or more units busy                  5397232    4.9%
-
-infer: 1 case(s) PASSED on board
+// need to fuse ops, dma is like 2x higher than it needs to be
