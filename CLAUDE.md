@@ -38,7 +38,7 @@ else points at. Its shape and its whole DRAM map come from a generated `infer_co
   writes an untrained one at `model/saved/int4_d128_f512_l4.pt` so the export, staging and
   RTL paths can run. Any accuracy it scores is chance — `fw/perf_notes.md`'s 0.00% is that.
 - **`numpy` and `torch` are needed for the `infer` test and for `export.py`.** The other
-  seven kernels need only a host C compiler.
+  eight kernels need only a host C compiler.
 
 ## Commands
 
@@ -54,7 +54,7 @@ TPU stack — **one command producer, PicoRV32 firmware built out of `accel/tpu/
 is no assembler and no `.tpu` language. Everything runs through `accel/test`:
 
 ```bash
-python accel/test/run_suite.py                  # 8 kernels on the ISS, ~1 s
+python accel/test/run_suite.py                  # 9 kernels on the ISS, ~1 s
 python accel/test/run_suite.py -b rtl           # ...through the whole core, ~20 s
 python accel/test/run_suite.py -b rtl -k tiled -v
 python accel/test/run_suite.py -b rtl-uart      # ...loaded over the simulated UART, ~6x
@@ -184,12 +184,14 @@ one and `Q@K^T`'s is the one needing the transposing DMA.
 
 ### The VPU has six ops and nothing else
 
-`VOP_DOT`, `ADD`, `RELU`, `REQUANT`, `DYT`, `QUANT4`.
+`VOP_DOT`, `ADD`, `RELU`, `REQUANT`, `DYT`, `ARGMAX`.
 
-- **`QUANT4`** (`0x22`) is `requant`'s fixed point clipped to `[-8, 7]` and written **4 bits
-  wide**, two elements per byte, in the MXU's weight encoding. It is what lets an activation
-  be a weight operand, and therefore what put `Q@K^T` and `P@V` on the array. `vlen` must be
-  a multiple of 2, and the destination advances half as fast as the source.
+- **`ARGMAX`** (selector 18) writes the int32 **index** of the largest element, ties to the
+  lowest. It reduces one dispatch, so anything longer is folded by the CPU — see
+  `tpu_argmax`. `tests/argmax/` is the only caller.
+- **`QUANT4`** (selector 17) is retired. It narrowed an int8 activation into the MXU's
+  packed int4 weight encoding, which is what put `Q@K^T` and `P@V` on the array; the MXU
+  requantizes to int4 on store now, so the pass has no work left to do.
 - **`VECMATMUL` was removed** once that left it with no caller (it was 36.4% of the whole run
   when attention ran on it). Gone with it: the `mm_*` sequencer, `cfg` 10–14, the `VPU_GEOM`
   command, and `vpu_mm_busy`.
@@ -247,6 +249,10 @@ command queues 815, `dma` 493.
   ~2.5 KB of the 16 KB firmware image.
 - `tpu_add_narrow` / `tpu_relu_narrow` / `tpu_pack4` chunk the VPU pairs at `vlen`;
   `tpu_transpose_int8`, `tpu_transpose_dram_int8`, `tpu_move2d` cover the rest.
+- **`tpu_argmax` is the one primitive the CPU is inside.** `VOP_ARGMAX` reports an index
+  within one dispatch, so anything longer than a chunk is folded by the CPU: it reads each
+  chunk's index back through the scratchpad window, reads the element it points at, and
+  keeps the running best. Ties take the lowest index. `tests/argmax/` is the regression.
 - **Every primitive is self-fencing** — it returns only once its commands have retired — so
   composing two is always safe.
 - **`tpu_matmul`, `tpu_gemm_blocks` and `tpu_gemm_arena_bytes` are `always_inline`, and that
@@ -272,8 +278,8 @@ A **32-token prefill**, then 31 decode steps of M=1 against a KV cache in DRAM. 
 `infer_block(rows, first_pos)` serves both, so **M is the only difference between the
 training shape and the generation shape**.
 
-- **Every tensor's home is DRAM.** The scratchpad holds a staging arena and a 320-byte
-  mailbox; scratchpad copies are a compile-time promotion cascade with a DRAM fallback.
+- **Every tensor's home is DRAM.** The scratchpad holds a staging arena and a `BATCH*T*4`
+  mailbox that is the token sequence and nothing else; scratchpad copies are a compile-time promotion cascade with a DRAM fallback.
   Nothing asserts that an activation fits on chip.
 - **The cache is 12 KB per layer per sequence, and each half is stored in the orientation its
   matmul wants**, because the append is what a cache costs. V's is free (one `quant4` row,
@@ -287,10 +293,11 @@ training shape and the generation shape**.
   the suite — that is the test, not a shortcut. (The KV cache *is* zeroed once, in the
   static image, so the first problem sees the same memory on every backend; nothing
   touches it after that.)
-- **The argmax and the embedding gather are on the device.** `cpu_subsys.sv` maps the
-  scratchpad at `0x9xxx_xxxx`, so the head writes its logits there, the CPU reads them back
-  (`tpu_spad_ld`) and argmaxes, and the gather is a DMA at `DR_EMB + tok*D`. The host
-  tokenizes and nothing else. `tests/spadwin/` is that window's own regression; the window
+- **The argmax and the embedding gather are on the device.** The head's logits are int4 in
+  DRAM and `tpu_argmax` reduces them on the array over `VOCAB` (13, odd — the head's
+  padding columns are zero and would outrank a negative logit); `cpu_subsys.sv` maps the
+  scratchpad at `0x9xxx_xxxx`, which is how the CPU folds the chunks and how the gather's
+  address reaches a DMA at `DR_EMB + tok*D`. The host tokenizes and nothing else. `tests/spadwin/` is that window's own regression; the window
   is **unsynchronized** — a load is not a command, so it needs the same `tpu_wait` a
   dependent command would, 32 bits wide and 4-byte aligned (the S port has no byte strobes).
 - **`BATCH` sequences share every weight stream.** X is `[BATCH][rows][D]`, so the
@@ -353,7 +360,7 @@ derivation, `iss.py`, and the RTL.
 ## Long simulations
 
 - **The ISS is where you iterate.** `python accel/test/run_suite.py` is under a second and
-  covers eight kernels; `tests/infer/generate.py -b iss --gen 4 -n 4` is the model. The RTL
+  covers nine kernels; `tests/infer/generate.py -b iss --gen 4 -n 4` is the model. The RTL
   run is what proves the *hardware* agrees.
 - `run_suite.py -b rtl` is the smoke test that dispatch still
   works at all. `spadwin` is the only thing exercising the CPU's scratchpad window.

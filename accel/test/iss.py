@@ -10,6 +10,7 @@ from dataclasses import dataclass, field
 
 # vpu.sv VOP_*. Gaps (2, 4-9, 11-15, 17) are retired holes, not reused.
 VOP_DOT, VOP_ADD, VOP_RELU, VOP_REQUANT, VOP_DYT = 0, 1, 3, 10, 16
+VOP_ARGMAX = 18
 
 # The int4 grid: mxu.sv/vpu.sv Q4_MIN/Q4_MAX and model/transformer.py
 # INT4_QMIN/INT4_QMAX are this pair.
@@ -201,8 +202,9 @@ class TPU:
 
     def _vpu(self, vop: int, dst: int, src0: int, src1: int, vlen: int,
              rq_word: int) -> None:
-        """One vector op over ``vlen`` packed int4 elements. ``DOT`` writes one
-        int32 scalar; every other op narrows to int4 in place."""
+        """One vector op over ``vlen`` packed int4 elements. ``DOT`` and
+        ``ARGMAX`` write one int32 scalar; every other op narrows to int4 in
+        place."""
         if vlen == 0:
             return
         m0, sh = self._rq_split(rq_word)
@@ -212,6 +214,15 @@ class TPU:
             for i in range(vlen):
                 acc += self.rd_i4(src0, i) * self.rd_i4(src1, i)
             self.wr_i32(dst, s32(acc))
+            return
+
+        if vop == VOP_ARGMAX:
+            best, best_i = -9, 0
+            for i in range(vlen):
+                v = self.rd_i4(src0, i)
+                if v > best:                 # ties -> lowest index
+                    best, best_i = v, i
+            self.wr_i32(dst, s32(best_i))
             return
 
         def value(i: int) -> int:
@@ -238,7 +249,7 @@ class TPU:
     VPU_CMD_OP = 0x01          # 0x02 (GEOM) retired with the vecmatmul macro op
     DMA_MOVE = 0x01
 
-    _VOPS = (VOP_DOT, VOP_ADD, VOP_RELU, VOP_REQUANT, VOP_DYT)
+    _VOPS = (VOP_DOT, VOP_ADD, VOP_RELU, VOP_REQUANT, VOP_DYT, VOP_ARGMAX)
 
     def exec_command(self, unit: int, w0: int, w1: int, w2: int, w3: int) -> None:
         """Execute one 128-bit macro-op. An unknown opcode is discarded, not

@@ -49,7 +49,8 @@ module vpu #(
         VOP_ADD     = 5'd1,
         VOP_RELU    = 5'd3,
         VOP_REQUANT = 5'd10,
-        VOP_DYT     = 5'd16;
+        VOP_DYT     = 5'd16,
+        VOP_ARGMAX  = 5'd18;
 
     // DYT is binary because a normalization always follows a residual add: it
     // is ADD with the odd clip, which is the only form the model uses.
@@ -58,7 +59,7 @@ module vpu #(
     endfunction
 
     function automatic logic is_reduction(input logic [4:0] o);
-        return (o == VOP_DOT);
+        return (o == VOP_DOT) || (o == VOP_ARGMAX);
     endfunction
 
     // clip((v*m0 + round) >> n). `lo` is -8 for the requantizing ops and -7 for
@@ -90,6 +91,7 @@ module vpu #(
     logic [ADDR_W-1:0] dst_r;
     logic [ADDR_W-1:0] p_src0, p_src1, p_dst;
     logic [10:0]       remaining;
+    logic [10:0]       p_elem;
 
     logic [M0_W+N_W-1:0]     rq_word_r;
     logic signed [ACC_W-1:0] acc;
@@ -110,7 +112,45 @@ module vpu #(
     logic signed [3:0]       res4    [0:LANES-1];
     logic signed [ACC_W-1:0] red_val [0:LANES-1];
 
+    // ARGMAX folds src0 to (value, index) in a binary tree, so a chunk costs
+    // log2(LANES) comparator levels instead of LANES. Level 0 pads up to a
+    // power of two with Q4_MIN and every tie goes left; the active lanes are a
+    // prefix, so a padding lane can never outrank a real one.
+    localparam int TREE_LV = $clog2(LANES);
+    localparam int TREE_N  = 1 << TREE_LV;
+
+    logic signed [3:0] fold_val [0:TREE_LV][0:TREE_N-1];
+    logic [10:0]       fold_idx [0:TREE_LV][0:TREE_N-1];
+
+    always_comb begin
+        for (int lv = 0; lv <= TREE_LV; lv++)
+            for (int k = 0; k < TREE_N; k++) begin
+                fold_val[lv][k] = 4'(signed'(Q4_MIN));
+                fold_idx[lv][k] = '0;
+            end
+        for (int l = 0; l < TREE_N; l++) begin
+            if (l < LANES && 11'(l) < chunk_active)
+                fold_val[0][l] = $signed(V_data0[l*4 +: 4]);
+            fold_idx[0][l] = 11'(l);
+        end
+        for (int lv = 1; lv <= TREE_LV; lv++)
+            for (int k = 0; k < TREE_N/2; k++)
+                if (k < (TREE_N >> lv)) begin
+                    if (fold_val[lv-1][2*k] >= fold_val[lv-1][2*k+1]) begin
+                        fold_val[lv][k] = fold_val[lv-1][2*k];
+                        fold_idx[lv][k] = fold_idx[lv-1][2*k];
+                    end else begin
+                        fold_val[lv][k] = fold_val[lv-1][2*k+1];
+                        fold_idx[lv][k] = fold_idx[lv-1][2*k+1];
+                    end
+                end
+    end
+
+    wire signed [3:0] chunk_max_val = fold_val[TREE_LV][0];
+    wire       [10:0] chunk_max_idx = fold_idx[TREE_LV][0];
+
     logic signed [3:0] a4, b4;
+
     always_comb begin
         a4 = '0; b4 = '0;
         for (int l = 0; l < LANES; l++) begin
@@ -130,12 +170,28 @@ module vpu #(
         end
     end
 
+    // Both reductions land in `acc`: DOT's running sum, ARGMAX's best index so
+    // far. ARGMAX carries the best value beside it, one bit wider than an int4
+    // so its initial value loses to a vector that is all Q4_MIN. Strictly
+    // greater, so the earliest chunk holding the maximum keeps it and the index
+    // is the lowest one -- torch.argmax's rule.
     logic signed [ACC_W-1:0] sum_chunk, acc_next;
+    logic signed [4:0]       max_val, max_next;
     always_comb begin
         sum_chunk = '0;
         for (int l = 0; l < LANES; l++)
             if (lane_active[l]) sum_chunk += red_val[l];
-        acc_next = acc + sum_chunk;
+
+        max_next = max_val;
+        if (op_r == VOP_ARGMAX) begin
+            acc_next = acc;
+            if (5'(chunk_max_val) > max_val) begin
+                acc_next = ACC_W'(p_elem) + ACC_W'(chunk_max_idx);
+                max_next = 5'(chunk_max_val);
+            end
+        end else begin
+            acc_next = acc + sum_chunk;
+        end
     end
 
     // Two lanes share a byte, so the strobe is per pair. A tail that leaves a
@@ -220,6 +276,8 @@ module vpu #(
             acc       <= '0;
             V_data0   <= '0;
             V_data1   <= '0;
+            p_elem    <= '0;
+            max_val   <= 5'(signed'(Q4_MIN - 1));
         end else if (!stalled) begin
             state <= state_n;
 
@@ -233,15 +291,21 @@ module vpu #(
                     rq_word_r <= vpu_rq_word;
                     remaining <= {1'b0, vpu_vlen};
                     acc       <= '0;
+                    p_elem    <= '0;
+                    max_val   <= 5'(signed'(Q4_MIN - 1));
                 end
 
                 S_RD0D: V_data0 <= V_rdata;
                 S_RD1D: V_data1 <= V_rdata;
                 S_EXEC: begin
-                    if (is_reduction(op_r)) acc <= acc_next;
+                    if (is_reduction(op_r)) begin
+                        acc     <= acc_next;
+                        max_val <= max_next;
+                    end
                     p_src0    <= p_src0 + chunk_bytes;
                     p_src1    <= p_src1 + chunk_bytes;
                     p_dst     <= p_dst  + chunk_bytes;
+                    p_elem    <= p_elem + chunk_active;
                     remaining <= remaining - chunk_active;
                 end
 

@@ -1,4 +1,4 @@
-# `model/` — the golden reference
+# `model/`: architecture definition & training 
 
 A character-level decoder-only transformer trained to do multi-digit **addition**.
 Everything under [`accel/`](../accel) is checked against this code, so it defines

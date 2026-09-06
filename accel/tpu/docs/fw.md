@@ -54,6 +54,31 @@ C; the section below is when to reach for which.
 site gcc folds the block arithmetic away, and the PicoRV32 runs it with no
 unit busy. See CLAUDE.md's note on `always_inline` firmware primitives.
 
+### `tpu_argmax` — the CPU folding what one dispatch cannot
+
+`VOP_ARGMAX` reduces one dispatch and reports an index **within that
+dispatch**, so a vector longer than a chunk needs something to compare chunks
+against each other. That something is the CPU: after each chunk it reads the
+index back through the scratchpad window, then reads the element that index
+points at, and keeps the running best itself. Strictly greater, so an earlier
+chunk keeps a tie — `torch.argmax`'s rule, and the one `head_argmax` needs.
+
+- **`count` may be odd.** The even-length rule is about the packed int4
+  destination the elementwise ops write; a reduction writes an int32 scalar.
+  `head_argmax` reduces over `VOCAB`, which is 13.
+- The second read is what costs the extra pass. The op writes the index and
+  not the value, and nothing in the ISA reads an int4 out of a scalar, so the
+  value has to come back out of the staged chunk. It is one aligned word: the
+  window has no byte strobes, so the nibble is picked out of the word holding
+  it.
+- **The window is not synchronized against the queues**, so both loads sit
+  behind a `tpu_wait`. A load is not a command and nothing orders it.
+- The chunk is whichever is smaller, the arena minus the scalar's word or
+  `TPU_VCHUNK_MAX`. `tests/argmax/` runs every problem against both, because
+  the two cap it for different reasons.
+- The destination is an int32 scalar in one scratchpad word, so `TPU_N` must be
+  at least 8. That is a build-time assert, not a run-time one.
+
 ### `tpu_matmul_wide` — one column block of C on chip instead of a whole row
 
 Same GEMM, same `tpu_gemm` struct, same arena. The one structural change is that
@@ -320,9 +345,11 @@ If `DR_END <= DR_LAYER0` fails: lower `BLOCK` first (it scales `X`, `TMP_A`,
 `TMP_B` and the scratch union, and costs one weight stream per extra pass),
 then lower `BATCH`.
 
-**Scratchpad.** The CPU has no path to DRAM, so what it reads (prompt ids,
-logits) and writes (the chosen token) lives in a fixed mailbox the scratchpad
-window reaches. That's the only fixed allocation — the rest is arena.
+**Scratchpad.** The CPU has no path to DRAM, so what it reads (the prompt ids)
+and writes (the chosen token) lives in a fixed mailbox the scratchpad window
+reaches — `[BATCH][T]` int32 and nothing else. That's the only fixed allocation
+— the rest is arena. The logits are not in it: `tpu_argmax` reduces them on the
+array and stages them through the arena like any other operand.
 
 **`--bench` — timing without weights.** `tests/infer/generate.py --bench` runs
 the same kernel with nothing staged into DRAM: no weights, no embedding table,
@@ -375,8 +402,8 @@ proof for the data window (`python accel/test/run_suite.py -b rtl -k spadwin`).
 
 Three things, none of which a DMA can do alone:
 - **Read** — a block fills from DRAM and the CPU reads all 16 words back,
-  finding the largest (an argmax over a tensor — what `infer.c` needs and the
-  VPU has no op for, since `REDUCEMAX` went with the softmax datapath).
+  finding the largest. These are int32, so it is the CPU's own scan, not
+  `tpu_argmax` — that one is int4 and has `tests/argmax/` of its own.
 - **Write** — the index and value go back through the window, then are read
   straight back to prove the write landed rather than merely being accepted
   (the S port has no byte strobes, so both are 32-bit accesses at 4-aligned
@@ -387,6 +414,30 @@ Three things, none of which a DMA can do alone:
 The host-staged pattern makes the maximum unique and puts it at index 12, so a
 read returning zero/a constant/the wrong word can't accidentally agree, and the
 gathered row sits near the end of the table rather than at its base.
+
+## argmax.c — tpu_argmax, and the only caller of `VOP_ARGMAX`
+
+Four lengths against two arena sizes, so each problem runs once with the chunk
+capped by the 10-bit `vlen` field and once with it capped by the arena. At the
+defaults that is 6 chunks one way and 18 the other, over the same eight
+answers — a fold that works at one chunk size and not the other shows up as
+half the output word being wrong.
+
+The lengths are `2500` (several chunks, the last ragged), `1016`
+(`TPU_VCHUNK_MAX` at `N=8`, exactly one), `8` (one scratchpad word, no tail
+lanes) and `2` (one lane pair, the shortest legal vector).
+
+Six data patterns, chosen for what they force:
+- a **ramp** over the whole int4 grid, whose maximum is near the front;
+- a **peak in the last chunk**, at the last element of a ragged one;
+- **two equal maxima** side by side, so the tie rule is visible;
+- **every element equal** and **every element `-8`**, which are the two ways a
+  fold can pick the wrong index without ever comparing wrongly;
+- a **maximum that is negative**, which a fold opening its accumulator at zero
+  loses.
+
+Two patterns answer 0 at every length on purpose; the other four do not, so a
+kernel that returns 0 fails four cases.
 
 ## tiled.c — tpulib.h past the point where the scratchpad helps
 

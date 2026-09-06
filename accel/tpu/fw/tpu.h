@@ -182,6 +182,7 @@ static inline void tpu_mxu_mm(uint32_t c_addr, uint32_t a_addr,
 #define TPU_V_RELU    3u
 #define TPU_V_REQUANT 10u
 #define TPU_V_DYT     16u
+#define TPU_V_ARGMAX  18u
 
 /* One vector op over `count` int4 elements. Every operand and every
  * elementwise result is packed int4, and the narrow is fused into the op, so
@@ -189,8 +190,9 @@ static inline void tpu_mxu_mm(uint32_t c_addr, uint32_t a_addr,
  *
  * `count` must be even and every address a multiple of TPU_WORD_BYTES: two
  * elements share a byte and the write strobe is per byte, so a half-filled
- * tail byte takes nibble 0 rather than keeping what was there. DOT is the one
- * op whose destination is not int4 — it writes one int32 scalar. */
+ * tail byte takes nibble 0 rather than keeping what was there. DOT and ARGMAX
+ * are the ops whose destination is not int4 — each writes one int32 scalar,
+ * ARGMAX's being an index into `count` rather than a value. */
 static inline void tpu_vpu(unsigned op, uint32_t dst_addr, uint32_t src0_addr,
                            uint32_t src1_addr, uint32_t count, uint32_t rq_word)
 {

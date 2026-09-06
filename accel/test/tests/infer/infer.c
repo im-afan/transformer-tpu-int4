@@ -58,6 +58,8 @@ _Static_assert(RQ_N == INFER_RQ_SITES,
 static const uint16_t rq_table[LAYERS][RQ_N] = INFER_RQ_INIT;
 
 #define I4(cols) ((cols) / 2)           /* bytes in a row-major int4 row */
+_Static_assert(I4(VOCAB_PAD) % TPU_WORD_BYTES == 0,
+               "a logits row must start on a scratchpad word for tpu_argmax");
 
 /* The cache is one region per sequence per layer, and each half is stored in
  * the orientation its matmul wants. */
@@ -68,9 +70,8 @@ static const uint16_t rq_table[LAYERS][RQ_N] = INFER_RQ_INIT;
 
 /* ---- scratchpad (64 KB): a fixed mailbox for the CPU, the rest is arena --- */
 #define SP_BYTES    TPU_SPAD_BYTES
-#define SP_MAILBOX  (SP_BYTES - (I4(VOCAB_PAD) + BATCH * T * 4u))
-#define SP_LOGITS   SP_MAILBOX                       /* [VOCAB_PAD] int4 */
-#define SP_TOKENS   (SP_LOGITS + I4(VOCAB_PAD))      /* [BATCH][T] int32 */
+#define SP_MAILBOX  (SP_BYTES - BATCH * T * 4u)
+#define SP_TOKENS   SP_MAILBOX                       /* [BATCH][T] int32 */
 
 #define SP_TOKEN_AT(seq, pos) (SP_TOKENS + ((seq) * T + (pos)) * 4u)
 
@@ -211,15 +212,17 @@ static void embed(unsigned dst_row, unsigned token)
 }
 
 /* Logits for the row of X at `x_row`; returns sequence `seq`'s token at pos+1.
- * They land in DRAM for the host to check against PyTorch and in the mailbox so
- * the CPU can read them. The MXU requantizes on store, so a logit is int4 and
- * ties are common — the head's {m0,n} is what spreads them over the grid. */
+ * They land in DRAM for the host to check against PyTorch, and tpu_argmax
+ * reduces them on the array. The MXU requantizes on store, so a logit is int4
+ * and ties are common — the head's {m0,n} is what spreads them over the grid,
+ * and tpu_argmax breaks a tie toward the lowest id like torch.argmax.
+ *
+ * VOCAB, not VOCAB_PAD: the head's padding columns are zero, so a padded logit
+ * is 0 and would outrank every real one that came out negative. */
 static unsigned head_argmax(unsigned x_row, unsigned seq, unsigned pos)
 {
     const uint32_t dram_logits = DR_LOGITS + (seq * T + pos) * I4(VOCAB_PAD);
-    unsigned best_token = 0;
-    int best_logit;
-    uint32_t packed[I4(VOCAB_PAD) / 4u];
+    unsigned best_token;
 
     INFER_MM(1u, D, VOCAB_PAD,
              .a = tpu_off(X_BUF, x_row * I4(D)),
@@ -227,23 +230,7 @@ static unsigned head_argmax(unsigned x_row, unsigned seq, unsigned pos)
              .c = TPU_ROWS(dram_logits, I4(VOCAB_PAD)),
              .rq_word = INFER_RQ_LOGIT);
 
-    tpu_move_bytes(SP_LOGITS, dram_logits, I4(VOCAB_PAD), TPU_DMA_FILL);
-    tpu_wait(TPU_U_DMA);
-
-    for (unsigned w = 0; w < I4(VOCAB_PAD) / 4u; w++)
-        packed[w] = tpu_spad_ld(SP_LOGITS + w * 4u);
-
-    /* Strictly greater, so a tie takes the lowest id — torch.argmax's rule. */
-    best_logit = -16;
-    for (unsigned token = 0; token < VOCAB; token++) {
-        const unsigned nib = (packed[token / 8u] >> (4u * (token % 8u))) & 0xFu;
-        const int logit = (int)(nib >= 8u ? (int)nib - 16 : (int)nib);
-
-        if (logit > best_logit) {
-            best_logit = logit;
-            best_token = token;
-        }
-    }
+    best_token = tpu_argmax(TPU_AT(dram_logits), VOCAB, &arena);
 
     tpu_spad_st(SP_TOKEN_AT(seq, pos + 1), best_token);
     return best_token;

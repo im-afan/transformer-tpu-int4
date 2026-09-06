@@ -58,6 +58,10 @@
 #define TPU_WGT_PREFETCH 1
 #endif
 
+/* The int4 grid, the same one vpu.sv and model/transformer.py clip to. */
+#define TPU_Q4_MIN (-8)
+#define TPU_Q4_MAX 7
+
 #define TPU_ALIGN_DOWN(v, a) ((v) & ~((uint32_t)(a) - 1u))
 #define TPU_ALIGN_UP(v, a)   TPU_ALIGN_DOWN((v) + (uint32_t)(a) - 1u, (a))
 
@@ -496,6 +500,71 @@ static inline void tpu_requant(tpu_buf dst, tpu_buf src, uint32_t count,
                                uint32_t rq_word, tpu_arena *arena)
 {
     tpu_elementwise(TPU_V_REQUANT, dst, src, src, count, rq_word, arena);
+}
+
+/* ---- argmax -------------------------------------------------------------- */
+
+/* Index of the largest of `count` int4 elements, ties to the lowest — the rule
+ * torch.argmax follows and the one infer.c's head_argmax already implements in
+ * C. `src` must be word-aligned like every other VPU pass, but `count` need
+ * not be even: a reduction writes no nibbles, so the half-byte tail that pins
+ * the elementwise ops does not exist here. The vocabulary is odd.
+ *
+ * VOP_ARGMAX reduces one dispatch's worth of elements and reports an index
+ * within that dispatch, so a vector longer than one chunk is folded by the CPU:
+ * it reads each chunk's index back through the scratchpad window, then reads
+ * the element that index points at to compare chunks against each other. The
+ * window is not synchronized against the queues, hence the barrier before each
+ * load. */
+static inline uint32_t tpu_argmax(tpu_buf src, uint32_t count, tpu_arena *arena)
+{
+    const uint32_t usable = TPU_ALIGN_DOWN(arena->bytes, TPU_WORD_BYTES);
+
+    uint32_t chunk = TPU_ALIGN_DOWN(usable - TPU_WORD_BYTES, TPU_WORD_BYTES) * 2u;
+    uint32_t best_idx = 0;
+    int      best_val = TPU_Q4_MIN - 1;   /* loses to an all-Q4_MIN vector */
+
+    TPU_SHAPE_ASSERT(TPU_WORD_BYTES >= 4,
+                     "the scalar destination is int32: TPU_N must be at least 8");
+    TPU_ASSERT(usable > TPU_WORD_BYTES, "arena too small to stage a chunk and a scalar");
+
+    if (chunk > TPU_VCHUNK_MAX)
+        chunk = TPU_VCHUNK_MAX;
+    TPU_ASSERT(chunk >= TPU_N, "arena too small to stage one chunk");
+
+    const uint32_t src_slot = arena->base;
+    const uint32_t dst_slot = src_slot + chunk / 2u;
+
+    for (uint32_t i = 0; i < count; i += chunk) {
+        uint32_t n = count - i;
+        uint32_t idx, byte, word;
+        unsigned nib;
+        int val;
+
+        if (n > chunk)
+            n = chunk;
+
+        tpu_dma(src_slot, src.addr + i / 2u, n, 1u, 0u, 0u, TPU_DMA_FILL);
+        tpu_wait(TPU_U_DMA);
+
+        tpu_vpu(TPU_V_ARGMAX, dst_slot, src_slot, 0u, n, 0u);
+        tpu_wait(TPU_U_VPU);
+
+        /* The window has no byte strobes, so the element is picked out of the
+         * aligned word holding its nibble. */
+        idx  = tpu_spad_ld(dst_slot);
+        byte = src_slot + idx / 2u;
+        word = tpu_spad_ld(byte & ~3u);
+        nib  = (word >> (8u * (byte & 3u) + 4u * (idx & 1u))) & 0xFu;
+        val  = (int)(nib >= 8u ? (int)nib - 16 : (int)nib);
+
+        if (val > best_val) {       /* strictly: an earlier chunk keeps a tie */
+            best_val = val;
+            best_idx = i + idx;
+        }
+    }
+
+    return best_idx;
 }
 
 /* ---- copy ---------------------------------------------------------------- */

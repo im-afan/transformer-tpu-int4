@@ -5,7 +5,7 @@ SIMD unit for every pointwise / reduction operation that is not a matmul.
 Dispatch arrives from `cmd_vpu.sv`'s 128-bit command queue. The VPU has exactly **one**
 command type (`0x01`); `0x02` (`VPU_GEOM`) is a retired hole.
 
-## Operations — five, and nothing else
+## Operations — six, and nothing else
 
 | `vpu_op` | Name | Kind | Operands | Result |
 | --- | --- | --- | --- | --- |
@@ -14,14 +14,34 @@ command type (`0x01`); `0x02` (`VPU_GEOM`) is a retired hole.
 | 3 | `RELU` | elementwise | `src0`, `rq_word` | `dst[i] = clip[-8,7](rq(max(src0[i], 0)))` |
 | 10 | `REQUANT` | rescale | `src0`, `rq_word` | `dst[i] = clip[-8,7](rq(src0[i]))` |
 | 16 | `DYT` | rescale | `src0`, `rq_word` | `dst[i] = clip[-7,7](rq(src0[i]))` |
+| 18 | `ARGMAX` | reduction | `src0` | scalar `index of max(src0[i])` -> `dst`, int32 |
 
 - The gaps (2, 4–9, 11–15, 17) are **retired codes, not free encoding space**. They are
   left vacant so a stale binary decodes to an unknown op rather than a different one. 17
-  was `QUANT4`; see below.
-- `DOT` is the only reduction; every other op produces a same-length vector.
+  was `QUANT4`; see below. `ARGMAX` is 18 for the same reason — 2 was `SCALAR_MUL`.
+- `DOT` and `ARGMAX` are the reductions; every other op produces a same-length vector.
 - **No shipped kernel issues `DOT`.** It is kept because it *is* the reduction datapath —
   accumulator, lane fold, scalar store — and the only reduction the ISA has. It costs one
   decode arm over hardware that has to be there anyway.
+
+### `ARGMAX`
+
+`dst` gets the int32 **index**, not the value. Ties go to the lowest index, which is
+`torch.argmax`'s rule. `infer.c`'s `head_argmax` is the caller, through
+[`tpu_argmax`](fw.md).
+
+- `rq_word` is ignored: an index has no scale.
+- Each chunk folds to `(value, index)` in a binary tree, `log2(LANES)` comparator levels
+  rather than `LANES` in series. Level 0 pads up to a power of two with `-8` and every tie
+  goes left; the active lanes are a prefix of the chunk, so a padding lane can never
+  outrank a real one.
+- Across chunks it is strictly greater, so the earliest chunk holding the maximum keeps
+  it. The running best value is 5 bits, one wider than an int4, so an all-`-8` vector
+  still answers 0.
+- The MXU requantizes to int4 on store, so the head's logits are already int4 and this is
+  an argmax over exactly what it wrote. That is the caller.
+- **`vlen` may be odd here.** The even-`vlen` rule below is about the packed int4
+  destination; a reduction writes an int32 scalar and no nibbles. The vocabulary is 13.
 
 ### What the model uses
 
@@ -110,8 +130,9 @@ width in bytes.
 
 Two constraints a kernel must respect, both from the byte-granular write strobe:
 
-- **`vpu_vlen` must be even.** Two elements share a byte; a tail that half-fills its byte
-  writes nibble 0 into the other half rather than preserving what was there.
+- **`vpu_vlen` must be even for the elementwise ops.** Two elements share a byte; a tail
+  that half-fills its byte writes nibble 0 into the other half rather than preserving what
+  was there. `DOT` and `ARGMAX` write no nibbles and take any length.
 - **`src0`, `src1` and `dst` must be word-aligned** (multiples of `N/2` bytes).
 
 Signals: `V_re`/`V_raddr`/`V_rdata` (valid the cycle **after** `V_re`),
@@ -125,7 +146,8 @@ Signals: `V_re`/`V_raddr`/`V_rdata` (valid the cycle **after** `V_re`),
 ```
 
 The FSM reads a chunk of each operand, computes all lanes in one cycle, and either writes
-the chunk back or folds it into a running int32 accumulator. A partial final chunk is
+the chunk back or folds it into a running int32 accumulator. `ARGMAX` reads `src0` only,
+so it skips `RD1` like the rescales do. A partial final chunk is
 masked by `V_wstrb` and by a lane-active predicate, so out-of-range lanes never contribute
 to a reduction. `{m0,n}` is latched once at start.
 
@@ -143,7 +165,7 @@ model; the current model is ReLU attention, DyT and a ReLU feed-forward.
 | `SQUARE` (5) | LayerNorm variance | — |
 | `ELEMENT_MUL` (9), `SCALAR_MUL` (2), `SCALAR_ADD` (11) | LayerNorm/softmax broadcasts | — |
 | `SCALAR_DIV` (12) | softmax's `sum(exp)`, LayerNorm variance | the restoring divider and its state |
-| `REDUCEMAX` (7), `REDUCESUM` (8) | softmax/LayerNorm statistics | the **max fold** — `acc` now always opens at zero |
+| `REDUCEMAX` (7), `REDUCESUM` (8) | softmax/LayerNorm statistics | the **max fold** — restored by `ARGMAX` (18), which keeps the index rather than the value |
 | `SOFTMAX` (14), `SM_EXP` (15) | the fused row-wise softmax macro op | its four-pass sequencer and `cfg vscalar` (index 9) |
 | `VECMATMUL` (13) | attention's `QK^T` and `PV`, before `QUANT4` | the pair counter and address steppers, the five geometry inputs (`cfg` 10–14), the `VPU_GEOM` command, and `vpu_mm_busy`. **Not** `DOT` |
 | `QUANT4` (17) | narrowing an int8 activation into the MXU's packed int4 weight layout | the `dst_is4` strobe special case and the last place a nibble stride differed from a byte stride |

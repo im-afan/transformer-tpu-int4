@@ -3,10 +3,8 @@
 ## Overview
 - Moves `rows` rows of `len` int4 elements between DRAM (the board's async SRAM) and the
   scratchpad, with an independent row stride on each side.
-- **It drives the SRAM chip pins itself.** `sram.sv` is not in the core any more; the
-  controller's range interface and its handshake were the layer this rewrite removed.
-- One byte per clock on a fill, one per two clocks on a spill.
-- No transpose mode. The MXU's `transpose` flag and software cover what it did.
+- Drives the Cmod A7 SRAM ports 
+- 1 byte / clock on a fill (DRAM -> spad), 1 byte / 2 clock on a spill (spad -> DRAM).
 
 ## Ports
 - Basic: `clk`, `rst_n`
@@ -22,17 +20,13 @@
 
 ## Geometry
 - A row is `(len + 1) / 2` bytes; `len` is elements, so it should be even.
-- Row *r* is at `dram_base + r*dram_stride` and `spad_base + r*spad_stride`.
-- A zero stride means densely packed rows (`= row bytes`), the same "zero is not set"
-  convention the MXU strides use.
-- `rows = 0` or `len = 0` is an empty transfer: it completes, moves nothing.
+- Row r is at `dram_base + r*dram_stride` and `spad_base + r*spad_stride`.
+- A zero stride means densely packed rows (`= row bytes`).
 
 ## Fill (DRAM -> scratchpad)
 - The address is registered onto the pins; the byte is written into the scratchpad on the
   next clock edge, giving the async part a full clock of access time.
-- **Backpressure is free.** If the scratchpad denies the write, the DMA holds the address:
-  the SRAM keeps driving the same byte and it is written when the grant arrives. That is
-  what the old skid buffer plus `dout_ready` existed to do.
+- If the scratchpad denies the write, the DMA holds the address; it is written when the grant arrives.
 
 ## Spill (scratchpad -> DRAM)
 - The scratchpad read runs one byte ahead of the write beat, so a beat starts every two
@@ -45,16 +39,14 @@
 - A denied scratchpad read stalls the fetch, which stalls the beat. Nothing is lost.
 
 ## The UART host port
-- The DMA is the only owner of the SRAM pins, so the host's `R`/`W` byte accesses go
-  through it. `host_*` carries exactly the signals `uart_interface` already drove at the
-  old controller, so that module is unchanged.
-- Serviced only while no command is running. `uart_interface` NAKs anything arriving while
-  the core is busy, so the two never contend.
+- The DMA is the only driver of the SRAM pins, so the host's `R`/`W` byte accesses go
+  through it.
+- Serviced only while no command is running. `uart_interface` returns NAK if commands arrive while DMA is busy.
 - A host read is one clock; a host write is the same two-clock beat as a spill.
 
 ## Command encoding
 
-`DMA_MOVE` (`0x01`), one 128-bit command, no sticky state at all:
+`DMA_MOVE` (`0x01`):
 
 | bits | field |
 | --- | --- |
@@ -66,15 +58,3 @@
 | `w2[31:16]` | `dma_rows` |
 | `w3[15:0]` | `dma_dram_stride` |
 | `w3[31:16]` | `dma_spad_stride` |
-
-DRAM addressing is 19 bits — the whole 512 KB part, not the low 64 KB.
-
-## Notable changes
-- `sram.sv` left the core. It is still in the tree for `uart_memory.sv` / `uart_bram.sv`
-  (the bring-up board images) and its own testbench.
-- The range interface, the `dout_ready` backpressure path, the fill skid buffer and the
-  one-range-per-row loop are all gone: owning the pins makes holding the beat a matter of
-  not advancing a register.
-- Transpose mode and its three geometry registers (`tcols`, `tsrow`, `tdrow`) are gone.
-- A transfer is 2-D now (`rows` x `len` with two strides) where it used to be a flat byte
-  count, so the row loop a caller used to write is one command.

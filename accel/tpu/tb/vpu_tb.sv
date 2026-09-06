@@ -2,7 +2,8 @@
 // Self-checking testbench for rtl/vpu.sv. Every operand and every elementwise
 // result is packed int4, so the scratchpad model is byte-addressed and the
 // helpers below read and write nibbles. DYT is ADD with the odd clip, so its
-// reference is the same expression. See docs/vpu.md.
+// reference is the same expression. DOT and ARGMAX are the two reductions and
+// write an int32 word instead. See docs/vpu.md.
 //
 //   iverilog -g2012 -o vpu_tb.vvp vpu_tb.sv ../rtl/vpu.sv && vvp vpu_tb.vvp
 
@@ -16,7 +17,7 @@ module vpu_tb;
 
     localparam logic [4:0]
         VOP_DOT = 5'd0, VOP_ADD = 5'd1, VOP_RELU = 5'd3,
-        VOP_REQUANT = 5'd10, VOP_DYT = 5'd16;
+        VOP_REQUANT = 5'd10, VOP_DYT = 5'd16, VOP_ARGMAX = 5'd18;
 
     localparam logic [ADDR_W-1:0] A_ADDR = 16'h1000,
                                   B_ADDR = 16'h2000,
@@ -199,6 +200,61 @@ module vpu_tb;
         $display("  %-18s vlen=%0d", "tail-pack", LANES + 2);
     endtask
 
+    // ---- ARGMAX -------------------------------------------------------------
+    // src0 only: the int32 index of the largest element, ties to the lowest.
+
+    task automatic set_a(input int idx, input int v);
+        tv_a[idx] = v;
+        put4(A_ADDR, idx, v);
+    endtask
+
+    task automatic fill_a(input int n, input int v);
+        for (int i = 0; i < n; i++) set_a(i, v);
+    endtask
+
+    // Poison every element the op must not look at: the rest of the tail byte,
+    // the next two words, and src1.
+    task automatic poison_past(input int vlen);
+        for (int i = vlen; i < vlen + 2*LANES; i++) begin
+            put4(A_ADDR, i, 7);
+            put4(B_ADDR, i, 7);
+        end
+        for (int i = 0; i < vlen; i++) put4(B_ADDR, i, 7);
+    endtask
+
+    task automatic test_argmax(input int vlen, input string tag);
+        int exp, best, got;
+        poison_past(vlen);
+        for (int k = 0; k < 4; k++) mem[D_ADDR + k] = 8'hA5;
+        run_op(VOP_ARGMAX, vlen, 1, 0);
+        best = -9; exp = 0;
+        for (int i = 0; i < vlen; i++)
+            if (tv_a[i] > best) begin best = tv_a[i]; exp = i; end
+        got = get32(D_ADDR);
+        checks++;
+        if (got !== exp) begin
+            errors++;
+            $display("  FAIL %s: got %0d, expected %0d (max=%0d)", tag, got, exp, best);
+        end
+        $display("  %-18s vlen=%0d idx=%0d max=%0d", tag, vlen, exp, best);
+    endtask
+
+    // A flat vector with one peak, to place the maximum in a chosen chunk.
+    task automatic test_argmax_at(input int vlen, input int pos, input int peak,
+                                  input int flat, input string tag);
+        fill_a(vlen, flat);
+        set_a(pos, peak);
+        test_argmax(vlen, tag);
+    endtask
+
+    // Two ops back to back: the second's answer must not inherit the first's
+    // running maximum.
+    task automatic test_argmax_reset();
+        test_argmax_at(40, 37, 7, -8, "ARGMAX-b2b-first");
+        fill_a(40, -8);
+        test_argmax(40, "ARGMAX-b2b-second");
+    endtask
+
     initial begin
         vpu_start = 1'b0; vpu_op = '0;
         vpu_src0 = '0; vpu_src1 = '0; vpu_dst = '0;
@@ -230,6 +286,36 @@ module vpu_tb;
         test_dot(40, "DOT");
         test_dot(24, "DOT-3chunk");
         test_dot(8,  "DOT-exact");
+
+        // The ramp's maximum lands in the first chunk; the flat-plus-peak cases
+        // walk it to the last chunk, the tail, and the tail's last lane.
+        gen_i4(40);          test_argmax(40, "ARGMAX-ramp");
+        gen_i4(LANES);       test_argmax(LANES, "ARGMAX-exact");
+        gen_i4(2);           test_argmax(2, "ARGMAX-pair");
+        test_argmax_at(40, 0,          7, -8, "ARGMAX-first");
+        test_argmax_at(40, 39,         7, -8, "ARGMAX-last");
+        test_argmax_at(40, LANES,      7, -8, "ARGMAX-chunk1");
+        test_argmax_at(42, 41,         7, -8, "ARGMAX-tail-last");
+        test_argmax_at(42, 40,         7, -8, "ARGMAX-tail-first");
+        test_argmax_at(40, 25,        -1, -8, "ARGMAX-all-negative");
+        test_argmax_at(40, 17,         0, -1, "ARGMAX-zero-peak");
+
+        // Ties go to the lowest index, and an all-Q4_MIN vector still answers
+        // 0 rather than letting the fold's padding win.
+        fill_a(40, 3);  test_argmax(40, "ARGMAX-tie");
+        fill_a(40, -8); test_argmax(40, "ARGMAX-all-min");
+        fill_a(6,  -8); test_argmax(6,  "ARGMAX-all-min-tail");
+
+        // A reduction writes no nibbles, so unlike every elementwise op it
+        // takes an odd vlen — which is what the vocabulary is. The poison past
+        // the end includes the other half of the last byte.
+        gen_i4(13);      test_argmax(13, "ARGMAX-odd");
+        test_argmax_at(13, 12, 7, -8, "ARGMAX-odd-last");
+        test_argmax_at(11, 10, 7, -8, "ARGMAX-odd-tail3");
+        test_argmax_at(9,   8, 7, -8, "ARGMAX-odd-tail1");
+        fill_a(13, -8);  test_argmax(13, "ARGMAX-odd-all-min");
+
+        test_argmax_reset();
 
         $display("==== done: %0d checks, %0d errors ====", checks, errors);
         if (errors == 0) $display("VPU: ALL TESTS PASSED");
