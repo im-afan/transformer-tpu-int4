@@ -5,8 +5,27 @@
  * accel/test/export.py generates from the checkpoint. Nothing here is tuned to
  * one model: M is the only difference between the training shape and the
  * generation shape, and infer_block serves both. See accel/tpu/docs/fw.md. */
+/* Three builds, a ladder: base is tpu_matmul_wide with one weight buffer,
+ * +dbuf double-buffers it so the next column block's weights fill under this
+ * one's matmuls, +fused folds each matmul's residual add and activation onto
+ * the block while it is still in the scratchpad. generate.py's --mm picks one;
+ * -DINFER_MM_WIDE=0 is the separate A/B that puts every site on tpu_matmul. */
+#define INFER_MM_BASE  0
+#define INFER_MM_DBUF  1
+#define INFER_MM_FUSED 2
+
+#ifndef INFER_MM_MODE
+#define INFER_MM_MODE INFER_MM_DBUF
+#endif
+
+#if INFER_MM_MODE == INFER_MM_BASE
+#define TPU_WGT_PREFETCH 0
+#endif
+
 #include "tpulib.h"
 #include "infer_config.h"
+
+#define INFER_FUSED (INFER_MM_MODE == INFER_MM_FUSED)
 
 #define PREFILL_PASSES  (PROMPT / BLOCK)
 #define PREFILL_TAIL    (PROMPT % BLOCK)
@@ -89,6 +108,10 @@ static tpu_arena arena;
 #define INFER_MM_WIDE 1
 #endif
 
+_Static_assert(INFER_MM_WIDE || !INFER_FUSED,
+               "the fused build is tpu_matmul_wide's layout; --general has no "
+               "fused primitive to call");
+
 /* Every matmul in this kernel goes through this. tpu_matmul_wide stages one
  * column block of C instead of a whole C row, which spends the arena on
  * row-panel depth, and it double-buffers B so the next column block's weights
@@ -104,6 +127,18 @@ static tpu_arena arena;
             tpu_matmul_wide(&mm, &arena);                                     \
         else                                                                  \
             tpu_matmul(&mm, &arena);                                          \
+    } while (0)
+
+/* The same, with the add and the activation that follow the matmul folded into
+ * its visit to each output block: the intermediate never goes back to DRAM.
+ * Only the fused build calls it, and INFER_FUSED is a constant, so the other
+ * two builds drop it whole. */
+#define INFER_MM_F(rows_, depth_, cols_, ...)                                 \
+    do {                                                                      \
+        const tpu_gemm_fused mm = { .rows = (rows_), .depth = (depth_),       \
+                                    .cols = (cols_), __VA_ARGS__ };           \
+                                                                              \
+        tpu_matmul_wide_fused(&mm, &arena);                                   \
     } while (0)
 
 /* X holds embeddings for positions first_pos..first_pos+rows-1 of each of the
@@ -156,17 +191,33 @@ static inline void infer_block(unsigned rows, unsigned first_pos)
                  * them keeps the shape constant; a runtime column count would
                  * unfold the block loop, which costs more than the extra
                  * tiles. */
-                INFER_MM(rows, HEAD_DIM, T,
-                         .a = tpu_off(Q_BUF, seq_off + head * I4(HEAD_DIM)),
-                         .b = TPU_ROWS(k_cache + head * I4(HEAD_DIM), I4(D)),
-                         .c = S_BUF,
-                         .transpose = 1,
-                         .rq_word = rq[RQ_S]);
+                /* P = relu(S + mask). Fused, the mask block is staged
+                 * beside the score block and both passes run there. */
+                if (INFER_FUSED) {
+                    INFER_MM_F(rows, HEAD_DIM, T,
+                               .a = tpu_off(Q_BUF, seq_off + head * I4(HEAD_DIM)),
+                               .b = TPU_ROWS(k_cache + head * I4(HEAD_DIM), I4(D)),
+                               .c = S_BUF,
+                               .add = TPU_ROWS(DR_MASK + first_pos * I4(T), I4(T)),
+                               .add_op = TPU_V_ADD,
+                               .activation = TPU_V_RELU,
+                               .transpose = 1,
+                               .rq_word = rq[RQ_S],
+                               .rq_add = rq[RQ_ID],
+                               .rq_act = rq[RQ_P]);
+                } else {
+                    INFER_MM(rows, HEAD_DIM, T,
+                             .a = tpu_off(Q_BUF, seq_off + head * I4(HEAD_DIM)),
+                             .b = TPU_ROWS(k_cache + head * I4(HEAD_DIM), I4(D)),
+                             .c = S_BUF,
+                             .transpose = 1,
+                             .rq_word = rq[RQ_S]);
 
-                /* P = relu(S + mask), both passes in place. */
-                tpu_add(S_BUF, S_BUF, TPU_ROWS(DR_MASK + first_pos * I4(T), I4(T)),
-                        rows * T, rq[RQ_ID], &arena);
-                tpu_relu(S_BUF, S_BUF, rows * T, rq[RQ_P], &arena);
+                    tpu_add(S_BUF, S_BUF,
+                            TPU_ROWS(DR_MASK + first_pos * I4(T), I4(T)),
+                            rows * T, rq[RQ_ID], &arena);
+                    tpu_relu(S_BUF, S_BUF, rows * T, rq[RQ_P], &arena);
+                }
 
                 INFER_MM(rows, T, HEAD_DIM,
                          .a = S_BUF,
@@ -176,31 +227,64 @@ static inline void infer_block(unsigned rows, unsigned first_pos)
             }
         }
 
-        INFER_MM(rows_all, D, D,
-                 .a = TMP_A,                    /* A */
-                 .b = TPU_ROWS(layer_wgt + LW_WO, I4(D)),
-                 .c = TMP_B,                    /* O; V_new is dead */
-                 .rq_word = rq[RQ_O]);
-
         /* MultiHeadAttention.forward ends in `O + X` and Transformer.forward
-         * adds X again, so this is 2X + O in two adds. The second is the DyT,
-         * which is the same add with the odd clip. */
-        tpu_add(TMP_A, X_BUF, TMP_B, rows_all * D, rq[RQ_XO], &arena);
-        tpu_dyt(TMP_B, TMP_A, X_BUF, rows_all * D, rq[RQ_X1], &arena);
+         * adds X again, so the residual is 2X + O in two adds. The second is
+         * the DyT, which is the same add with the odd clip — so fused, X is
+         * the add block and the block is read twice, once per pass. */
+        if (INFER_FUSED) {
+            INFER_MM_F(rows_all, D, D,
+                       .a = TMP_A,              /* A */
+                       .b = TPU_ROWS(layer_wgt + LW_WO, I4(D)),
+                       .c = TMP_B,              /* X1; O and X+O never land */
+                       .add = X_BUF,
+                       .add_op = TPU_V_ADD,
+                       .activation = TPU_V_DYT,
+                       .rq_word = rq[RQ_O],
+                       .rq_add = rq[RQ_XO],
+                       .rq_act = rq[RQ_X1]);
 
-        INFER_MM(rows_all, D, DFF,
-                 .a = TMP_B,                    /* X1 */
-                 .b = TPU_ROWS(layer_wgt + LW_FF1, I4(DFF)),
-                 .c = H_BUF,
-                 .rq_word = rq[RQ_H]);
-        tpu_relu(H_BUF, H_BUF, rows_all * DFF, rq[RQ_HR], &arena);
-        INFER_MM(rows_all, DFF, D,
-                 .a = H_BUF,
-                 .b = TPU_ROWS(layer_wgt + LW_FF2, I4(D)),
-                 .c = TMP_A,                    /* F; X+O is dead */
-                 .rq_word = rq[RQ_F]);
+            INFER_MM_F(rows_all, D, DFF,
+                       .a = TMP_B,              /* X1 */
+                       .b = TPU_ROWS(layer_wgt + LW_FF1, I4(DFF)),
+                       .c = H_BUF,
+                       .add_op = TPU_ACT_NONE,
+                       .activation = TPU_V_RELU,
+                       .rq_word = rq[RQ_H],
+                       .rq_act = rq[RQ_HR]);
 
-        tpu_dyt(X_BUF, TMP_B, TMP_A, rows_all * D, rq[RQ_X2], &arena);
+            INFER_MM_F(rows_all, DFF, D,
+                       .a = H_BUF,
+                       .b = TPU_ROWS(layer_wgt + LW_FF2, I4(D)),
+                       .c = X_BUF,              /* X2; F never lands */
+                       .add = TMP_B,            /* X1 */
+                       .add_op = TPU_ACT_NONE,
+                       .activation = TPU_V_DYT,
+                       .rq_word = rq[RQ_F],
+                       .rq_act = rq[RQ_X2]);
+        } else {
+            INFER_MM(rows_all, D, D,
+                     .a = TMP_A,                /* A */
+                     .b = TPU_ROWS(layer_wgt + LW_WO, I4(D)),
+                     .c = TMP_B,                /* O; V_new is dead */
+                     .rq_word = rq[RQ_O]);
+
+            tpu_add(TMP_A, X_BUF, TMP_B, rows_all * D, rq[RQ_XO], &arena);
+            tpu_dyt(TMP_B, TMP_A, X_BUF, rows_all * D, rq[RQ_X1], &arena);
+
+            INFER_MM(rows_all, D, DFF,
+                     .a = TMP_B,                /* X1 */
+                     .b = TPU_ROWS(layer_wgt + LW_FF1, I4(DFF)),
+                     .c = H_BUF,
+                     .rq_word = rq[RQ_H]);
+            tpu_relu(H_BUF, H_BUF, rows_all * DFF, rq[RQ_HR], &arena);
+            INFER_MM(rows_all, DFF, D,
+                     .a = H_BUF,
+                     .b = TPU_ROWS(layer_wgt + LW_FF2, I4(D)),
+                     .c = TMP_A,                /* F; X+O is dead */
+                     .rq_word = rq[RQ_F]);
+
+            tpu_dyt(X_BUF, TMP_B, TMP_A, rows_all * D, rq[RQ_X2], &arena);
+        }
     }
 }
 

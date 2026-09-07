@@ -38,7 +38,7 @@ else points at. Its shape and its whole DRAM map come from a generated `infer_co
   writes an untrained one at `model/saved/int4_d128_f512_l4.pt` so the export, staging and
   RTL paths can run. Any accuracy it scores is chance — `fw/perf_notes.md`'s 0.00% is that.
 - **`numpy` and `torch` are needed for the `infer` test and for `export.py`.** The other
-  eight kernels need only a host C compiler.
+  nine kernels need only a host C compiler.
 
 ## Commands
 
@@ -54,12 +54,14 @@ TPU stack — **one command producer, PicoRV32 firmware built out of `accel/tpu/
 is no assembler and no `.tpu` language. Everything runs through `accel/test`:
 
 ```bash
-python accel/test/run_suite.py                  # 9 kernels on the ISS, ~1 s
+python accel/test/run_suite.py                  # 10 kernels on the ISS, ~1 s
 python accel/test/run_suite.py -b rtl           # ...through the whole core, ~20 s
 python accel/test/run_suite.py -b rtl -k tiled -v
 python accel/test/run_suite.py -b rtl-uart      # ...loaded over the simulated UART, ~6x
 python accel/test/run_suite.py -b board -p COM5
 
+python accel/test/tests/fused/generate.py -b iss --sweep
+python accel/test/tests/infer/generate.py -b iss --synthetic --gen 3 --mm fused
 python accel/test/tests/matmul/generate.py -b rtl -M 32 --ktiles 8 --ntiles 4
 python accel/test/tests/ffn/generate.py -b rtl -T 32 -d 64 -f 256
 python accel/test/tests/infer/generate.py -b iss --synthetic --gen 3 -n 1
@@ -241,6 +243,13 @@ command queues 815, `dma` 493.
   of one, and it double-buffers B, which costs a bank. Transposed-B and
   accumulate both work. `docs/fw.md` has the cases where it is a loss;
   `tests/tiled/`'s `--mm5-general` and `tests/wide/` are the A/Bs.
+- **`tpu_matmul_wide_fused` is that layout with the residual add and the
+  activation folded onto each output block** — matmul, add, activate, spill
+  once, so the intermediate never lands in DRAM. `add` is one tensor shaped
+  like C and is the second operand of both steps, so a `TPU_V_DYT` activation
+  reads it twice and the double residual is one call. Three requant words, one
+  per step. No accumulate. `docs/fused.md` and `tests/fused/` are the doc and
+  the regression.
 - **`infer.c` uses `tpu_matmul_wide` at every site**, `Q@K^T` included.
   `-DINFER_MM_WIDE=0` (`tests/infer/generate.py --general`) is the A/B. On the RTL
   at `d=128/f=512, --gen 3`: **2 890 294 clocks against 3 489 116 (−17.2%)**, with
@@ -308,7 +317,22 @@ training shape and the generation shape**.
   stack growing down from the same RAM — ~1.6 KB of headroom. It is 14 804 at
   `d=64 / f=256`. The wide-everywhere `INFER_MM` is what costs it: `-DINFER_MM_WIDE=0`
   is 12 204 and `-DTPU_WGT_PREFETCH=0` is 11 808. **Check `size` on the .elf before
-  adding a call site.**
+  adding a call site.** The ladder, measured the same way on the synthetic
+  `d=128 / f=512`: base 11 680, dbuf 14 632, **fused 12 824** — fusing is
+  *smaller* than dbuf, because it deletes three `INFER_MM` instantiations and
+  the elementwise chunk loops at four sites.
+- **Three builds, a ladder, on `INFER_MM_MODE`**: `0 base` is `tpu_matmul_wide`
+  with one weight buffer, `1 dbuf` adds the weight double buffer, `2 fused`
+  adds `tpu_matmul_wide_fused` at the four sites that have an add or an
+  activation after them — the scores (+ mask, relu), `A@Wo` (+ X, dyt), `X1@W1`
+  (relu) and `HR@W2` (dyt). `generate.py --mm base|dbuf|fused`, same golden
+  three ways. `dbuf` is the default. O, X+O, F and H's pre-relu value stop
+  existing as DRAM tensors in the fused build. `--general` is a separate A/B
+  and has no fused path. On the RTL, synthetic `d=64/f=256, --gen 3`:
+  **base 1 544 793 clocks, dbuf 1 421 291, fused 1 245 012 (-12.4% on dbuf)**,
+  with `mxu` identical to the clock on all three — the whole difference is DMA,
+  789 400 -> 588 416, which is the intermediates not round-tripping. Fused
+  costs +16.0% commands. `docs/fused.md` has the breakdown.
 - **Its shape and its whole DRAM map come from the generated `infer_config.h`.** There is
   no `DR_ALIGN` chain in the C any more, and `DR_LAYER0` is wherever the activations end
   rather than a hardcoded `0x20000`.
@@ -360,7 +384,7 @@ derivation, `iss.py`, and the RTL.
 ## Long simulations
 
 - **The ISS is where you iterate.** `python accel/test/run_suite.py` is under a second and
-  covers nine kernels; `tests/infer/generate.py -b iss --gen 4 -n 4` is the model. The RTL
+  covers ten kernels; `tests/infer/generate.py -b iss --gen 4 -n 4` is the model. The RTL
   run is what proves the *hardware* agrees.
 - `run_suite.py -b rtl` is the smoke test that dispatch still
   works at all. `spadwin` is the only thing exercising the CPU's scratchpad window.

@@ -131,6 +131,33 @@ typedef struct {
     uint32_t rq_word;
 } tpu_gemm;
 
+/* C = act(requant(A @ B) + add). `add` is a tensor shaped like C and is the
+ * second operand of both fusable steps: the ADD pass runs when `add_op` is
+ * TPU_V_ADD, and a TPU_V_DYT activation reads the same staged block again —
+ * which is what makes the double residual one call. Each step carries its own
+ * requant word, the way the unfused sequence does: `rq_word` is the matmul's
+ * store, `rq_add` the add's, `rq_act` the activation's. `add` is unread when
+ * `add_op` is TPU_ACT_NONE and the activation is not DYT. No accumulate: C is
+ * written, never read. */
+typedef struct {
+    uint32_t rows;
+    uint32_t depth;
+    uint32_t cols;
+    tpu_buf  a;
+    tpu_buf  b;
+    tpu_buf  c;
+    tpu_buf  add;
+    unsigned add_op;
+    unsigned activation;
+    unsigned transpose;
+    uint32_t rq_word;
+    uint32_t rq_add;
+    uint32_t rq_act;
+} tpu_gemm_fused;
+
+/* Not a VPU op — 0 is VOP_DOT. */
+#define TPU_ACT_NONE 0xFFu
+
 #define TPU_CEIL_DIV(a, b) (((a) + (b) - 1u) / (b))
 
 /* How a GEMM primitive lays itself out inside an arena. The two differ only in
@@ -286,23 +313,34 @@ static inline void tpu_matmul(const tpu_gemm *gemm, tpu_arena *arena)
 }
 
 /* Column block `c0` of B — [depth][N] plain, [N][depth] transposed, the same
- * bytes staged either way. */
+ * bytes staged either way. Takes the fields rather than a tpu_gemm so the
+ * fused GEMM shares it. */
+__attribute__((always_inline))
+static inline void tpu_fill_b_block_cols(tpu_buf b, uint32_t cols,
+                                         unsigned transpose, uint32_t slot,
+                                         uint32_t c0, uint32_t b_row,
+                                         uint32_t depth, uint32_t depth_bytes)
+{
+    uint32_t ncols = cols - c0;
+
+    if (ncols > TPU_N)
+        ncols = TPU_N;
+
+    if (transpose)
+        tpu_dma(slot, b.addr + c0 * b_row,
+                depth, ncols, b_row, depth_bytes, TPU_DMA_FILL);
+    else
+        tpu_dma(slot, b.addr + c0 / 2u,
+                ncols, depth, b_row, TPU_WORD_BYTES, TPU_DMA_FILL);
+}
+
 __attribute__((always_inline))
 static inline void tpu_fill_b_block(const tpu_gemm *gemm, uint32_t slot,
                                     uint32_t c0, uint32_t b_row,
                                     uint32_t depth_bytes)
 {
-    uint32_t ncols = gemm->cols - c0;
-
-    if (ncols > TPU_N)
-        ncols = TPU_N;
-
-    if (gemm->transpose)
-        tpu_dma(slot, gemm->b.addr + c0 * b_row,
-                gemm->depth, ncols, b_row, depth_bytes, TPU_DMA_FILL);
-    else
-        tpu_dma(slot, gemm->b.addr + c0 / 2u,
-                ncols, gemm->depth, b_row, TPU_WORD_BYTES, TPU_DMA_FILL);
+    tpu_fill_b_block_cols(gemm->b, gemm->cols, gemm->transpose, slot, c0,
+                          b_row, gemm->depth, depth_bytes);
 }
 
 /* The same GEMM with one column block of C staged instead of a whole C row.
@@ -399,6 +437,153 @@ static inline void tpu_matmul_wide(const tpu_gemm *gemm, tpu_arena *arena)
 
             /* A short last block left the unstaged lanes stale; they sit in C
              * columns past `ncols`, which this spill never reads. */
+            tpu_dma(c_slot, gemm->c.addr + r0 * c_row + c0 / 2u,
+                    ncols, nrows, c_row, TPU_WORD_BYTES, TPU_DMA_SPILL);
+        }
+    }
+
+    tpu_wait(TPU_U_DMA);
+}
+
+/* One VPU pass over a tile already in the scratchpad, chunked at the vlen
+ * field's limit. The pushes are ordered inside the unit's queue, so the caller
+ * fences once at the end rather than per chunk. */
+__attribute__((always_inline))
+static inline void tpu_vpu_tile(unsigned op, uint32_t dst, uint32_t src0,
+                                uint32_t src1, uint32_t count, uint32_t rq_word)
+{
+    for (uint32_t i = 0; i < count; i += TPU_VCHUNK_MAX) {
+        const uint32_t off = i / 2u;
+        uint32_t n = count - i;
+
+        if (n > TPU_VCHUNK_MAX)
+            n = TPU_VCHUNK_MAX;
+
+        tpu_vpu(op, dst + off, src0 + off, src1 + off, n, rq_word);
+    }
+}
+
+/* tpu_matmul_wide with the residual add and the activation folded into the
+ * same visit: an output block is matmulled, added to and activated where it
+ * already sits, and spilled once. The block of `add` takes the place of the
+ * accumulate path's staged C, so the C region holds two output blocks per
+ * panel row instead of one — that is the only layout difference, and B's
+ * prefetch is unchanged.
+ *
+ * Both VPU passes read and write the tile in place, which is safe because the
+ * VPU runs one word at a time: it reads both sources before it writes. */
+__attribute__((always_inline))
+static inline void tpu_matmul_wide_fused(const tpu_gemm_fused *gemm,
+                                         tpu_arena *arena)
+{
+    const uint32_t depth_bytes = gemm->depth / 2u;
+    const uint32_t dense_row   = gemm->cols / 2u;
+
+    const uint32_t a_row   = gemm->a.row_bytes ? gemm->a.row_bytes : depth_bytes;
+    const uint32_t c_row   = gemm->c.row_bytes ? gemm->c.row_bytes : dense_row;
+    const uint32_t add_row = gemm->add.row_bytes ? gemm->add.row_bytes : dense_row;
+    const uint32_t b_row   = gemm->b.row_bytes ? gemm->b.row_bytes
+                           : (gemm->transpose ? depth_bytes : dense_row);
+
+    const uint32_t flags = gemm->transpose ? TPU_MM_T : 0u;
+
+    const unsigned act     = gemm->activation;
+    const unsigned adding  = (gemm->add_op == TPU_V_ADD);
+    const unsigned act_on  = (act != TPU_ACT_NONE);
+    const unsigned staging_add = adding || (act == TPU_V_DYT);
+
+    const tpu_gemm_layout lay = tpu_gemm_fit(arena->base, arena->bytes,
+                                             gemm->depth, 2u * TPU_WORD_BYTES,
+                                             TPU_WGT_PREFETCH);
+    const uint32_t a_slot        = lay.a_slot;
+    const uint32_t b_slot        = lay.b_slot;
+    const uint32_t c_slot        = lay.c_slot;
+    const uint32_t prefetch_half = lay.b_half;
+    uint32_t panel_rows = lay.panel_rows;
+
+    TPU_SHAPE_ASSERT(gemm->depth % TPU_N == 0,
+                     "tpu_matmul_wide_fused: depth is not a whole array word");
+    TPU_SHAPE_ASSERT(gemm->cols % 2u == 0,
+                     "tpu_matmul_wide_fused: an odd column count spills half a byte");
+    TPU_SHAPE_ASSERT(gemm->depth <= 0xFFFFu,
+                     "tpu_matmul_wide_fused: contraction longer than the len field");
+    TPU_SHAPE_ASSERT(arena->base % TPU_BANK_BYTES == 0,
+                     "tpu_matmul_wide_fused: arena base is not bank aligned");
+    TPU_SHAPE_ASSERT(gemm->add_op == TPU_ACT_NONE || gemm->add_op == TPU_V_ADD,
+                     "tpu_matmul_wide_fused: add_op is TPU_V_ADD or TPU_ACT_NONE");
+    TPU_SHAPE_ASSERT(act == TPU_ACT_NONE || act == TPU_V_RELU ||
+                     act == TPU_V_DYT || act == TPU_V_REQUANT,
+                     "tpu_matmul_wide_fused: activation is not an elementwise "
+                     "VPU op — RELU, DYT, REQUANT or TPU_ACT_NONE");
+    TPU_SHAPE_ASSERT(lay.fits,
+                     "tpu_matmul_wide_fused: the arena cannot hold one N-row "
+                     "block of A and B and two of C at this depth — give it "
+                     "more banks or shorten the contraction");
+
+    if (panel_rows > gemm->rows)
+        panel_rows = gemm->rows;
+
+    /* The second half of the C region, one output block wide per panel row —
+     * rounded out to whole N-row blocks, because a panel shorter than one is
+     * still a whole block of matmul stores. */
+    const uint32_t add_slot = c_slot
+                            + TPU_ALIGN_UP(panel_rows, TPU_N) * TPU_WORD_BYTES;
+
+    tpu_mxu_geom(depth_bytes, gemm->transpose ? depth_bytes : TPU_WORD_BYTES,
+                 TPU_WORD_BYTES, gemm->depth);
+
+    for (uint32_t r0 = 0; r0 < gemm->rows; r0 += panel_rows) {
+        uint32_t nrows = gemm->rows - r0;
+
+        if (nrows > panel_rows)
+            nrows = panel_rows;
+
+        tpu_dma(a_slot, gemm->a.addr + r0 * a_row,
+                gemm->depth, nrows, a_row, depth_bytes, TPU_DMA_FILL);
+
+        if (prefetch_half)
+            tpu_fill_b_block_cols(gemm->b, gemm->cols, gemm->transpose,
+                                  b_slot, 0u, b_row, gemm->depth, depth_bytes);
+
+        for (uint32_t c0 = 0; c0 < gemm->cols; c0 += TPU_N) {
+            const uint32_t parity = (c0 / TPU_N) & 1u;
+            const uint32_t b_cur  = b_slot + parity * prefetch_half;
+            const uint32_t b_next = b_slot + (parity ^ 1u) * prefetch_half;
+            const uint32_t tile   = nrows * TPU_N;
+            uint32_t ncols = gemm->cols - c0;
+
+            if (ncols > TPU_N)
+                ncols = TPU_N;
+
+            if (staging_add)
+                tpu_dma(add_slot, gemm->add.addr + r0 * add_row + c0 / 2u,
+                        ncols, nrows, add_row, TPU_WORD_BYTES, TPU_DMA_FILL);
+            if (!prefetch_half)
+                tpu_fill_b_block_cols(gemm->b, gemm->cols, gemm->transpose,
+                                      b_cur, c0, b_row, gemm->depth, depth_bytes);
+            tpu_wait(TPU_U_DMA);        /* also retires the previous spill */
+
+            if (prefetch_half && c0 + TPU_N < gemm->cols)
+                tpu_fill_b_block_cols(gemm->b, gemm->cols, gemm->transpose,
+                                      b_next, c0 + TPU_N, b_row,
+                                      gemm->depth, depth_bytes);
+
+            for (uint32_t sub = 0; sub < nrows; sub += TPU_N)
+                tpu_mxu_mm(c_slot + sub * TPU_WORD_BYTES,
+                           a_slot + sub * depth_bytes, b_cur, flags,
+                           gemm->rq_word);
+            tpu_wait(TPU_U_MXU);
+
+            /* A short last block leaves the lanes past `ncols` stale in both
+             * tiles; they stay in C columns the spill never reads. */
+            if (adding)
+                tpu_vpu_tile(TPU_V_ADD, c_slot, c_slot, add_slot, tile,
+                             gemm->rq_add);
+            if (act_on)
+                tpu_vpu_tile(act, c_slot, c_slot, add_slot, tile, gemm->rq_act);
+            if (adding || act_on)
+                tpu_wait(TPU_U_VPU);
+
             tpu_dma(c_slot, gemm->c.addr + r0 * c_row + c0 / 2u,
                     ncols, nrows, c_row, TPU_WORD_BYTES, TPU_DMA_SPILL);
         }

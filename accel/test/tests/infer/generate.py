@@ -19,6 +19,10 @@ cache, and a reference that kept one would agree with a broken kernel.
     python accel/test/tests/infer/generate.py -b rtl --synthetic --gen 3 --bench
     python accel/test/tests/infer/generate.py -b rtl --synthetic --gen 3 --phase split
 
+--mm picks which of the three builds runs: `base` is tpu_matmul_wide with one
+weight buffer, `dbuf` adds the double buffer, `fused` also folds each matmul's
+residual add and activation onto the output block. Same golden three ways.
+
 --bench is timing only: no weights are staged into DRAM and no output is
 checked, so the run is just the kernel and its perf counters.
 
@@ -54,6 +58,9 @@ BUILD = os.path.join(TESTROOT, "build", "infer")
 
 # The synthetic requant table: one shift per site, chosen so no tensor collapses
 # to all-zero or saturates flat. Layer-independent, unlike a derived one.
+# infer.c's ladder, in the order the rungs were added.
+MM_MODES = {"base": 0, "dbuf": 1, "fused": 2}
+
 SYNTHETIC_RQ = {"Q": (1, 6), "K": (1, 6), "V": (1, 6), "S": (1, 4),
                 "ID": (1, 0), "P": (1, 0), "A": (1, 6), "O": (1, 6),
                 "XO": (1, 0), "X1": (1, 1), "H": (1, 6), "HR": (1, 0),
@@ -133,9 +140,11 @@ class Reference:
 # =============================================================================
 class InferVectors(VectorGenerator):
     def __init__(self, shape: Shape, problems: int, model_path: str | None = None,
-                 seed: int = 0, wide: bool = True, bench: bool = False):
+                 seed: int = 0, wide: bool = True, bench: bool = False,
+                 mm: str = "dbuf"):
         self.s = shape
         self.wide = wide
+        self.mm = mm
         self.bench = bench
         # How many generated tokens the golden covers. A decode-only image
         # starts from the prompt's last token instead of the one the prefill
@@ -210,9 +219,11 @@ class InferVectors(VectorGenerator):
     # ---- the images ---------------------------------------------------------
     @property
     def defines(self) -> dict:
-        # Everything else is in the config header. INFER_MM_WIDE is not a shape:
-        # it is which matmul primitive every site uses, and 0 is the A/B.
-        return {} if self.wide else {"INFER_MM_WIDE": 0}
+        # Everything else is in the config header. Neither of these is a shape:
+        # INFER_MM_MODE is the build's rung of the ladder, INFER_MM_WIDE is
+        # which matmul primitive every site uses and 0 is the A/B.
+        d = {"INFER_MM_MODE": MM_MODES[self.mm]}
+        return d if self.wide else {**d, "INFER_MM_WIDE": 0}
 
     def static(self) -> dict:
         """In --bench nothing is staged at all: no weights, no embeddings, no
@@ -297,8 +308,9 @@ class InferVectors(VectorGenerator):
 
 # =============================================================================
 def program(backend, shape: Shape, problems: int, model_path: str | None = None,
-            seed: int = 0, wide: bool = True, bench: bool = False):
-    gen = InferVectors(shape, problems, model_path, seed, wide, bench)
+            seed: int = 0, wide: bool = True, bench: bool = False,
+            mm: str = "dbuf"):
+    gen = InferVectors(shape, problems, model_path, seed, wide, bench, mm)
     return TPUProgram(os.path.join(HERE, "infer.c"), backend, gen,
                       include_dirs=[BUILD])
 
@@ -355,7 +367,7 @@ def run_phase(args, backend, phase: str) -> TPUProgram:
     shape = shape_for(args, phase)
     problems = args.cases if args.cases else (1 if args.bench else 4)
     prog = program(backend, shape, problems, args.model_path, args.seed,
-                   not args.general, args.bench)
+                   not args.general, args.bench, args.mm)
     prog.name = "infer" if phase == "both" else f"infer {phase}-only"
     prog.run_program()
     if prog.generator.checks_output:
@@ -423,6 +435,12 @@ def main() -> int:
     ap.add_argument("--bench", action="store_true",
                     help="timing only: stage no weights and check no output, "
                          "just run and read the perf counters")
+    ap.add_argument("--mm", choices=tuple(MM_MODES), default="dbuf",
+                    help="which rung of the matmul ladder the image is built "
+                         "on: base is tpu_matmul_wide with one weight buffer, "
+                         "dbuf double-buffers it (the default), fused also "
+                         "folds each matmul's add and activation onto the "
+                         "block. Same golden three ways")
     ap.add_argument("--general", action="store_true",
                     help="every matmul through tpu_matmul instead of "
                          "tpu_matmul_wide — the A/B")
@@ -434,7 +452,7 @@ def main() -> int:
     args = ap.parse_args()
 
     if not args.synthetic and not args.model_path:
-        args.model_path = "model/saved/int4_d128_f512_l4.pt"
+        args.model_path = "model/saved/d128_l4_64digits_trained.pt"
 
 
     gen_n = args.gen if args.gen is not None else args.tokens - args.prompt

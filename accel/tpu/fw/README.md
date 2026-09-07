@@ -21,6 +21,7 @@ Basic functions that dispatch to MMIO; each function can be mapped to a single M
 - tpu_buf: a tensor in DRAM
 - tpu_arena: a memory "arena", denoting how much total scratchpad memory a primitive can use. 
 - tpu_gemm: config struct for gemm; (rows x depth) * (depth x cols); a, b, c buffers; transpose/acc flag, requant word {M0, N} in a single int32
+- tpu_gemm_fused: config struct for the fused matmul + add + activation; same as tpu_gemm plus the `add` tensor, an `add_op` (TPU_V_ADD or TPU_ACT_NONE), an `activation` (TPU_V_RELU / TPU_V_DYT / TPU_V_REQUANT / TPU_ACT_NONE) and a requant word per step (rq_word for the matmul, rq_add for the add, rq_act for the activation). No accumulate flag.
 - tpu_gemm_layout: scratchpad layout for gemm, auto-fitted based on matrix sizes for optimal (minimum) memory transfers in a single matmul. 
     - a, b, c addr, b_half when b is double-buffered
 ### functions
@@ -28,6 +29,13 @@ Basic functions that dispatch to MMIO; each function can be mapped to a single M
 - tpu_matmul: fully general matmul, including when tiling across the k (contraction) dimension is needed. Does not use layout autofitting.
 - tpu_matmul_wide: matmul using layout autofitting. 
     - double-buffers inner loop to overlap mxu with dma.
+- tpu_matmul_wide_fused: C = act(A @ B + add), same flow and same autofitting as tpu_matmul_wide.
+    - stages the matching block of `add` where the accumulate path would have staged C, so a panel row costs two output blocks of the C region instead of one.
+    - each output block is matmulled, added to and activated in place in the scratchpad, then spilled once; the intermediate never goes back to DRAM.
+    - `add` is the second operand of both steps: the add pass uses it, and a TPU_V_DYT activation reads it again, which is what makes the double residual one call.
+    - every step requants, same as the unfused sequence in infer.c.
+    - see ../docs/fused.md.
+- tpu_vpu_tile: one VPU pass over a tile already in the scratchpad, chunked at the vlen field's limit; does not fence.
 - tpu_elementwise: elementwise ops, loads chunks into scratchpad arena, does ops, loads back to DMA, repeat
 - tpu_copy: copy from one address in DRAM to another by copying to scratchpad and copying back
 
