@@ -2,17 +2,17 @@
 
 ## Introduction
 
-This was a summer project I made to learn the basics of ML systems. This article will be split into different parts, so feel free to scroll through! The goal of this project is to derive some of the common results you'll find in ML (limited to a single device for now), and to get a feel for the math behind model scaling. I'm assuming you have basic knowledge on how transformer inference works (prefill, decode), but not the hardware side of things.
+This was a summer project I made to learn the basics of ML systems. The overall goal of this project is to run a small transformer on my Cmod A7 FPGA board. Then, I want to derive some of the common results you'll find in ML (limited to a single device for now), and to get a feel for some of math behind model scaling and kernel optimization. I'm assuming you have basic knowledge on how transformer inference works (prefill, decode), but not the hardware side of things.
 
 ## Background
 
 ### What determines how fast our model is?
 
-Before we get into hardware, we need to ask a seemingly obvious question: what makes a model/algorithm faster? In ML, this problem can be analyzed in 2 domains: compute and communications. Compute is how many raw operations we can do in some amount of time. For example, FLOP/s (floating point operations / sec) is a common metric for the compute capabilities of GPUs or other ML accelerators. So the total compute time of an algorithm can be calculated using $T_compute = # FLOPs / accelerator FLOPs/s$. 
+Before we get into hardware, we need to ask a seemingly obvious question: what makes a model/algorithm faster? In ML, this problem can be analyzed in 2 domains: compute and communications. Compute is how many raw operations we can do in some amount of time. For example, FLOP/s (floating point operations / sec) is a common metric for the compute capabilities of GPUs or other ML accelerators. So the total compute time of an algorithm can be calculated using $T_{\text{compute}} = \frac{\text{# FLOPs}}{\text{accelerator FLOPs/s}}$. 
 
-On the other hand, we have communication. In single-device inference, this usually refers to the comms between the memory (HBM, DDR) and the accelerator's cache. In distributed inference, the comms between devices must also be considered. Similarly, if we know the memory bandwidth of our HBM or DDR, we can calculate our comms time as $T_comms = Communication Bytes / Memory Bytes/sec$
+On the other hand, we have communication. In single-device inference, this usually refers to the comms between the memory (HBM, DDR) and the accelerator's cache. In distributed inference, the comms between devices must also be considered. Similarly, if we know the memory bandwidth of our HBM or DDR, we can calculate our comms time as $T_{\text{comms}} = \frac{\text{Communication Bytes}}{\text{Memory Bytes/sec}}$
 
-In most hardware, we assume that comms and compute run at the same time, so optimally, they are completely overlapped. So, our lower bound on the runtime of an algorithm is $max(T_comms, T_compute)$. 
+In most hardware, we assume that comms and compute run at the same time, so optimally, they are completely overlapped. So, our lower bound on the runtime of an algorithm is $\max(T_{\text{comms}}, T_{\text{compute}})$. 
 
 ### Matmuls
 
@@ -64,4 +64,101 @@ CPU issue overhead was also a concern when designing the architecture. When the 
 
 ## Firmware & Kernels
 
-### 
+We now need to program the PicoRV32 core to perform inference. First, we define our programming scheme: 
+- Since our external SRAM (512 KB) is much larger than our scratchpad (64 KB), we want to only use the scratchpad to handle the individual operands of a primtive. Every operation should read and write back to external memory.
+- We will define many primitives such as matmul, tensor addition, ReLU, and then compose them together using RISCV's loop & branching capabilities to implement inference.
+
+We start by implementing the basic instruction dispatch to the TPU. After that, we implement primitives, namely matmul and elementwise functions. 
+
+### Optimizing A Matmul
+
+We are lucky enough to have a relatively big scratchpad (64 KB) compared to our external SRAM (512 KB), which is a 1:8 ratio. With d=128, d_ff=512, and T=32 during prefill, our largest matmul, in the FFN, requires about $(128 * 512 + 2 * 32 * 128) / 2 = 36,864$ bytes (36 KB), which can fit entirely in our scratchpad! This means that we can basically always achieve the theoretical $NM + MK + NK$ byte loads for a matmul, since we don't need to load the same chunk of a matrix twice when tiling. 
+
+We implement matmul as a tiled matmul over $8\times 8$ tiles in the output matrix. Here's the pseudocode for this kernel: 
+
+```
+inputs (in external memory): A[M, K], B[K, N]
+output (in external memory): C[M, N]
+allocate A_tile[8*S, K], B_tile[K, 8], C_tile[8, 8] in scratchpad, in different regions.
+(Fit S such that it is maximized without overflowing the scratchpad.)
+
+for i from 0 to M, with step 8*S:
+    copy A[i:i+8*S][:] from external memory to A_tile
+    for j from 0 to N, with step 8:
+        copy B[:][j:j+8] from external memory to B_tile
+        wait for all DMA to finish
+        for k from 0 to 8*S, with step 8:
+            tpu_matmul A_tile * B_tile -> C_tile
+            wait for mxu to finish
+            copy C_tile from scratchpad to C[i:i+8][j:j+8]
+```
+
+And if we instead want $C = AB^T$, we instead load `B[j:j+8][:]` to B_tile, and dispatch a transpose flag when calling the mxu.
+
+This algorithm uses less scratchpad memory than the upper bound we just calculated, and it also supports matmuls that don't fully fit in the scratchpad by autofitting the S variable. However, that would cause inefficiency due to having to load each element of B more than once.
+
+But this still isn't optimal! Remember that, optimally, our runtime is the max of the MXU and DMA time. We need a way to overlap our DMA accesses with the MXU decently. To do this, we instead allocate 2 regions for `B_tile` in scratchpad, allowing us to double-buffer our DMA loads. So as our MXU is active in the `k` loop, we are loading the next chunk of B simultaneously, to the inactive B buffer. We will discuss the results of each optimization we do in detail later.
+
+### Optimizing Full Inference
+
+Aside from out matmul, we also implement elementwise operations. This is pretty simple; just copy the tensor(s) to scratchpad, dispatch the VPU on the addresses, and write back to DRAM. If the tensor doesn't fit entirely, load chunks of it into scratchpad and do it multiple times. 
+
+We are now ready to implement a full inference kernel! Using our model architecture, a full prefill, for a single layer, looks like this: 
+
+```
+parameters:
+embedding dim d, # heads (heads), head dim h = d/heads
+
+inputs (in external memory): 
+attention weights W_Q/K/V[d, d], FFN weights W_1[d, 4d], W_2[4d, d].
+token embeddings X[T, d].
+
+outputs (in external memory): 
+KV cache [T, 2d].
+modified token embeddings Y[T, d]
+
+Q[T, d] = tpu_matmul(X, W_Q)
+K[T, d]  = tpu_matmul(K, W_K)
+V[T, d] = tpu_matmul(V, W_V)
+copy K and V to KV cache
+O[T, d] = empty vector
+for h from 0 to heads-1:
+    S[T][T] = tpu_matmul.transposed(Q[:][h * d_h +: d_h], K[h * d_h +: d_h][:])
+    S = S + mask
+    S = relu(S)
+    P[T][d_h] = S @ V[h * d_h +: d_h]
+    copy P to O[:][h * d_h +: d_h]
+O = tpu_matmul(O, W_O)
+O = O + X
+O = hardtanh(O, X)
+
+A[T, 4d] = tpu_matmul(O, W_1)
+A = relu(A)
+Y[T, d] = tpu_matmul(A, W_2)
+Y = Y + X
+Y = hardtanh(Y, X)
+```
+
+Now, let's run a full prefill, with and without double-buffering: 
+
+```
+base:
+run                                     4500744 clocks  375.062 ms @ 12 MHz
+MXU busy                                1097010   24.4%
+of which weight load                        0    0.0%
+VPU busy                                 242248    5.4%
+DMA busy                                2576920   57.3%
+no unit busy (issue overhead)            584566   13.0%
+producer stalled on a full queue              0    0.0%
+two or more units busy                        0    0.0%
+
+double-buffered: 
+run                                     3822442 clocks  318.537 ms @ 12 MHz
+MXU busy                                1097010   28.7%
+of which weight load                        0    0.0%
+VPU busy                                 242248    6.3%
+DMA busy                                2576920   67.4%
+no unit busy (issue overhead)            640577   16.8%
+producer stalled on a full queue              0    0.0%
+two or more units busy                   734313   19.2%
+```

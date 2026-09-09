@@ -144,6 +144,11 @@ _Static_assert(INFER_MM_WIDE || !INFER_FUSED,
 /* X holds embeddings for positions first_pos..first_pos+rows-1 of each of the
  * BATCH sequences, sequence-major; on return, the residual stream after all
  * four layers. `rows` is per sequence. See docs/fw.md. */
+static inline void prefill(unsigned tokens) {
+    
+}
+
+
 __attribute__((always_inline))
 static inline void infer_block(unsigned rows, unsigned first_pos)
 {
