@@ -11,6 +11,11 @@ image holds.
 and runs with TPU_MM_ACC, so C = clip4(requant(A @ B) + C_old). Both are paths
 tpu_matmul_wide did not used to have.
 
+`--benchmark` writes no tensor data and checks nothing — the image is only
+the firmware, the run is only the run, and all that comes back is the perf
+counters. The clocks do not depend on the data, so it is the same measurement
+without the load and read-back on the wire.
+
 `--single-buffer` compiles the prefetch out (`TPU_WGT_PREFETCH=0`) and
 `--arena-banks 3` leaves no room for the second half, so it single-buffers on
 its own — the same problem and the same golden three ways.
@@ -19,6 +24,7 @@ its own — the same problem and the same golden three ways.
     python accel/test/tests/wide/generate.py -b iss --transpose --acc
     python accel/test/tests/wide/generate.py -b rtl --single-buffer
     python accel/test/tests/wide/generate.py -b rtl -M 64 -K 128 -N 100
+    python accel/test/tests/wide/generate.py -b board -p COM5 --benchmark
 """
 from __future__ import annotations
 
@@ -51,7 +57,8 @@ def clip4(v: int) -> int:
 class WideVectors(VectorGenerator):
     def __init__(self, rows: int = 20, depth: int = 512, cols: int = 52,
                  transpose: bool = False, acc: bool = False,
-                 arena_banks: int = 4, prefetch: bool = True):
+                 arena_banks: int = 4, prefetch: bool = True,
+                 benchmark: bool = False):
         if depth % TPU_N:
             raise SystemExit(f"K = {depth} must be a multiple of {TPU_N} — the "
                              f"contraction is taken in one dispatch")
@@ -61,6 +68,7 @@ class WideVectors(VectorGenerator):
         self.rows, self.k, self.n = rows, depth, cols
         self.transpose, self.acc = transpose, acc
         self.arena_banks, self.prefetch = arena_banks, prefetch
+        self.benchmark = benchmark
 
         self.map = AddressMap(align=64, limit=DRAM_BYTES, what="wide")
         self.map.alloc("DR_A", rows * i4_row(self.k))
@@ -70,8 +78,11 @@ class WideVectors(VectorGenerator):
 
         # The same product either way: --transpose swaps B's storage, not the
         # index function, which is what the kernel's TPU_MM_T says.
+        # --benchmark has no golden to fit, so one row stands in for the shape:
+        # the requant word does not change what the run costs.
+        rq_rows = 1 if benchmark else rows
         self.acc32 = [[sum(a_val(i, t) * w_val(t, j) for t in range(self.k))
-                       for j in range(self.n)] for i in range(rows)]
+                       for j in range(self.n)] for i in range(rq_rows)]
         self.rq_c = fit_rq((v for row in self.acc32 for v in row), "RQ_C")
 
         self.defines = {"M": rows, "K": self.k, "N": self.n,
@@ -94,7 +105,14 @@ class WideVectors(VectorGenerator):
                 + (self.rows * i4_row(self.n) if self.acc else 0))
         return fill + 2 * self.rows * i4_row(self.n)
 
+    def writable_ranges(self) -> list:
+        """--benchmark checks nothing, so every byte the kernel touches is
+        scratch as far as the stray-write check is concerned."""
+        return [(0, self.map.next)] if self.benchmark else []
+
     def static(self) -> dict:
+        if self.benchmark:
+            return {}
         img: dict = {}
         put_rowmajor_i4(img, self.map["DR_A"], self.rows, self.k, a_val)
         if self.transpose:
@@ -109,6 +127,10 @@ class WideVectors(VectorGenerator):
         return img
 
     def cases(self):
+        if self.benchmark:
+            yield Case(name=f"{self.rows}x{self.k} @ {self.k}x{self.n}, "
+                            f"wide, timing only")
+            return
         golden: dict = {}
         put_rowmajor_i4(golden, self.map["DR_C"], self.rows, self.n,
                         self.result)
@@ -142,6 +164,9 @@ def main() -> int:
                     help="scratchpad banks tpulib.h may spend: one each for A "
                          "and C and two for B is what the prefetch costs, and "
                          "3 single-buffers on its own")
+    ap.add_argument("--benchmark", action="store_true",
+                    help="write no tensor data and check no result — load the "
+                         "firmware, run it, read the perf counters back")
     ap.add_argument("--single-buffer", action="store_true",
                     help="build with TPU_WGT_PREFETCH=0 — the A/B, same golden")
     args = ap.parse_args()
@@ -149,7 +174,8 @@ def main() -> int:
     gen = WideVectors(rows=args.rows, depth=args.depth, cols=args.cols,
                       transpose=args.transpose, acc=args.acc,
                       arena_banks=args.arena_banks,
-                      prefetch=not args.single_buffer)
+                      prefetch=not args.single_buffer,
+                      benchmark=args.benchmark)
     # The tb clock is 10 ns and a DMA byte is a clock (two on a spill), so a
     # shape past the default needs a watchdog that follows it.
     watchdog = max(2_000_000, 400 * gen.dma_clocks())

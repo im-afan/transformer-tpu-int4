@@ -35,18 +35,17 @@ accel/
 Python is a package rooted at the repo, so run from the repo root with `-m`:
 
 ```bash
-python -m model.train --arch int4_wide
-python -m model.tests.test_inference --arch int4_wide
-python -m model.make_dummy_checkpoint          # untrained .pt, for plumbing only
+python -m model.train --arch int4_wide # train an int4_wide model (d=128, d_ff=512, 4 layers)
+python -m model.tests.test_inference --arch int4_wide # test one inference on a generated digit sequence
 ```
 
-TPU stack (also from the repo root):
+TPU kernels:
 
 ```bash
-python accel/test/run_suite.py                 # every kernel, on the ISS
-python accel/test/run_suite.py -b rtl          # ...through the whole core in Icarus
-python accel/test/tests/infer/generate.py -b iss -n 16     # the model, on the ISS
-python accel/test/tests/infer/generate.py -b board -p COM5 # ...on the board
+python accel/test/run_suite.py                 # test every kernel, on the ISS, and compare it to the numpy model
+python accel/test/run_suite.py -b rtl          # every kernel but in iverilog
+python accel/test/tests/infer/generate.py -b iss -n 16     # inference on the ISS
+python accel/test/tests/infer/generate.py -b board -p COM5 # inference on the board
 ```
 
 `-b rtl` and `-b board` require a baremetal risc-v toolchain; `-b rtl` also needs Icarus.

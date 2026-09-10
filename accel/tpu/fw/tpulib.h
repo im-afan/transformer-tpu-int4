@@ -39,6 +39,36 @@
         TPU_ASSERT(cond, msg);                                                \
     } while (0)
 
+/* Warn when the arena cannot hold every row of A at once, which makes the row
+ * panel loop run more than once and every panel stream the whole of B out of
+ * DRAM again. Legal, so it is a warning and not an assert; 0 turns it off.
+ *
+ * The warning attribute fires on a call that survives optimization, so the
+ * callee has to exist — an arena that already reloads B pays one call to an
+ * empty function per matmul, which is the point at which you either widen the
+ * arena or silence this. */
+#ifndef TPU_WARN_B_RELOAD
+#define TPU_WARN_B_RELOAD 1
+#endif
+
+#if TPU_WARN_B_RELOAD
+__attribute__((noinline, unused, warning(
+    "A does not fit in the arena, so the row panel loop runs more than once "
+    "and the whole of B is streamed from DRAM once per panel — give the arena "
+    "more banks, pass fewer rows per call, or build with TPU_WARN_B_RELOAD=0")))
+static void tpu_warn_b_reload(void) { __asm__ volatile (""); }
+
+#define TPU_WARN_ONE_B_PASS(lay, gemm)                                        \
+    do {                                                                      \
+        const unsigned one_pass_ = (gemm)->cols <= TPU_N                      \
+                                || (lay).panel_rows >= (gemm)->rows;          \
+        if (__builtin_constant_p(one_pass_) && !one_pass_)                    \
+            tpu_warn_b_reload();                                              \
+    } while (0)
+#else
+#define TPU_WARN_ONE_B_PASS(lay, gemm) ((void)0)
+#endif
+
 /* ---- the machine (tpu_top.sv's parameters) ------------------------------- */
 
 #ifndef TPU_ADDR_W
@@ -391,6 +421,7 @@ static inline void tpu_matmul_wide(const tpu_gemm *gemm, tpu_arena *arena)
                      "tpu_matmul_wide: the arena cannot hold one N-row block of "
                      "each of A, B and C at this depth — give it more banks or "
                      "shorten the contraction");
+    TPU_WARN_ONE_B_PASS(lay, gemm);
 
     if (panel_rows > gemm->rows)
         panel_rows = gemm->rows;
@@ -519,6 +550,7 @@ static inline void tpu_matmul_wide_fused(const tpu_gemm_fused *gemm,
                      "tpu_matmul_wide_fused: the arena cannot hold one N-row "
                      "block of A and B and two of C at this depth — give it "
                      "more banks or shorten the contraction");
+    TPU_WARN_ONE_B_PASS(lay, gemm);
 
     if (panel_rows > gemm->rows)
         panel_rows = gemm->rows;

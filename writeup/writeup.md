@@ -31,7 +31,7 @@ For benchmarking, we use a standard Transformer architecture, with embedding dim
 
 ### Overview
 
-In a transformer, we have 2 types of operations: matmuls, and elementwise ops like tensor addition and ReLU. The purpose of an accelerator is to load tensors from memory, do those operations, and write back the results.
+In a transformer, we have 2 types of operations: matmuls, and elementwise ops like tensor addition and ReLU. The purpose of an accelerator is to load tensors from memory, do those operations, and write back the results. To make the most of our FPGA resources and memory, we choose to quantize activations and weights to int4. 
 
 The memory heirarchy of our TPU is simple. We are using a Cmod A7 board, which includes an Artix-7 FPGA chip along with an external asynchronous SRAM chip (8 bit read, 8 ns access time). We use the SRAM chip to model our accelerator's external memory (HBM/DDR in a real accelerator), and the Artix-7's BRAM to act as an on-chip cache (scratchpad memory). 
 
@@ -106,59 +106,60 @@ Aside from out matmul, we also implement elementwise operations. This is pretty 
 We are now ready to implement a full inference kernel! Using our model architecture, a full prefill, for a single layer, looks like this: 
 
 ```
-parameters:
-embedding dim d, # heads (heads), head dim h = d/heads
+model params: embedding dim d, # heads (heads), head dim h = d/heads
 
-inputs (in external memory): 
+inputs (in external memory, repeated for each layer): 
 attention weights W_Q/K/V[d, d], FFN weights W_1[d, 4d], W_2[4d, d].
 token embeddings X[T, d].
 
-outputs (in external memory): 
+outputs (in external memory, repeated for each layer): 
 KV cache [T, 2d].
-modified token embeddings Y[T, d]
 
-Q[T, d] = tpu_matmul(X, W_Q)
-K[T, d]  = tpu_matmul(K, W_K)
-V[T, d] = tpu_matmul(V, W_V)
-copy K and V to KV cache
-O[T, d] = empty vector
-for h from 0 to heads-1:
-    S[T][T] = tpu_matmul.transposed(Q[:][h * d_h +: d_h], K[h * d_h +: d_h][:])
-    S = S + mask
-    S = relu(S)
-    P[T][d_h] = S @ V[h * d_h +: d_h]
-    copy P to O[:][h * d_h +: d_h]
-O = tpu_matmul(O, W_O)
-O = O + X
-O = hardtanh(O, X)
+for each layer: 
+    Q[T, d] = tpu_matmul(X, W_Q)
+    K[T, d]  = tpu_matmul(X, W_K) // directly at respective KV cache address
+    V[T, d] = tpu_matmul(X, W_V)
+    O[T, d] = empty vector
+    for h from 0 to heads-1:
+        S[T, T] = tpu_matmul.transposed(Q[:][h * d_h +: d_h], K[h * d_h +: d_h][:])
+        S = S + mask
+        S = relu(S)
+        O[:][h * d_h +: d_h] = S @ V[:][h * d_h +: d_h]
+    O = tpu_matmul(O, W_O)
+    O = O + X
+    O = hardtanh(O)
 
-A[T, 4d] = tpu_matmul(O, W_1)
-A = relu(A)
-Y[T, d] = tpu_matmul(A, W_2)
-Y = Y + X
-Y = hardtanh(Y, X)
+    A[T, 4d] = tpu_matmul(O, W_1)
+    A = relu(A)
+    Y[T, d] = tpu_matmul(A, W_2)
+    Y = Y + X
+    X = hardtanh(Y)
 ```
 
 Now, let's run a full prefill, with and without double-buffering: 
 
 ```
-base:
-run                                     4500744 clocks  375.062 ms @ 12 MHz
-MXU busy                                1097010   24.4%
+base: 
+run                                     3230318 clocks  269.193 ms @ 12 MHz
+MXU busy                                1005874   31.1%
 of which weight load                        0    0.0%
-VPU busy                                 242248    5.4%
-DMA busy                                2576920   57.3%
-no unit busy (issue overhead)            584566   13.0%
+VPU busy                                 176536    5.5%
+DMA busy                                1754096   54.3%
+no unit busy (issue overhead)            293812    9.1%
 producer stalled on a full queue              0    0.0%
 two or more units busy                        0    0.0%
 
-double-buffered: 
-run                                     3822442 clocks  318.537 ms @ 12 MHz
-MXU busy                                1097010   28.7%
+double-buffered:
+run                                     2920755 clocks  243.396 ms @ 12 MHz
+MXU busy                                1005874   34.4%
 of which weight load                        0    0.0%
-VPU busy                                 242248    6.3%
-DMA busy                                2576920   67.4%
-no unit busy (issue overhead)            640577   16.8%
+VPU busy                                 176536    6.0%
+DMA busy                                1754096   60.1%
+no unit busy (issue overhead)            330398   11.3%
 producer stalled on a full queue              0    0.0%
-two or more units busy                   734313   19.2%
+two or more units busy                   346149   11.9%
 ```
+
+As you can see, our DMA and MXU times are exactly the same between the two runs. The only difference is that in the double-buffered case, we overlapped the two, resulting in a ~10% speedup. Now, let's calculate how that stacks up against our expected:
+
+For compute, in a single transformer layer, we perform $4$ $[T, d] \times [d, d]$ matmuls for attention ($W_{Q,K,V,O}$). We also perform a $[T, d] \times [d, 4d]$ and a $[T, 4d] \times [4d,d]$ in our FFN. In attention, we also perform $[T,d_h] \times [d_h,T] \times [T,d_h]$, $h$ times. In total, this is $L(4Td^2 + 8Td^2 + 2hT^2d_h) = L(12Td^2 + 2T^2d)$ across the whole model (since $d_h = \frac{d}{h}$). Plugging in our values, we get $4(12\times 64 \times 128^2 + 2\times 64^2 \times 128) = 54,525,952$ int4 operations. Since our MXU can handle do $64$ int4 ops per clock, we expect it to take $851,968$ clocks; pretty close to the actual ~1M!
