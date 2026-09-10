@@ -66,6 +66,7 @@ python accel/test/tests/matmul/generate.py -b rtl -M 32 --ktiles 8 --ntiles 4
 python accel/test/tests/ffn/generate.py -b rtl -T 32 -d 64 -f 256
 python accel/test/tests/infer/generate.py -b iss --synthetic --gen 3 -n 1
 python accel/test/tests/infer/generate.py -b iss -n 256        # accuracy, generating
+python accel/test/tests/mha_prefill/generate.py -b rtl --part split -d 128 -f 512 -L 4
 python accel/test/tests/infer/generate.py -b rtl --synthetic --gen 3 --phase split
 python -m accel.test.export --dump-rq --model-path model/saved/int4_d128_f512_l4.pt
 
@@ -363,6 +364,16 @@ training shape and the generation shape**.
   **The build directory is keyed on a hash of the flags** — `make` compares timestamps and
   cannot see a changed `-D`, so without that a sweep runs the previous shape's image
   against this shape's golden.
+- `tests/mha_prefill/` — **`infer_block` with nothing around it: no decode, no
+  head, no argmax.** The counters freeze at the halt, so an image that runs only
+  the prefill *is* the measurement of the prefill, and
+  `--part attn|ffn|block|split` takes that one level down — three images whose
+  clocks subtract. `-d`, `-f`, `-L`, `--heads`, `--prompt`, `--batch`, `--block`
+  are all knobs, the weights are mixed hashes, and every requant word is fitted
+  to the accumulators the reference produced, so a shape change cannot collapse
+  a tensor to zero. Same `--mm` ladder and `--general` A/B as `infer`. In
+  `run_suite.SLOW`, so ask for it by name; `docs/mha_prefill.md`. **Its
+  `infer_block` is a copy of `infer.c`'s — when one changes the other has to.**
 - `run_suite.py` — all of them, on one backend.
 
 Three rules the backends depend on: the static image must be **dense over everything the

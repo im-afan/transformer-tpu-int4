@@ -141,14 +141,6 @@ _Static_assert(INFER_MM_WIDE || !INFER_FUSED,
         tpu_matmul_wide_fused(&mm, &arena);                                   \
     } while (0)
 
-/* X holds embeddings for positions first_pos..first_pos+rows-1 of each of the
- * BATCH sequences, sequence-major; on return, the residual stream after all
- * four layers. `rows` is per sequence. See docs/fw.md. */
-static inline void prefill(unsigned tokens) {
-    
-}
-
-
 __attribute__((always_inline))
 static inline void infer_block(unsigned rows, unsigned first_pos)
 {
@@ -165,31 +157,34 @@ static inline void infer_block(unsigned rows, unsigned first_pos)
                  .b = TPU_ROWS(layer_wgt + LW_WQ, I4(D)),
                  .c = Q_BUF,
                  .rq_word = rq[RQ_Q]);
-        INFER_MM(rows_all, D, D,
-                 .a = X_BUF,
-                 .b = TPU_ROWS(layer_wgt + LW_WK, I4(D)),
-                 .c = TMP_A,                    /* K_new */
-                 .rq_word = rq[RQ_K]);
-        INFER_MM(rows_all, D, D,
-                 .a = X_BUF,
-                 .b = TPU_ROWS(layer_wgt + LW_WV, I4(D)),
-                 .c = TMP_B,                    /* V_new */
-                 .rq_word = rq[RQ_V]);
 
-        /* Per sequence: append to its cache, then attend over it. Sequence
-         * `seq`'s scores overwrite its own rows of K_new with A, which is safe
-         * because a later sequence's K_new lives in the rows below. */
+        /* K and V spill straight into the cache: a sequence's rows at
+         * first_pos are exactly the layout and encoding their projection
+         * produces, so there is no append. One call per sequence, because a
+         * sequence's cache is its own region — the weight stream is read BATCH
+         * times where Q reads it once. */
         for (unsigned seq = 0; seq < BATCH; seq++) {
             const uint32_t k_cache = K_CACHE(seq, layer);
             const uint32_t v_cache = V_CACHE(seq, layer);
             const uint32_t seq_off = seq * rows * I4(D);
 
-            /* The append is a copy: both halves are already in the orientation
-             * and the encoding their matmul wants. */
-            tpu_copy(TPU_ROWS(k_cache + first_pos * I4(D), I4(D)),
-                     tpu_off(TMP_A, seq_off), rows, D, &arena);
-            tpu_copy(TPU_ROWS(v_cache + first_pos * I4(D), I4(D)),
-                     tpu_off(TMP_B, seq_off), rows, D, &arena);
+            INFER_MM(rows, D, D,
+                     .a = tpu_off(X_BUF, seq_off),
+                     .b = TPU_ROWS(layer_wgt + LW_WK, I4(D)),
+                     .c = TPU_ROWS(k_cache + first_pos * I4(D), I4(D)),
+                     .rq_word = rq[RQ_K]);
+            INFER_MM(rows, D, D,
+                     .a = tpu_off(X_BUF, seq_off),
+                     .b = TPU_ROWS(layer_wgt + LW_WV, I4(D)),
+                     .c = TPU_ROWS(v_cache + first_pos * I4(D), I4(D)),
+                     .rq_word = rq[RQ_V]);
+        }
+
+        /* Per sequence: attend over its cache. */
+        for (unsigned seq = 0; seq < BATCH; seq++) {
+            const uint32_t k_cache = K_CACHE(seq, layer);
+            const uint32_t v_cache = V_CACHE(seq, layer);
+            const uint32_t seq_off = seq * rows * I4(D);
 
             for (unsigned head = 0; head < HEADS; head++) {
                 /* Contracting over all T keys rather than first_pos+rows of
@@ -270,7 +265,7 @@ static inline void infer_block(unsigned rows, unsigned first_pos)
             INFER_MM(rows_all, D, D,
                      .a = TMP_A,                /* A */
                      .b = TPU_ROWS(layer_wgt + LW_WO, I4(D)),
-                     .c = TMP_B,                /* O; V_new is dead */
+                     .c = TMP_B,                /* O */
                      .rq_word = rq[RQ_O]);
 
             tpu_add(TMP_A, X_BUF, TMP_B, rows_all * D, rq[RQ_XO], &arena);

@@ -27,7 +27,7 @@ from program import backend_from_args                    # noqa: E402
 # than after the block loops have run.
 DEFAULT_ORDER = ["matmul", "ffn", "mha", "spadwin", "dma_roundtrip",
                  "tiled_simple", "wide", "fused", "argmax", "tiled"]
-SLOW = {"infer"}
+SLOW = {"infer", "mha_prefill"}
 
 WATCHDOG_NS = {"matmul": 2_000_000, "ffn": 2_000_000, "mha": 2_000_000,
                "spadwin": 4_000_000, "dma_roundtrip": 20_000_000,
@@ -36,6 +36,7 @@ WATCHDOG_NS = {"matmul": 2_000_000, "ffn": 2_000_000, "mha": 2_000_000,
                "wide": 60_000_000,
                "fused": 60_000_000,
                "tiled": 60_000_000,
+               "mha_prefill": 200_000_000,
                "infer": 1_000_000_000}
 
 
@@ -50,6 +51,9 @@ def load(name: str):
     path = os.path.join(TESTS, name, "generate.py")
     spec = importlib.util.spec_from_file_location(f"test_{name}", path)
     mod = importlib.util.module_from_spec(spec)
+    # Registered before it runs: a dataclass in the module resolves its own
+    # annotations through sys.modules, and an unregistered one raises.
+    sys.modules[spec.name] = mod
     spec.loader.exec_module(mod)
     return mod
 

@@ -45,7 +45,7 @@ Our scratchpad memory is synthesized as simple dual-port BRAM, with 2 independen
 
 [BRAM DIAGRAM]
 
-Our DMA is very simple. Running at the Cmod A7's standard 12 MHz clock, the 8ns external RAM access time is basically instant; it arrives at the next clock. The DMA unit takes in a base address for scratchpad and external RAM, a row stride, and 2d matrix dimensions, and simply drives the ports of the external RAM and scratchpad to transfer data between them.
+Our DMA is very simple. Running at the Cmod A7's standard 12 MHz clock, the 8ns external RAM access time is basically instant; it arrives at the next clock. The DMA unit takes in a base address for scratchpad and external RAM, a row stride, and 2d matrix dimensions, and simply drives the ports of the external RAM and scratchpad to transfer data between them. However, there is one wrinkle: since our external SRAM is asynchronous and has an 8 ns access time, the WE (write-enable) signal needs to come only after the address and data signals have arrived and stabilized. This means that for each byte written, we need to turn WE on and back off again, at the negative edge of our clock. So our final bandwidth is 1 byte / clock for external -> scratchpad, and 0.5 byte / clock for scratchpad -> external.
 
 
 ### MXU & VPU
@@ -109,6 +109,7 @@ We are now ready to implement a full inference kernel! Using our model architect
 model params: embedding dim d, # heads (heads), head dim h = d/heads
 
 inputs (in external memory, repeated for each layer): 
+query tokens S, key/value tokens T
 attention weights W_Q/K/V[d, d], FFN weights W_1[d, 4d], W_2[4d, d].
 token embeddings X[T, d].
 
@@ -116,50 +117,122 @@ outputs (in external memory, repeated for each layer):
 KV cache [T, 2d].
 
 for each layer: 
-    Q[T, d] = tpu_matmul(X, W_Q)
-    K[T, d]  = tpu_matmul(X, W_K) // directly at respective KV cache address
-    V[T, d] = tpu_matmul(X, W_V)
-    O[T, d] = empty vector
+    Q[S, d] = tpu_matmul(X, W_Q)
+    K[T, d] = tpu_matmul(X, W_K) // directly at respective KV cache address
+    V[T, d] = tpu_matmul(X, W_V)  // 
+    O[S, d] = empty vector
+
     for h from 0 to heads-1:
-        S[T, T] = tpu_matmul.transposed(Q[:][h * d_h +: d_h], K[h * d_h +: d_h][:])
-        S = S + mask
-        S = relu(S)
-        O[:][h * d_h +: d_h] = S @ V[:][h * d_h +: d_h]
+        P[S, T] = tpu_matmul.transposed(Q[:][h * d_h +: d_h], K[h * d_h +: d_h][:])
+        P = P + mask
+        P = relu(P)
+        O[:][h * d_h +: d_h] = P @ V[:][h * d_h +: d_h]
     O = tpu_matmul(O, W_O)
     O = O + X
     O = hardtanh(O)
 
-    A[T, 4d] = tpu_matmul(O, W_1)
+    A[S, 4d] = tpu_matmul(O, W_1)
     A = relu(A)
-    Y[T, d] = tpu_matmul(A, W_2)
+    Y[S, d] = tpu_matmul(A, W_2)
     Y = Y + X
     X = hardtanh(Y)
 ```
 
-Now, let's run a full prefill, with and without double-buffering: 
+In prefill, S=T. Decode is just a special case of this, where S=1, and the K/V matrices are loaded from the KV cache instead of being recomputed every step. Let's run a full inference, with prefill and decode: 
 
 ```
-base: 
-run                                     3230318 clocks  269.193 ms @ 12 MHz
-MXU busy                                1005874   31.1%
-of which weight load                        0    0.0%
-VPU busy                                 176536    5.5%
-DMA busy                                1754096   54.3%
-no unit busy (issue overhead)            293812    9.1%
+base:
+run                                    57695827 clocks  4807.986 ms @ 12 MHz
+MXU busy                                9752832   16.9%
+VPU busy                                 483616    0.8%
+DMA busy                               32695968   56.7%
+no unit busy (issue overhead)          14763411   25.6%
 producer stalled on a full queue              0    0.0%
 two or more units busy                        0    0.0%
 
-double-buffered:
-run                                     2920755 clocks  243.396 ms @ 12 MHz
-MXU busy                                1005874   34.4%
-of which weight load                        0    0.0%
-VPU busy                                 176536    6.0%
-DMA busy                                1754096   60.1%
-no unit busy (issue overhead)            330398   11.3%
+run                                    47183187 clocks  3931.932 ms @ 12 MHz
+MXU busy                                9752832   20.7%
+VPU busy                                 483616    1.0%
+DMA busy                               32695968   69.3%
+no unit busy (issue overhead)          12714599   26.9%
 producer stalled on a full queue              0    0.0%
-two or more units busy                   346149   11.9%
+two or more units busy                  8463828   17.9%
+```
+And with just prefill: 
+
+```
+base:
+run                                     3719516 clocks  309.960 ms @ 12 MHz
+MXU busy                                1097010   29.5%
+VPU busy                                 242200    6.5%
+DMA busy                                2016984   54.2%
+no unit busy (issue overhead)            363322    9.8%
+producer stalled on a full queue              0    0.0%
+two or more units busy                        0    0.0%
+
+run                                     3372036 clocks  281.003 ms @ 12 MHz
+MXU busy                                1097010   32.5%
+VPU busy                                 242200    7.2%
+DMA busy                                2016984   59.8%
+no unit busy (issue overhead)            383315   11.4%
+producer stalled on a full queue              0    0.0%
+two or more units busy                   367473   10.9%
+```
+We see that the double buffering helps a lot! it improves our runtime by about 22% in full inference and 10% in prefill. Obviously, we haven't achieved full overlap between compute and comms, but this is probably about as good as I could achieve without designing out-of-order execution in hardware.
+
+But the main observation comes from comparing the prefill and decode. As you can see, decode takes up more than 90% of the actual LLM inference time, which is pretty similar to actual workloads. Furthermore, we see that while prefill's DMA clocks is only about 70% more than MXU (this is actually pretty bad, we will talk more about this later), it is about 3-4x higher in decode. You've probably heard that prefill is compute bound, while decode is memory-bound. We've just shown that here! 
+
+To see why in more detail, let's do some quick math. Let's approximate our transformer as only the FFN blocks, for each layer. For each layer, we load our weight matrices of size $[d, 4d]$ and $[4d, d]$, and our activations $[S,d], [S,4d]$ which are both read and written. On the compute side, we do 2 matmuls: $[S, d]\times [d, 4d]$ and $[S, 4d]\times [4d, d]$. So in total, we are loading $8d^2/2 + 5Sd/2$ clocks, writing back $5Sd/2$ bytes (recalling that our external memory is 1 clock/byte read and 2 clock/byte write, $4d^2 + \frac{15Sd}{2}$ clocks total), and doing $8Sd^2$ operations. 
+
+In prefill, $S=T=64$ for this benchmark. That's $(4)(128)^2=65536$ clocks for weight loads in a layer, $61440$ clocks for activations, and $131072$ clocks of matmul ($8\cdot 6\cdot 128^2$, divided by 64 ops / clock in our MXU). Very comparable matmul and DMA clocks!
+
+Decode is a different story. With our non-batched decode, $S=1$. We still use the same $4(128)^2=65536$ clocks for weight loads. For activations, we only do $\frac{15\cdot 1\cdot 128}{2}=960$ clocks, and we only do $\frac{8\cdot 1\cdot 128^2}{64} = 2048$ clocks of matmul! We've just derived that the comms of decode is completely dominated by weight loads (actually, this changes when the KV cache gets very big, but we won't go into that), and the compute workload is very, very low. And that's what's going on in our TPU.
+
+### Optimizing Prefill
+
+With decode, there's not much room for improvement on our TPU. In fact, if you go through every single weight load in our decode kernel, you'll find that the expected number of clocks just for weights comes very close to the current number. So instead, we are going to focus on optimizing prefill. The flow of prefill is actually very similar to LLM training (with the difference of not having to store every activation, and no backprop), so there is still value in doing this!
+
+#### Operator Fusion
+
+Our current inference code (refer to the pseudocode) has a very obvious improvement we can do: operator fusion. Currently, we are doing a matmul, storing the result back, then loading the result back to scratchpad to do an elementwise add, relu, or hardtanh on it. This makes no sense! Instead, for each output tile in the matmul, we should just do the add/relu/hardtanh before we write back the tensor. We make a new fused matmul function that does this.
+
+Here's the result after implementing fusion: 
+```  
+run                                     2562124 clocks  213.510 ms @ 12 MHz
+MXU busy                                1097010   42.8%
+VPU busy                                 242632    9.5%
+DMA busy                                1261736   49.2%
+no unit busy (issue overhead)            321583   12.6%
+producer stalled on a full queue              0    0.0%
+two or more units busy                   360837   14.1%
 ```
 
-As you can see, our DMA and MXU times are exactly the same between the two runs. The only difference is that in the double-buffered case, we overlapped the two, resulting in a ~10% speedup. Now, let's calculate how that stacks up against our expected:
+Wow! That's a 32% speedup over the double-buffered code, and a 45% speedup over the base prefill!
 
-For compute, in a single transformer layer, we perform $4$ $[T, d] \times [d, d]$ matmuls for attention ($W_{Q,K,V,O}$). We also perform a $[T, d] \times [d, 4d]$ and a $[T, 4d] \times [4d,d]$ in our FFN. In attention, we also perform $[T,d_h] \times [d_h,T] \times [T,d_h]$, $h$ times. In total, this is $L(4Td^2 + 8Td^2 + 2hT^2d_h) = L(12Td^2 + 2T^2d)$ across the whole model (since $d_h = \frac{d}{h}$). Plugging in our values, we get $4(12\times 64 \times 128^2 + 2\times 64^2 \times 128) = 54,525,952$ int4 operations. Since our MXU can handle do $64$ int4 ops per clock, we expect it to take $851,968$ clocks; pretty close to the actual ~1M!
+#### FlashAttention (kinda)
+
+The current benchmark is a bit weird. We have an embedding dim of $128$, but our prefill size is quite small; only $64$ tokens. In real models like DeepSeek-v4-pro, the ratio is very different: while it has a $7168$ embedding dim, it easily support up to 100k+ tokens! So for this next benchmark, we will be increasing the prefill size to $256$. Since our memory is limited, we will be reducing our model to just 1 layer.
+
+But we're not done yet. To see what we should optimize, we need a full picture of every single tensor our inference loads.
+
+Outside of attention, we write and read $K,Q,V,O$ once each. So this amounts to $1.5\cdot 4\cdot Td$ DMA clocks for all of these. Recall that the $1.5$ is because each activation is int4, and the external memory takes 2 clocks to write a byte and 1 clock to read a byte. Then, in the FFN, we read and write a $[T, 4d]$ up-projection tensor and a $[T, d]$ tensor, which is $1.5\cdot 5 \cdot Td$. 
+
+In attention, we calculate our attention scores $P$ of size $[T,T]$. We then multiply that by $V$ to get our attention head output with size $[T, d_h]$. We do this for every head, and each one is both loaded and written (the attention head output is read when multiplying by $W_O$ after concatenating). So our total is $1.5h(T^2 + Td_h) = 1.5T^2h+1.5Td$.
+
+For weights, our $W_{Q/K/V/O}$ weights are each $[d, d]$, so $4d^2 / 2$ bytes. We also have the FFN weights which are $[d, 4d]$ and $[4d, d]$, so $8d^2 / 2$ bytes. In total, we are loading $6d^2$ bytes. We don't have to write them back, so this is $6d^2$ DMA clocks.
+
+Summing it all up: $1.5\cdot 10Td + 1.5T^2h + 6d^2$ DMA clocks. That $T^2$ term is really scary; as our context window grows larger, that will be the majority of the cost. Here's a prefill benchmark on our new architecture: 
+
+```
+run                                     2995837 clocks  249.653 ms @ 12 MHz
+MXU busy                                1279282   42.7%
+VPU busy                                 373848   12.5%
+DMA busy                                1265400   42.2%
+no unit busy (issue overhead)            207375    6.9%
+producer stalled on a full queue              0    0.0%
+two or more units busy                   130068    4.3%
+```
+
+And let's calculate the cost of the attention score matrix. $1.5\cdot 256^2\cdot 4$ = 393,216. $25%$ of the total comms! And if we reduce our model even more to $d=64$ with prefill size $512$, that grows to nearly $50%$.
+
+[FLASHATTENTION IMPLEMENTATION STILL PENDING]
