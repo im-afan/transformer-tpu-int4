@@ -51,7 +51,8 @@ from export import (RQ_IDX, RQ_N, Shape, dram_map, logit_addr,  # noqa: E402
                     token_addr, write_config)
 from program import (TPUProgram, backend_from_args, report,    # noqa: E402
                      standard_parser)
-from vector_generator import (Case, VectorGenerator, i4_row,   # noqa: E402
+from vector_generator import (TPU_SPAD_BYTES, Case,           # noqa: E402
+                              VectorGenerator, flash_block, i4_row,
                               put_i32, put_rowmajor_i4, w_hash)
 
 BUILD = os.path.join(TESTROOT, "build", "infer")
@@ -91,9 +92,29 @@ def _rq(acc, word, lo=-8):
 class Reference:
     """The model as integers, with no KV cache."""
 
-    def __init__(self, s: Shape, emb, layers, head, rq_table, logit_word):
+    def __init__(self, s: Shape, emb, layers, head, rq_table, logit_word,
+                 pv_block: int = 0):
         self.s, self.emb, self.layers, self.head = s, emb, layers, head
         self.rq_table, self.logit_word = rq_table, logit_word
+        # Non-zero under --attn flash: P @ V is contracted one key block at a
+        # time and the MXU's accumulate is an int4 add, so the golden has to
+        # clip where the hardware does. Zero, or a block as long as the key
+        # axis, is one dispatch and one clip.
+        self.pv_block = pv_block
+
+    def _pv(self, P, V, word):
+        """A @ = P @ V, taken the way the kernel takes it."""
+        keys = P.shape[1]
+        if not self.pv_block or self.pv_block >= keys:
+            return _rq(P @ V, word)
+        acc = None
+        # Blocks past a row's own position contribute an all-zero partial (the
+        # mask took P there to exactly zero), so a row's result does not depend
+        # on how far the panel's block loop ran.
+        for j in range(0, keys, self.pv_block):
+            part = _rq(P[:, j:j + self.pv_block] @ V[j:j + self.pv_block], word)
+            acc = part if acc is None else np.clip(acc + part, -8, 7)
+        return acc
 
     def generate(self, prompt_ids: list, n_gen: int) -> tuple:
         """(tokens, logits) for each generated step, in the kernel's order."""
@@ -118,7 +139,7 @@ class Reference:
                     S = _rq(Q[:, sl] @ K[:, sl].T, rq[RQ_IDX["S"]])
                     S = _rq(S + mask, rq[RQ_IDX["ID"]])
                     P = _rq(np.maximum(S, 0), rq[RQ_IDX["P"]])
-                    A[:, sl] = _rq(P @ V[:, sl], rq[RQ_IDX["A"]])
+                    A[:, sl] = self._pv(P, V[:, sl], rq[RQ_IDX["A"]])
                 O = _rq(A @ w["o"], rq[RQ_IDX["O"]])
                 XO = _rq(X + O, rq[RQ_IDX["XO"]])
                 X1 = _rq(XO + X, rq[RQ_IDX["X1"]], lo=-7)          # dyt
@@ -141,10 +162,11 @@ class Reference:
 class InferVectors(VectorGenerator):
     def __init__(self, shape: Shape, problems: int, model_path: str | None = None,
                  seed: int = 0, wide: bool = True, bench: bool = False,
-                 mm: str = "dbuf"):
+                 mm: str = "dbuf", attn: str = "blocks"):
         self.s = shape
         self.wide = wide
         self.mm = mm
+        self.attn = attn
         self.bench = bench
         # How many generated tokens the golden covers. A decode-only image
         # starts from the prompt's last token instead of the one the prefill
@@ -167,8 +189,16 @@ class InferVectors(VectorGenerator):
         write_config(os.path.join(BUILD, "infer_config.h"), self.s, self.map,
                      self.rq_table, self.logit_word,
                      model_path or "synthetic weights (tests/infer/generate.py)")
+        # infer.c hands tpulib.h everything below the mailbox, and the block
+        # size follows from that. At the live shape it comes out equal to the
+        # key axis, which makes flash bit-identical to the block sequence.
+        self.pv_block = 0
+        if attn == "flash":
+            arena = TPU_SPAD_BYTES - self.s.BATCH * self.s.T * 4
+            self.pv_block = flash_block(arena, self.s.T, self.s.head_dim)
         self.reference = Reference(self.s, self.emb, self.layers, self.head,
-                                   self.rq_table, self.logit_word)
+                                   self.rq_table, self.logit_word,
+                                   self.pv_block)
 
     # ---- weights ------------------------------------------------------------
     def _synthetic(self) -> None:
@@ -223,6 +253,8 @@ class InferVectors(VectorGenerator):
         # INFER_MM_MODE is the build's rung of the ladder, INFER_MM_WIDE is
         # which matmul primitive every site uses and 0 is the A/B.
         d = {"INFER_MM_MODE": MM_MODES[self.mm]}
+        if self.attn == "flash":
+            d["INFER_ATTN_FLASH"] = 1
         return d if self.wide else {**d, "INFER_MM_WIDE": 0}
 
     def static(self) -> dict:
@@ -309,8 +341,8 @@ class InferVectors(VectorGenerator):
 # =============================================================================
 def program(backend, shape: Shape, problems: int, model_path: str | None = None,
             seed: int = 0, wide: bool = True, bench: bool = False,
-            mm: str = "dbuf"):
-    gen = InferVectors(shape, problems, model_path, seed, wide, bench, mm)
+            mm: str = "dbuf", attn: str = "blocks"):
+    gen = InferVectors(shape, problems, model_path, seed, wide, bench, mm, attn)
     return TPUProgram(os.path.join(HERE, "infer.c"), backend, gen,
                       include_dirs=[BUILD])
 
@@ -367,7 +399,7 @@ def run_phase(args, backend, phase: str) -> TPUProgram:
     shape = shape_for(args, phase)
     problems = args.cases if args.cases else (1 if args.bench else 4)
     prog = program(backend, shape, problems, args.model_path, args.seed,
-                   not args.general, args.bench, args.mm)
+                   not args.general, args.bench, args.mm, args.attn)
     prog.name = "infer" if phase == "both" else f"infer {phase}-only"
     prog.run_program()
     if prog.generator.checks_output:
@@ -441,6 +473,12 @@ def main() -> int:
                          "dbuf double-buffers it (the default), fused also "
                          "folds each matmul's add and activation onto the "
                          "block. Same golden three ways")
+    ap.add_argument("--attn", choices=("blocks", "flash"), default="blocks",
+                    help="how attention runs: blocks is the score matmul, the "
+                         "mask add, the relu and P@V as four passes over DRAM; "
+                         "flash is one tpu_flashattention with the scores in "
+                         "the scratchpad. The A/B, same golden — the key axis "
+                         "fits one block at the live shape")
     ap.add_argument("--general", action="store_true",
                     help="every matmul through tpu_matmul instead of "
                          "tpu_matmul_wide — the A/B")

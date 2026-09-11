@@ -40,9 +40,10 @@ for _p in (TESTROOT, REPO):
 from export import DRAM_BYTES, RQ_IDX, RQ_N, RQ_NAMES    # noqa: E402
 from program import (TPUProgram, backend_from_args, report,  # noqa: E402
                      standard_parser)
-from vector_generator import (RQ_ONE, TPU_N, Case, VectorGenerator,  # noqa: E402
-                              fit_rq, i4_row, put_i32,
-                              put_rowmajor_i4, w_hash, zero_range)
+from vector_generator import (RQ_ONE, TPU_N, TPU_SPAD_BYTES,       # noqa: E402
+                              Case, VectorGenerator, fit_rq, flash_block,
+                              i4_row, put_i32, put_rowmajor_i4, w_hash,
+                              zero_range)
 
 BUILD = os.path.join(TESTROOT, "build", "mha_prefill")
 ALIGN = 64
@@ -242,8 +243,30 @@ class Reference:
     relu to 0 — which is why a reference over the prompt alone is exact.
     """
 
-    def __init__(self, s: Shape, emb, layers):
+    def __init__(self, s: Shape, emb, layers, pv_block: int = 0):
         self.s, self.emb, self.layers = s, emb, layers
+        # Non-zero under --attn flash: P @ V is contracted one key block at a
+        # time and the MXU's accumulate is an int4 add, so the golden has to
+        # clip where the hardware does. A block as long as the key axis is one
+        # dispatch and one clip, which is what the live shapes come out at.
+        self.pv_block = pv_block
+
+    def _pv(self, P, V, word):
+        """One head's P @ V, taken the way the kernel takes it: a key block per
+        accumulate, and the MXU's accumulate is clip4(requant(partial) + C_old).
+        Blocks past a row's own position contribute an all-zero partial, so a
+        row does not depend on how far the panel's block loop ran."""
+        import numpy as np
+
+        keys = P.shape[-1]
+        if not self.pv_block or self.pv_block >= keys:
+            return _rq(P @ V, word)
+        acc = None
+        for j in range(0, keys, self.pv_block):
+            part = _rq(P[..., j:j + self.pv_block] @ V[:, j:j + self.pv_block],
+                       word)
+            acc = part if acc is None else np.clip(acc + part, -8, 7)
+        return acc
 
     def run(self, prompts: list, table: list | None = None) -> tuple:
         """(table, K, V, X). With `table` None every site's word is fitted to
@@ -288,7 +311,9 @@ class Reference:
                 P = _rq(np.maximum(S, 0), RQ_ONE)
                 a_acc = np.stack([P[:, h] @ V[:, :, a:b]
                                   for h, (a, b) in enumerate(heads)], axis=1)
-                A = _rq(a_acc, fit(a_acc, "A"))
+                rq_a = fit(a_acc, "A")
+                A = np.stack([self._pv(P[:, h], V[:, :, a:b], rq_a)
+                              for h, (a, b) in enumerate(heads)], axis=1)
                 A = np.concatenate([A[:, h] for h in range(s.HEADS)], axis=2)
 
                 o_acc = A @ w["o"]
@@ -313,9 +338,16 @@ class Reference:
 # =============================================================================
 class PrefillVectors(VectorGenerator):
     def __init__(self, shape: Shape, problems: int, seed: int = 0,
-                 wide: bool = True, bench: bool = False, mm: str = "dbuf"):
+                 wide: bool = True, bench: bool = False, mm: str = "dbuf",
+                 attn: str = "blocks"):
         self.s = shape
         self.wide, self.mm, self.bench = wide, mm, bench
+        self.attn = attn
+        # The kernel hands tpulib.h everything below the mailbox, and the key
+        # block size follows from that.
+        self.pv_block = (flash_block(TPU_SPAD_BYTES - shape.BATCH * shape.T * 4,
+                                     shape.T, shape.head_dim)
+                         if attn == "flash" else 0)
         self.problems, self.seed = problems, seed
         self.map = dram_map(shape)
         self._weights()
@@ -325,7 +357,8 @@ class PrefillVectors(VectorGenerator):
                               (BENCH_RQ[name] for name in RQ_NAMES)]
                              for _ in range(shape.LAYERS)]
         else:
-            self.reference = Reference(shape, self.emb, self.layers)
+            self.reference = Reference(shape, self.emb, self.layers,
+                                       self.pv_block)
             # Fitted on the first case's prompt and then frozen: the words are
             # compiled into the image, so every case has to run on one table.
             self.rq_table, _, _, _ = self.reference.run(self._prompt(0))
@@ -364,6 +397,8 @@ class PrefillVectors(VectorGenerator):
     @property
     def defines(self) -> dict:
         d = {"INFER_MM_MODE": MM_MODES[self.mm]}
+        if self.attn == "flash":
+            d["INFER_ATTN_FLASH"] = 1
         return d if self.wide else {**d, "INFER_MM_WIDE": 0}
 
     def static(self) -> dict:
@@ -441,10 +476,10 @@ class PrefillVectors(VectorGenerator):
 # =============================================================================
 def program(backend, shape: Shape | None = None, problems: int = 2,
             seed: int = 0, wide: bool = True, bench: bool = False,
-            mm: str = "dbuf"):
+            mm: str = "dbuf", attn: str = "blocks"):
     shape = shape or Shape()
     shape.check()
-    gen = PrefillVectors(shape, problems, seed, wide, bench, mm)
+    gen = PrefillVectors(shape, problems, seed, wide, bench, mm, attn)
     return TPUProgram(os.path.join(HERE, "mha_prefill.c"), backend, gen,
                       include_dirs=[BUILD])
 
@@ -462,7 +497,7 @@ def shape_for(args, part: str) -> Shape:
 def run_part(args, backend, part: str) -> TPUProgram:
     prog = program(backend, shape_for(args, part),
                    args.cases or (1 if args.bench else 2), args.seed,
-                   not args.general, args.bench, args.mm)
+                   not args.general, args.bench, args.mm, args.attn)
     prog.name = "mha_prefill" if part == "block" else f"mha_prefill {part}-only"
     prog.run_program()
     return prog
@@ -526,6 +561,11 @@ def main() -> int:
     ap.add_argument("--mm", choices=tuple(MM_MODES), default="dbuf",
                     help="which rung of the matmul ladder the image is built "
                          "on, the same three infer has")
+    ap.add_argument("--attn", choices=("blocks", "flash"), default="blocks",
+                    help="how attention runs: blocks is the score matmul, the "
+                         "mask add, the relu and P@V as four passes over DRAM; "
+                         "flash is one tpu_flashattention with the scores in "
+                         "the scratchpad. infer.c's --attn, kept in step")
     ap.add_argument("--general", action="store_true",
                     help="every matmul through tpu_matmul instead of "
                          "tpu_matmul_wide — the A/B")

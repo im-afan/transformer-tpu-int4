@@ -112,6 +112,15 @@ _Static_assert(INFER_MM_WIDE || !INFER_FUSED,
                "the fused build is tpu_matmul_wide's layout; --general has no "
                "fused primitive to call");
 
+/* Attention on tpu_flashattention instead of the score matmul, the mask add,
+ * the relu and the P@V matmul. S and P stop being DRAM tensors and the key
+ * blocks past a row panel's last query stop being visited at all. Orthogonal
+ * to INFER_MM_MODE and to INFER_MM_WIDE — those pick the primitive every other
+ * site uses. generate.py --attn flash is the A/B. See docs/flash.md. */
+#ifndef INFER_ATTN_FLASH
+#define INFER_ATTN_FLASH 0
+#endif
+
 /* Every matmul in this kernel goes through this. tpu_matmul_wide stages one
  * column block of C instead of a whole C row, which spends the arena on
  * row-panel depth, and it double-buffers B so the next column block's weights
@@ -187,6 +196,24 @@ static inline void infer_block(unsigned rows, unsigned first_pos)
             const uint32_t seq_off = seq * rows * I4(D);
 
             for (unsigned head = 0; head < HEADS; head++) {
+#if INFER_ATTN_FLASH
+                /* The whole head in one call: the scores live in the
+                 * scratchpad and the key blocks past this panel's last query
+                 * are never visited. */
+                const tpu_flash fa = {
+                    .rows = rows, .first_pos = first_pos,
+                    .keys = T, .head_dim = HEAD_DIM,
+                    .q = tpu_off(Q_BUF, seq_off + head * I4(HEAD_DIM)),
+                    .k = TPU_ROWS(k_cache + head * I4(HEAD_DIM), I4(D)),
+                    .v = TPU_ROWS(v_cache + head * I4(HEAD_DIM), I4(D)),
+                    .mask = TPU_ROWS(DR_MASK, I4(T)),
+                    .out = tpu_off(TMP_A, seq_off + head * I4(HEAD_DIM)),
+                    .rq_s = rq[RQ_S], .rq_mask = rq[RQ_ID],
+                    .rq_p = rq[RQ_P], .rq_a = rq[RQ_A],
+                };
+
+                tpu_flashattention(&fa, &arena);
+#else
                 /* Contracting over all T keys rather than first_pos+rows of
                  * them keeps the shape constant; a runtime column count would
                  * unfold the block loop, which costs more than the extra
@@ -224,6 +251,7 @@ static inline void infer_block(unsigned rows, unsigned first_pos)
                          .b = TPU_ROWS(v_cache + head * I4(HEAD_DIM), I4(D)),
                          .c = tpu_off(TMP_A, seq_off + head * I4(HEAD_DIM)),
                          .rq_word = rq[RQ_A]);              /* A */
+#endif
             }
         }
 

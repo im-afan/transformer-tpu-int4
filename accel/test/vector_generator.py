@@ -166,6 +166,34 @@ def dyt(acc: int, word: int) -> int:
 
 
 # =============================================================================
+# tpu_flashattention's block size. A golden that models the kernel's key
+# blocking has to pick the same B the firmware will, so this is
+# tpu_flash_fit/tpu_flash_bytes written twice — if the two ever drift, every
+# flash case fails, which is the point.
+# =============================================================================
+def flash_bytes(block: int, head_dim: int) -> int:
+    """Four bank-aligned [B][head_dim] slots and one bank-aligned score region
+    holding P and the mask block."""
+    def up(v):
+        return (v + TPU_BANK_BYTES - 1) // TPU_BANK_BYTES * TPU_BANK_BYTES
+    return 4 * up(block * (head_dim // 2)) + up(block * block)
+
+
+def flash_block(arena_bytes: int, keys: int, head_dim: int) -> int:
+    """The largest whole-array-word key block the arena holds, walked down from
+    the whole key axis."""
+    usable = arena_bytes // TPU_BANK_BYTES * TPU_BANK_BYTES
+    block = keys // TPU_N * TPU_N
+    while block > TPU_N and flash_bytes(block, head_dim) > usable:
+        block -= TPU_N
+    if block < TPU_N or flash_bytes(block, head_dim) > usable:
+        raise SystemExit(
+            f"flash: a {arena_bytes}-byte arena holds no block of a "
+            f"{keys}x{head_dim} head — give it more banks")
+    return block
+
+
+# =============================================================================
 # The address map. A kernel's operands are laid out here, in Python, and handed
 # to the compiler as -D — so the C carries defaults for a bare build and the
 # generator's numbers are the ones that ran.

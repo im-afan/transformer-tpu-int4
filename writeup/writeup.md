@@ -235,4 +235,6 @@ two or more units busy                   130068    4.3%
 
 And let's calculate the cost of the attention score matrix. $1.5\cdot 256^2\cdot 4$ = 393,216. $25%$ of the total comms! And if we reduce our model even more to $d=64$ with prefill size $512$, that grows to nearly $50%$.
 
-[FLASHATTENTION IMPLEMENTATION STILL PENDING]
+
+## Conclusion
+

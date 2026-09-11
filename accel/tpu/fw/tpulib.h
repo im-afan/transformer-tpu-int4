@@ -818,4 +818,201 @@ static inline void tpu_copy(tpu_buf dst, tpu_buf src, uint32_t rows,
     }
 }
 
+/* ---- flash attention ----------------------------------------------------- */
+
+/* One head of `out = relu(Q @ K' + mask) @ V`, causal, with the score matrix
+ * never leaving the scratchpad. Q and out are [rows][head_dim], K and V are
+ * [keys][head_dim], and `mask` is the additive [*][keys] causal mask, indexed
+ * by a query's position on the key axis: query `r` of this call is at
+ * `first_pos + r`, which is what lets one call be a prefill pass or a decode
+ * step against a cache.
+ *
+ * There is no softmax and no source-axis normalization, so a key block's
+ * contribution is a plain partial sum and the tiling needs no running maximum
+ * and no denominator. A key block starting past the panel's last query is
+ * skipped whole: `-8` against an int4 score then ReLU is exactly zero.
+ *
+ * The contraction over keys is split one block per step, and the MXU's
+ * accumulate is an int4 add, so every step clips where an unsplit call clips
+ * once. When the whole key axis fits one block that is a no-op and the result
+ * is bit-identical to an unsplit contraction. See docs/flash.md. */
+typedef struct {
+    uint32_t rows;          /* queries in this call                     */
+    uint32_t first_pos;     /* query 0's position on the key axis       */
+    uint32_t keys;          /* the key axis: a whole cache              */
+    uint32_t head_dim;
+    tpu_buf  q;
+    tpu_buf  k;
+    tpu_buf  v;
+    tpu_buf  mask;
+    tpu_buf  out;
+    uint32_t rq_s;          /* Q@K' on store    */
+    uint32_t rq_mask;       /* the mask add     */
+    uint32_t rq_p;          /* the ReLU         */
+    uint32_t rq_a;          /* P@V on store     */
+} tpu_flash;
+
+/* Five bank-disjoint slots, because the MXU reads A, B and C on the same clock:
+ * Q/K/P for the scores and P/V/res for the output. The mask block rides in the
+ * score region behind P — only the DMA and the VPU touch it, and the VPU reads
+ * its two sources in separate states. */
+typedef struct {
+    uint32_t q_slot;
+    uint32_t k_slot;
+    uint32_t v_slot;
+    uint32_t o_slot;
+    uint32_t p_slot;
+    uint32_t m_slot;
+    uint32_t block;
+    unsigned fits;
+} tpu_flash_layout;
+
+__attribute__((always_inline))
+static inline uint32_t tpu_flash_bytes(uint32_t block, uint32_t head_dim)
+{
+    return 4u * TPU_ALIGN_UP(block * (head_dim / 2u), TPU_BANK_BYTES)
+         + TPU_ALIGN_UP(block * block, TPU_BANK_BYTES);
+}
+
+/* The largest whole-array-word block the arena holds, walked down from the
+ * whole key axis. Constant at an inlined call site, so the walk folds. */
+__attribute__((always_inline))
+static inline tpu_flash_layout tpu_flash_fit(uint32_t base, uint32_t bytes,
+                                             uint32_t keys, uint32_t head_dim)
+{
+    const uint32_t usable = TPU_ALIGN_DOWN(bytes, TPU_BANK_BYTES);
+    uint32_t block = TPU_ALIGN_DOWN(keys, TPU_N);
+    tpu_flash_layout lay;
+
+    while (block > TPU_N && tpu_flash_bytes(block, head_dim) > usable)
+        block -= TPU_N;
+
+    {
+        const uint32_t qkv = TPU_ALIGN_UP(block * (head_dim / 2u), TPU_BANK_BYTES);
+
+        lay.block  = block;
+        lay.fits   = block >= TPU_N
+                  && tpu_flash_bytes(block, head_dim) <= usable;
+        lay.q_slot = base;
+        lay.k_slot = lay.q_slot + qkv;
+        lay.v_slot = lay.k_slot + qkv;
+        lay.o_slot = lay.v_slot + qkv;
+        lay.p_slot = lay.o_slot + qkv;
+        lay.m_slot = lay.p_slot + block * (block / 2u);
+    }
+    return lay;
+}
+
+__attribute__((always_inline))
+static inline void tpu_flashattention(const tpu_flash *attn, tpu_arena *arena)
+{
+    const uint32_t keys     = attn->keys;
+    const uint32_t head_dim = attn->head_dim;
+    const uint32_t dh_row   = head_dim / 2u;
+
+    const uint32_t q_row = attn->q.row_bytes ? attn->q.row_bytes : dh_row;
+    const uint32_t k_row = attn->k.row_bytes ? attn->k.row_bytes : dh_row;
+    const uint32_t v_row = attn->v.row_bytes ? attn->v.row_bytes : dh_row;
+    const uint32_t o_row = attn->out.row_bytes ? attn->out.row_bytes : dh_row;
+    const uint32_t m_row = attn->mask.row_bytes ? attn->mask.row_bytes
+                                                : keys / 2u;
+
+    const tpu_flash_layout lay = tpu_flash_fit(arena->base, arena->bytes,
+                                               keys, head_dim);
+    const uint32_t block = lay.block;
+    const uint32_t p_row = block / 2u;
+
+    TPU_SHAPE_ASSERT(head_dim % TPU_N == 0,
+                     "tpu_flashattention: head_dim is not a whole array word");
+    TPU_SHAPE_ASSERT(keys % TPU_N == 0,
+                     "tpu_flashattention: the key axis is not a whole number of "
+                     "array words, so a tail block would contract a partial one");
+    TPU_SHAPE_ASSERT(attn->first_pos + attn->rows <= keys,
+                     "tpu_flashattention: the queries run past the key axis");
+    TPU_SHAPE_ASSERT(arena->base % TPU_BANK_BYTES == 0,
+                     "tpu_flashattention: arena base is not bank aligned");
+    TPU_SHAPE_ASSERT(lay.fits,
+                     "tpu_flashattention: the arena cannot hold one block of Q, "
+                     "K, V and the output plus a square score tile — give it "
+                     "more banks");
+
+    for (uint32_t i = 0; i < attn->rows; i += block) {
+        unsigned first = 1u;
+        uint32_t panel = attn->rows - i;
+        uint32_t last;
+
+        if (panel > block)
+            panel = block;
+
+        /* One past this panel's last query, on the key axis. */
+        last = attn->first_pos + i + panel;
+
+        tpu_dma(lay.q_slot, attn->q.addr + i * q_row,
+                head_dim, panel, q_row, dh_row, TPU_DMA_FILL);
+        tpu_wait(TPU_U_DMA);
+
+        /* A key block starting at or past `last` is masked to zero everywhere,
+         * so the panel stops here rather than accumulating blocks it knows are
+         * zero. That is most of the cache at a decode step. */
+        for (uint32_t j = 0; j < last; j += block) {
+            uint32_t cols = keys - j;
+            unsigned masked;
+
+            if (cols > block)
+                cols = block;
+
+            /* Only a block straddling the diagonal has any masked element. */
+            masked = (j + cols) > (attn->first_pos + i + 1u);
+
+            tpu_dma(lay.k_slot, attn->k.addr + j * k_row,
+                    head_dim, cols, k_row, dh_row, TPU_DMA_FILL);
+            tpu_dma(lay.v_slot, attn->v.addr + j * v_row,
+                    head_dim, cols, v_row, dh_row, TPU_DMA_FILL);
+            if (masked)
+                tpu_dma(lay.m_slot,
+                        attn->mask.addr + (attn->first_pos + i) * m_row + j / 2u,
+                        cols, panel, m_row, p_row, TPU_DMA_FILL);
+            tpu_wait(TPU_U_DMA);
+
+            /* S = Q @ K', the whole head_dim in one dispatch per block. */
+            tpu_mxu_geom(dh_row, dh_row, p_row, head_dim);
+            for (uint32_t sub = 0; sub < panel; sub += TPU_N)
+                for (uint32_t c0 = 0; c0 < cols; c0 += TPU_N)
+                    tpu_mxu_mm(lay.p_slot + sub * p_row + c0 / 2u,
+                               lay.q_slot + sub * dh_row,
+                               lay.k_slot + c0 * dh_row,
+                               TPU_MM_T, attn->rq_s);
+            tpu_wait(TPU_U_MXU);
+
+            /* P = relu(S + mask), in place. A short key block leaves the score
+             * columns past `cols` stale; the contraction below never reads
+             * them, so both passes are run over the whole staged width. */
+            if (masked)
+                tpu_vpu_tile(TPU_V_ADD, lay.p_slot, lay.p_slot, lay.m_slot,
+                             panel * block, attn->rq_mask);
+            tpu_vpu_tile(TPU_V_RELU, lay.p_slot, lay.p_slot, lay.p_slot,
+                         panel * block, attn->rq_p);
+            tpu_wait(TPU_U_VPU);
+
+            /* res += P @ V. The first live block writes, so nothing has to be
+             * zeroed: the MXU stores whole N x N blocks and head_dim is a whole
+             * array word. */
+            tpu_mxu_geom(p_row, dh_row, dh_row, cols);
+            for (uint32_t sub = 0; sub < panel; sub += TPU_N)
+                for (uint32_t c0 = 0; c0 < head_dim; c0 += TPU_N)
+                    tpu_mxu_mm(lay.o_slot + sub * dh_row + c0 / 2u,
+                               lay.p_slot + sub * p_row,
+                               lay.v_slot + c0 / 2u,
+                               first ? 0u : TPU_MM_ACC, attn->rq_a);
+            tpu_wait(TPU_U_MXU);
+
+            first = 0u;
+        }
+
+        tpu_dma(lay.o_slot, attn->out.addr + i * o_row,
+                head_dim, panel, o_row, dh_row, TPU_DMA_SPILL);
+        tpu_wait(TPU_U_DMA);
+    }
+}
+
 #endif /* TPULIB_H */

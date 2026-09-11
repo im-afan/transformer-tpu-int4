@@ -257,6 +257,14 @@ command queues 815, `dma` 493.
   identical `mxu` and DMA clocks — the whole difference is 583 695 clocks of
   prefetch overlap that `tpu_matmul` cannot express. It costs +24.6% commands and
   ~2.5 KB of the 16 KB firmware image.
+- **`tpu_flashattention` is one head of causal ReLU attention with the scores never
+  leaving the scratchpad.** `rows` queries at `first_pos` against `keys` keys, so one
+  call is a prefill pass or a decode step. No softmax means no running max and no
+  denominator — the tiling is just "block the keys and accumulate". A key block at or
+  past the panel's last query is skipped whole (`-8` then ReLU is exactly zero). The
+  cost is that the key contraction is split, and the MXU's accumulate is an int4 add,
+  so it clips per block; when `B == keys` that is a no-op and the result is bit-equal
+  to the unsplit contraction. `docs/flash.md` and `tests/flash/`.
 - `tpu_add_narrow` / `tpu_relu_narrow` / `tpu_pack4` chunk the VPU pairs at `vlen`;
   `tpu_transpose_int8`, `tpu_transpose_dram_int8`, `tpu_move2d` cover the rest.
 - **`tpu_argmax` is the one primitive the CPU is inside.** `VOP_ARGMAX` reports an index
@@ -337,6 +345,15 @@ training shape and the generation shape**.
 - **Its shape and its whole DRAM map come from the generated `infer_config.h`.** There is
   no `DR_ALIGN` chain in the C any more, and `DR_LAYER0` is wherever the activations end
   rather than a hardcoded `0x20000`.
+- **`-DINFER_ATTN_FLASH=1` (`generate.py --attn flash`) puts the whole per-head body on
+  `tpu_flashattention`** — the score matmul, the mask add, the relu and `P@V` become one
+  call and `S` stops being a DRAM tensor. Orthogonal to `INFER_MM_MODE` and
+  `INFER_MM_WIDE`. At the live shape the key axis fits one block, so the golden is
+  unchanged and the tokens are bit-identical; it takes `T = 256` before the block is
+  shorter than the axis. The image is smaller on every rung of the ladder
+  (dbuf 14 420 -> 12 748 at `d=128 / f=512`). On the RTL, synthetic `d=64 / f=256,
+  --gen 3`: **1 137 223 clocks against 1 385 468 (-17.9%)** with `mxu` and `vpu`
+  identical to the clock — the whole difference is `S` not round-tripping to DRAM.
 
 ### `accel/test/` — the verification suite
 
@@ -374,6 +391,12 @@ training shape and the generation shape**.
   a tensor to zero. Same `--mm` ladder and `--general` A/B as `infer`. In
   `run_suite.SLOW`, so ask for it by name; `docs/mha_prefill.md`. **Its
   `infer_block` is a copy of `infer.c`'s — when one changes the other has to.**
+- `tests/flash/` — one `tpu_flashattention`, DRAM to DRAM, against a plain Python
+  attention **tiled the same way**, because a split key contraction clips where an
+  unsplit one does not. `--arena-banks` is what picks the block size, since the arena is
+  what the fit reads; `--sweep` covers one block, two with a ragged tail, and a decode
+  shape (`--rows 1 --first-pos`). `--unsplit-check` prints the split-vs-unsplit drift.
+  `docs/flash.md`.
 - `run_suite.py` — all of them, on one backend.
 
 Three rules the backends depend on: the static image must be **dense over everything the

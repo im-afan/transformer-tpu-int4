@@ -26,13 +26,14 @@ from program import backend_from_args                    # noqa: E402
 # Ordered cheapest first, so a broken dispatch plane fails in seconds rather
 # than after the block loops have run.
 DEFAULT_ORDER = ["matmul", "ffn", "mha", "spadwin", "dma_roundtrip",
-                 "tiled_simple", "wide", "fused", "argmax", "tiled"]
+                 "tiled_simple", "flash", "wide", "fused", "argmax", "tiled"]
 SLOW = {"infer", "mha_prefill"}
 
 WATCHDOG_NS = {"matmul": 2_000_000, "ffn": 2_000_000, "mha": 2_000_000,
                "spadwin": 4_000_000, "dma_roundtrip": 20_000_000,
                "tiled_simple": 20_000_000,
                "argmax": 20_000_000,
+               "flash": 20_000_000,
                "wide": 60_000_000,
                "fused": 60_000_000,
                "tiled": 60_000_000,

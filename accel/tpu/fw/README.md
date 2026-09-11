@@ -24,6 +24,8 @@ Basic functions that dispatch to MMIO; each function can be mapped to a single M
 - tpu_gemm_fused: config struct for the fused matmul + add + activation; same as tpu_gemm plus the `add` tensor, an `add_op` (TPU_V_ADD or TPU_ACT_NONE), an `activation` (TPU_V_RELU / TPU_V_DYT / TPU_V_REQUANT / TPU_ACT_NONE) and a requant word per step (rq_word for the matmul, rq_add for the add, rq_act for the activation). No accumulate flag.
 - tpu_gemm_layout: scratchpad layout for gemm, auto-fitted based on matrix sizes for optimal (minimum) memory transfers in a single matmul. 
     - a, b, c addr, b_half when b is double-buffered
+- tpu_flash: config struct for one head of causal ReLU attention; `rows` queries at `first_pos` against `keys` keys, q/k/v/mask/out buffers, and a requant word per step (rq_s for Q@K', rq_mask for the mask add, rq_p for the relu, rq_a for P@V)
+- tpu_flash_layout: scratchpad layout for it — five bank-disjoint slots (Q, K, V, the output panel, the score region) and the key block size that follows from what the arena holds
 ### functions
 - tpu_gemm_fit: fits a tpu_gemm to a tpu_gemm_layout
 - tpu_matmul: fully general matmul, including when tiling across the k (contraction) dimension is needed. Does not use layout autofitting.
@@ -37,6 +39,13 @@ Basic functions that dispatch to MMIO; each function can be mapped to a single M
     - see ../docs/fused.md.
 - tpu_vpu_tile: one VPU pass over a tile already in the scratchpad, chunked at the vlen field's limit; does not fence.
 - tpu_elementwise: elementwise ops, loads chunks into scratchpad arena, does ops, loads back to DMA, repeat
+- tpu_flash_fit / tpu_flash_bytes: fits a head's shape to a tpu_flash_layout, walking the key block down from the whole key axis until it fits
+- tpu_flashattention: out = relu(Q @ K' + mask) @ V for one head, tiled so the scores never leave the scratchpad.
+    - no softmax means no running max and no denominator: a key block's contribution is a plain partial sum.
+    - a key block at or past the row panel's last query is skipped whole — `-8` against an int4 score then relu is exactly zero.
+    - the mask is staged only for the block straddling the diagonal.
+    - the key contraction is split one block per step and the MXU's accumulate is an int4 add, so it clips per block; when the block covers the whole key axis that is a no-op.
+    - see ../docs/flash.md.
 - tpu_copy: copy from one address in DRAM to another by copying to scratchpad and copying back
 
 
