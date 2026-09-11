@@ -2,7 +2,7 @@
 
 ## Introduction
 
-This was a summer project I made to learn the basics of ML systems. The overall goal of this project is to run a small transformer on my Cmod A7 FPGA board. Then, I want to derive some of the common results you'll find in ML (limited to a single device for now), and to get a feel for some of math behind model scaling and kernel optimization. I'm assuming you have basic knowledge on how transformer inference works (prefill, decode), but not the hardware side of things.
+This was a summer project I made to learn the basics of ML performance optimization and hardware-software co-design. The overall goal of this project is to run a small transformer on my Cmod A7 FPGA board. Then, I want to derive some of the common results you'll find in LLM scaling (limited to a single device for now), and to get a feel for kernel optimization. I'm assuming you have basic knowledge on how transformer inference works (prefill, decode), but not the hardware side of things.
 
 ## Background
 
@@ -207,7 +207,7 @@ producer stalled on a full queue              0    0.0%
 two or more units busy                   360837   14.1%
 ```
 
-Wow! That's a 32% speedup over the double-buffered code, and a 45% speedup over the base prefill!
+Wow! That's a 24% speedup over the double-buffered code, and a 31% speedup over the base prefill!
 
 #### FlashAttention (kinda)
 
@@ -235,6 +235,51 @@ two or more units busy                   130068    4.3%
 
 And let's calculate the cost of the attention score matrix. $1.5\cdot 256^2\cdot 4$ = 393,216. $25%$ of the total comms! And if we reduce our model even more to $d=64$ with prefill size $512$, that grows to nearly $50%$.
 
+What if we could change our attention so that it doesn't write the attention score matrix $S$ at all? FlashAttention does exactly that. Since our transformer doesn't include softmax, we'll be modifying the original FlashAttention a bit, but the main idea stays the same.
+
+The main idea is to break down our $Q,K,V$ tensors into tiles of size $[B,d_h]$ for each head, so that the tiles fit in scratchpad. The outer loop goes through the $Q$ tiles, and the inner loop goes through $K$ tiles. In each loop, a $[B, B]$ tile of the attention scores is calculated, and then is multiplied by the corresponding $V$ tile. The result is accumulated over the outer loop. Here's the pseudocode for our FlashAttention algorithm:
+
+```
+input: Q, K, V, tokens (T), head dim (d_h)
+output: relu(QK^T + mask) @ V
+fit B such that the scratchpad is fully used
+allocate Q_s in scratchpad with shape [B, d_h]
+allocate K_s in scratchpad with shape [B, d_h]
+allocate V_s in scratchpad with shape [B, d_h]
+allocate P_s in scratchpad with shape [B, B]
+allocate res_s in scratchpad with shape [B, d_h]
+
+for i in from 0 to T, with increment B:
+    copy Q[i +: B][:] to Q_s
+    for j from 0 to T, with increment B:
+        copy K[j +: B][:] to K_s
+        copy V[j +: B][:] to V_s
+        tpu matmul(Q_s, K_s, P_s, transpose=true, accumulate=false)
+        P_s = P_s + mask
+        P_s = relu(P_s)
+        tpu matmul(P_s, V_s, res_s, transpose=false, accumulate=(j > 0))
+       copy res_s to out[i +: B][:]
+``` 
+
+[ADD FLASH ATTENTION IMAGE. Caption: FlashAttention data flow. Source: https://arxiv.org/abs/2205.14135]
+
+Running our benchmark on FlashAttention, on the new architecture:
+
+```
+run                                     2551133 clocks  212.594 ms @ 12 MHz
+MXU busy                                1226914   48.1%
+of which weight load                        0    0.0%
+VPU busy                                 339368   13.3%
+DMA busy                                 858464   33.7%
+no unit busy (issue overhead)            238305    9.3%
+producer stalled on a full queue              0    0.0%
+two or more units busy                   111918    4.4%
+```
+
+That's a 15% speedup over the base attention. Most notably, our DMA usage went down a lot! It's nearly 30% less than before. And as our context window grows bigger, the speedup will only increase. This optimization is also what allowed models to increase from just a a few thousand to 1M+ context length, as the very large attention score matrix no longer needs to be stored in external memory.
 
 ## Conclusion
 
+This concludes my journey in creating a TPU. Looking back at this project, it's actually pretty amazing: we were able to replicate FlashAttention, common model optimization techniques, and even calculate transformer performance, all on a finger-sized FPGA board for less than $100!
+
+One thing I didn't do in this project that could be interesting: multi-device inference. Since I only had access to one Cmod board, I couldn't experiment with implementing operations like AllReduce or running sharded inference. There's a lot of interesting results that come out of this discussed in the Scaling Book, but this will have to be left as something to do later.

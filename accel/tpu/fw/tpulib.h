@@ -903,6 +903,32 @@ static inline tpu_flash_layout tpu_flash_fit(uint32_t base, uint32_t bytes,
     return lay;
 }
 
+/* The pseudocode this was written from. It differs from the code below in two
+ * places, both in docs/flash.md: the mask add comes before the ReLU, and the
+ * queries are `rows` at `first_pos` rather than the whole key axis.
+ *
+ *   input: Q, K, V, tokens (T), head dim (d_h)
+ *   output: relu(QK^T + mask) @ V
+ *
+ *   auto fit B
+ *
+ *   allocate Q_s in scratchpad with shape [B, d_h]
+ *   allocate K_s in scratchpad with shape [B, d_h]
+ *   allocate V_s in scratchpad with shape [B, d_h]
+ *   allocate P_s in scratchpad with shape [B, B]
+ *   allocate res_s in scratchpad with shape [B, d_h]
+ *
+ *   for i in from 0 to T, with increment B:
+ *       copy Q[i +: B][:] to Q_s
+ *       for j from 0 to T, with increment B:
+ *           copy K[j +: B][:] to K_s
+ *           copy V[j +: B][:] to V_s
+ *           tpu matmul(Q_s, K_s, P_s, transpose=true, accumulate=false)
+ *           P_s = P_s + mask
+ *           P_s = relu(P_s)
+ *           tpu matmul(P_s, V_s, res_s, transpose=false, accumulate=(j > 0))
+ *       copy res_s to out[i +: B][:]
+ */
 __attribute__((always_inline))
 static inline void tpu_flashattention(const tpu_flash *attn, tpu_arena *arena)
 {
