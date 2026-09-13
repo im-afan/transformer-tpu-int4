@@ -56,7 +56,11 @@ Our DMA is very simple. Running at the Cmod A7's standard 12 MHz clock, the 10 n
 
 ### MXU & VPU
 
-For matmuls, we use an output-stationary 8x8 systolic array; each PE keeps its partial sum, while moving its input values to the next PE to its right and below it. This allows us to perform an arbitrary 8xNx8 ($A[8,N] \cdot B[N,8])$) matmul, as long as A and B fit in scratchpad. By default, all tensors are stored row-major in both external memory and scratchpad. Since our design has no fast way to transpose a matrix, we instead use a trick in the MXU to perform transposed matmuls such as $QK^T$ in attention. By default, A and B are fed into the systolic array by... [FINISH EXPLANATION, PROBABLY NEED A DIAGRAM FOR THIS TO BE EXPLAINED WELL] 
+For matmuls, we use an output-stationary 8x8 systolic array; each PE keeps its partial sum, while moving its input values to the next PE to its right and below it. This allows us to perform an arbitrary 8xNx8 ($A[8,N] \cdot B[N,8])$) matmul, as long as A and B fit in scratchpad. By default, all tensors are stored row-major in both external memory and scratchpad. Since our design has no fast way to transpose a matrix, we instead use a trick in the MXU to perform transposed matmuls such as $QK^T$ in attention. By default, A and B are fed into the systolic array like this:
+
+![MXU dataflow](mxu.png)
+
+*2x2 version of the MXU; the real one is 8x8. Each PE stores one output element $c_{ij}$. Left, no transpose: row $i$ of A (blue) is loaded into that row's register as one contiguous chunk and shifts out one element per clock. A whole B row arrives at once, and registers skew the incoming data. Middle, transposed: B is stored $[N, K]$ instead, so a column's elements are contiguous and B is fed the same way as A. This makes it so that transposed matrices never need to be re-arranged in memory; the MXU just reads them differently.* 
 
 As a result, every clock, the systolic array reads $32$ bits (8 int4 values) for matrix A and $32$ bits for matrix B. This is where the scratchpad architecture comes in handy: as long as A and B are in different memory regions, they can be read at the same time, without interfering with ongoing DMA operations.
 
